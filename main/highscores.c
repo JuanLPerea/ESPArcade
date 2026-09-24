@@ -2,73 +2,85 @@
 #include "renderer.h"
 #include "controls.h"
 #include "sound.h"
-#include "pico/stdlib.h"
-#include "hardware/flash.h"
-#include "hardware/sync.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
 #include <string.h>
 #include <stdio.h>
 
-// ---------------------------------------------------------------------------
-// Almacenamiento en flash
-// ---------------------------------------------------------------------------
-// Último sector de flash disponible. PICO_FLASH_SIZE_BYTES lo define el
-// SDK según el board real (2MB en "pico", 4MB en "pico2", etc.) -- a
-// diferencia de ArcadePi, que asumía 2MB fijo, esto se ajusta solo.
-#define HS_FLASH_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
-#define HS_MAGIC   0x48534332u // "HSC2"
+/* ===========================================================
+ * PORT A ESP32 - lo que cambia respecto al original:
+ *
+ *  - Almacenamiento: flash_range_erase/program de un sector fijo
+ *    (Pico) -> un unico blob NVS con toda la tabla de records.
+ *    No hace falta la struct FlashData con padding a sector
+ *    completo ni el static_assert de tamano: NVS gestiona el
+ *    tamano real del blob por su cuenta.
+ *  - No hace falta __no_inline_not_in_flash_func ni desactivar
+ *    interrupciones: esa necesidad era especifica de escribir en
+ *    la flash donde vive el propio codigo en ejecucion (XIP) de
+ *    la Pico. NVS en ESP32 no tiene esa restriccion.
+ *  - sleep_ms() (Pico SDK) -> vTaskDelay() (FreeRTOS).
+ *
+ * TODO LO DEMAS (logica de inserccion ordenada en el top-5,
+ * dibujado, entrada de iniciales) es la MISMA logica que el
+ * highscores.c original: no toca hardware, es C puro.
+ * =========================================================== */
+
+#define NVS_NAMESPACE "arcadecolor"
+#define NVS_KEY_TABLES "hs_tables"
 #define HS_VERSION 1
-
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    ScoreTable tables[HS_MAX_GAMES];
-    uint8_t _pad[FLASH_SECTOR_SIZE - sizeof(uint32_t) * 2 - sizeof(ScoreTable) * HS_MAX_GAMES];
-} FlashData;
-
-static_assert(sizeof(FlashData) == FLASH_SECTOR_SIZE, "FlashData debe ocupar exactamente un sector");
 
 static ScoreTable g_tables[HS_MAX_GAMES];
 static bool g_save_pending = false;
 
-// ---------------------------------------------------------------------------
-// Escritura en flash
-// ---------------------------------------------------------------------------
-// Debe ejecutarse desde RAM (__no_inline_not_in_flash_func): mientras la
-// flash está borrándose/programándose, la CPU no puede buscar en ella
-// las siguientes instrucciones (ejecución XIP), así que el propio código
-// que hace el borrado/programado no puede vivir en flash.
-//
-// A diferencia de ArcadePi (que además debía parar el DMA+PIO del vídeo
-// compuesto, porque leen flash de forma continua para generar la señal),
-// aquí basta con desactivar interrupciones: el renderer solo transmite
-// por SPI bajo demanda (renderer_flush()), no hay nada leyendo flash en
-// segundo plano durante el guardado.
-static void __no_inline_not_in_flash_func(save_to_flash)(void) {
-    static FlashData buf;
-    buf.magic = HS_MAGIC;
-    buf.version = HS_VERSION;
-    memcpy(buf.tables, g_tables, sizeof(g_tables));
-    memset(buf._pad, 0xFF, sizeof(buf._pad));
-
-    uint32_t irq = save_and_disable_interrupts();
-    flash_range_erase(HS_FLASH_OFFSET, FLASH_SECTOR_SIZE);
-    flash_range_program(HS_FLASH_OFFSET, (const uint8_t *)&buf, FLASH_SECTOR_SIZE);
-    restore_interrupts(irq);
-
-    g_save_pending = false;
-}
-
+/* ---------------------------------------------------------
+ * NVS
+ * --------------------------------------------------------- */
 void highscores_init(void) {
-    const FlashData *stored = (const FlashData *)(XIP_BASE + HS_FLASH_OFFSET);
-
-    if (stored->magic == HS_MAGIC && stored->version == HS_VERSION) {
-        memcpy(g_tables, stored->tables, sizeof(g_tables));
-    } else {
-        memset(g_tables, 0, sizeof(g_tables));
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
     }
+
+    memset(g_tables, 0, sizeof(g_tables));
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(g_tables);
+        // Si el blob guardado no mide exactamente lo que esperamos
+        // (p.ej. tras cambiar HS_MAX_GAMES/HS_TOP_SCORES entre
+        // versiones), lo descartamos y arrancamos con tablas
+        // vacias, igual que el original descartaba un magic/version
+        // que no coincidiera.
+        esp_err_t rd = nvs_get_blob(h, NVS_KEY_TABLES, g_tables, &len);
+        if (rd != ESP_OK || len != sizeof(g_tables)) {
+            memset(g_tables, 0, sizeof(g_tables));
+        }
+        nvs_close(h);
+    }
+
     g_save_pending = false;
 }
 
+static void save_to_nvs(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+
+    nvs_set_blob(h, NVS_KEY_TABLES, g_tables, sizeof(g_tables));
+    nvs_commit(h);
+    nvs_close(h);
+
+    g_save_pending = false;
+}
+
+/* ---------------------------------------------------------
+ * Consulta / insercion (identico al original)
+ * --------------------------------------------------------- */
 const ScoreTable *highscores_get(int game_id) {
     if (game_id < 0 || game_id >= HS_MAX_GAMES) return NULL;
     return &g_tables[game_id];
@@ -107,7 +119,7 @@ void highscores_add(int game_id, const char *name, uint32_t score) {
 
 void highscores_flush(void) {
     if (g_save_pending) {
-        save_to_flash();
+        save_to_nvs();
     }
 }
 
@@ -117,9 +129,9 @@ void highscores_reset(void) {
     highscores_flush();
 }
 
-// ---------------------------------------------------------------------------
-// Dibujo
-// ---------------------------------------------------------------------------
+/* ---------------------------------------------------------
+ * Dibujo (identico al original)
+ * --------------------------------------------------------- */
 static int hs_centered_x(const char *text, int scale) {
     int w = (int)st7789_text_width(text, (uint8_t)scale);
     int x = (TFT_WIDTH - w) / 2;
@@ -151,13 +163,10 @@ void highscores_draw(int game_id, const char *title, int top_y) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entrada de iniciales (bloqueante)
-// ---------------------------------------------------------------------------
-// Adaptado a los controles de ArcadeColor (controls_update/menu_up/
-// menu_down/menu_select) en vez de los globales de encoder/botón crudos
-// que usaba ArcadePi -- misma idea (gira para cambiar de letra, pulsa
-// para confirmar), pero reutilizando lo que ya tiene el proyecto.
+/* ---------------------------------------------------------
+ * Entrada de iniciales (bloqueante) -- identica al original salvo
+ * sleep_ms -> vTaskDelay.
+ * --------------------------------------------------------- */
 #define HS_LETTERS_LEN 27 // 'A'-'Z' + espacio
 static char hs_letter_at(int idx) {
     idx = ((idx % HS_LETTERS_LEN) + HS_LETTERS_LEN) % HS_LETTERS_LEN;
@@ -199,7 +208,7 @@ void highscores_enter(int game_id, uint32_t score) {
         if (controls_menu_up())   letter_idx[cursor]++;
         if (controls_menu_down()) letter_idx[cursor]--;
         if (controls_menu_select()) cursor++;
-        sleep_ms(15);
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 
     for (int i = 0; i < HS_NAME_LEN; i++) {

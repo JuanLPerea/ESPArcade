@@ -2,20 +2,16 @@
 #define HIGHSCORES_H
 
 /**
- * highscores.h - Tabla de records persistente en flash
+ * highscores.h - Tabla de records persistente
  *
- * Portado de ArcadePi. Guarda los HS_TOP_SCORES mejores resultados por
- * juego en el último sector de flash disponible. La escritura en flash
- * es la única operación que congela brevemente la CPU (~5ms); ocurre
- * solo al guardar un record nuevo.
+ * Version ESP32: guarda los HS_TOP_SCORES mejores resultados por juego
+ * en NVS en vez de en el ultimo sector de flash cruda que usaba la
+ * version Pico. NVS da wear leveling de fabrica, asi que aqui no hay
+ * ningun "congelamiento breve de la CPU" que documentar -- eso era una
+ * particularidad de escribir flash a mano.
  *
- * A diferencia de ArcadePi (vídeo compuesto por PIO+DMA continuo, que
- * necesita pausarse durante la escritura en flash), aquí el renderer
- * solo transmite por SPI bajo demanda (renderer_flush()), así que el
- * guardado en flash es más simple: basta con desactivar interrupciones.
- *
- * Iniciales: 3 caracteres A-Z, con el mismo encoder/botón de selección
- * que usa el menú (controls_menu_up/down/select).
+ * Iniciales: 3 caracteres A-Z, con el mismo encoder/boton de seleccion
+ * que usa el menu (controls_menu_up/down/select).
  */
 
 #include <stdint.h>
@@ -46,7 +42,7 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 /**
- * Inicializa el módulo: lee la flash y carga las tablas en RAM.
+ * Inicializa el módulo: lee NVS y carga las tablas en RAM.
  * Debe llamarse una vez en main(), antes de cualquier otra función de
  * este módulo (típicamente justo después de controls_init()).
  */
@@ -77,11 +73,11 @@ void highscores_enter(int game_id, uint32_t score);
 /** Inserta un record en RAM sin mostrar ninguna pantalla. */
 void highscores_add(int game_id, const char *name, uint32_t score);
 
-/** Escribe RAM -> flash. Llamar cuando no haya nada más urgente que
+/** Escribe RAM -> NVS. Llamar cuando no haya nada más urgente que
  * hacer (p.ej. al volver de un juego), no en mitad de una animación. */
 void highscores_flush(void);
 
-/** Borra todos los records de todos los juegos (RAM + flash). */
+/** Borra todos los records de todos los juegos (RAM + NVS). */
 void highscores_reset(void);
 
 /**

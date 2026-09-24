@@ -8,6 +8,7 @@ idf_component_register(
         "renderer.c"
         "controls.c"
         "sound.c"
+        "highscores.c"
         "menu.c"
         "games/games_list.c"
         "ArcadeColor.c"
@@ -19,4 +20,5 @@ idf_component_register(
         esp_adc
         esp_timer
         esp_driver_dac
+        nvs_flash
 )

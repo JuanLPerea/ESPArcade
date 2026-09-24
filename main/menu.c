@@ -1,6 +1,7 @@
 #include "menu.h"
 #include "renderer.h"
 #include "controls.h"
+#include "sound.h"
 #include "games/games_list.h"
 
 // Unico cambio respecto al menu.c original: sleep_ms() del Pico SDK
@@ -50,14 +51,21 @@ void menu_run(void) {
     int prev_selected = -1;
     int prev_scroll = -1;
 
+    // Musica de fondo del menu: hasta ahora sound_init() arrancaba
+    // el motor de audio pero nada llamaba nunca a sound_start_
+    // menu_music() ni a los efectos -- por eso no sonaba nada
+    // aunque el altavoz estuviera bien conectado.
+    sound_start_menu_music();
+
     while (true) {
         controls_update();
+        sound_update(); // avanza la secuencia de notas de la musica
 
         if (controls_menu_down()) {
-            if (selected < NUM_GAMES - 1) selected++;
+            if (selected < NUM_GAMES - 1) { selected++; sound_effect_move(); }
         }
         if (controls_menu_up()) {
-            if (selected > 0) selected--;
+            if (selected > 0) { selected--; sound_effect_move(); }
         }
 
         // Ajusta el scroll para que el elemento seleccionado quede siempre visible
@@ -90,13 +98,18 @@ void menu_run(void) {
         renderer_flush();
 
         if (controls_menu_select()) {
+            sound_effect_select();
+            sound_stop_menu_music();
+
             // TODO: cuando exista el submenú 1P/2P/Demo, sustituir este
             // GAME_MODE_1P fijo por el modo que elija el jugador.
             games_list[selected].run(GAME_MODE_1P);
 
             // Al volver del juego, fuerza un redibujado completo
+            // y reanuda la musica del menu.
             prev_selected = -1;
             prev_scroll = -1;
+            sound_start_menu_music();
         }
 
         vTaskDelay(pdMS_TO_TICKS(15));

@@ -12,9 +12,6 @@
 /* ===========================================================
  * st7789.c - Version ESP32 (esp_lcd_panel_st7789 + DMA)
  *
- * CORREGIDO tras localizar el bug real (gracias a un benchmark
- * de referencia que SI funcionaba bien en el mismo hardware):
- *
  *  1. esp_lcd_panel_draw_bitmap() es ASINCRONO -- vuelve antes
  *     de que la DMA termine de transmitir. La UNICA forma fiable
  *     de saber cuando es seguro reutilizar el buffer de origen es
@@ -25,9 +22,6 @@
  *  2. Modo retrato nativo (240x320) con esp_lcd_panel_mirror(),
  *     SIN swap_xy, evita el lio de gap+rotacion que dio tantos
  *     problemas en landscape.
- *  3. .data_endian se deja SIN especificar (iba a LITTLE antes;
- *     el benchmark de referencia no lo toca en absoluto y con eso
- *     el color sale bien).
  *
  * El framebuffer en RAM, el rectangulo "sucio" y la fuente 5x7
  * siguen siendo la misma logica de siempre (C puro, no toca

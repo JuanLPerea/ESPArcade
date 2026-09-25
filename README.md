@@ -24,8 +24,8 @@ por lo que quedan varios pines libres.
 | | SW | **13** | Pull-up interno |
 | **Botones** | J1_A | **4** | |
 | | J1_B | **14** | |
-| | J2_A | **16** | |
-| | J2_B | **17** | |
+| | J2_A | **26** | |
+| | J2_B | **27** | |
 | **Audio** | DAC / I2S | **25** | DAC1, 8 bits |
 
 

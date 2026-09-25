@@ -22,8 +22,8 @@
 #define PIN_J1_BTN_A 4
 #define PIN_J1_BTN_B 14
 #define PIN_J2_SW    13
-#define PIN_J2_BTN_A 16
-#define PIN_J2_BTN_B 17
+#define PIN_J2_BTN_A 26
+#define PIN_J2_BTN_B 27
 
 #define ADC_CH_J1_X ADC_CHANNEL_4 // GPIO32
 #define ADC_CH_J1_Y ADC_CHANNEL_5 // GPIO33

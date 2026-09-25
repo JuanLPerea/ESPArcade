@@ -46,6 +46,10 @@ typedef struct {
     uint16_t volume;
     uint8_t waveform;
     uint32_t noise_state;
+    // Apagado automatico por duracion (solo se usa en el canal de
+    // efectos; los canales de musica se paran/cambian desde
+    // sound_update() y dejan esto a 0 = "sin limite propio").
+    volatile uint32_t samples_left;
 } audio_channel_t;
 
 static dac_continuous_handle_t s_dac;
@@ -177,7 +181,18 @@ static void configure_channel(volatile audio_channel_t *channel, uint16_t freque
     channel->waveform = waveform;
     channel->noise_state = 0x12345678u ^ ((uint32_t)frequency * 2654435761u);
     if (channel->noise_state == 0) channel->noise_state = 1;
+    channel->samples_left = 0; // 0 = sin limite (lo gestiona sound_update)
     channel->active = true;
+}
+
+// Igual que configure_channel, pero programa un apagado automatico
+// tras duration_ms. Pensado para el canal de efectos: se dispara y
+// se olvida, sin que nadie tenga que llamar a sound_effect_stop().
+static void configure_channel_timed(volatile audio_channel_t *channel, uint16_t frequency, uint16_t volume, uint8_t waveform, uint16_t duration_ms) {
+    configure_channel(channel, frequency, volume, waveform);
+    if (channel->active) {
+        channel->samples_left = ((uint32_t)duration_ms * AUDIO_SAMPLE_RATE) / 1000;
+    }
 }
 
 static void disable_channel(volatile audio_channel_t *channel) {
@@ -224,6 +239,18 @@ static int16_t channel_sample(volatile audio_channel_t *channel) {
         default: sample = 0; break;
     }
     channel->phase += channel->phase_increment;
+
+    // Apagado automatico: si este canal tiene un limite de duracion
+    // (samples_left != 0), cuenta hacia atras muestra a muestra y se
+    // desactiva solo al llegar a 0. Los canales sin limite (musica,
+    // samples_left == 0) no se ven afectados.
+    if (channel->samples_left > 0) {
+        channel->samples_left--;
+        if (channel->samples_left == 0) {
+            channel->active = false;
+        }
+    }
+
     return (sample * (int16_t)channel->volume) / 100;
 }
 
@@ -300,8 +327,7 @@ void sound_init(void) {
  * ============================================================ */
 void sound_play_tone(uint16_t frequency_hz, uint16_t duration_ms) {
     if (!sound_initialized) sound_init();
-    configure_channel(&channel3, frequency_hz, CHANNEL3_VOLUME, WAVE_SQUARE);
-    (void)duration_ms; // igual que el original: la duracion real la gestionan los efectos especificos
+    configure_channel_timed(&channel3, frequency_hz, CHANNEL3_VOLUME, WAVE_SQUARE, duration_ms);
 }
 
 /* ============================================================
@@ -350,36 +376,37 @@ bool sound_menu_music_is_playing(void) {
 }
 
 /* ============================================================
- * EFECTOS (identicos al original)
+ * EFECTOS -- cada uno con una duracion razonable, para que se
+ * apaguen solos (antes se quedaban sonando indefinidamente).
  * ============================================================ */
 void sound_effect_shoot(void) {
     if (!sound_initialized) sound_init();
-    configure_channel(&channel3, 1100, CHANNEL3_VOLUME, WAVE_SQUARE);
+    configure_channel_timed(&channel3, 1100, CHANNEL3_VOLUME, WAVE_SQUARE, 80);
 }
 
 void sound_effect_explosion(void) {
     if (!sound_initialized) sound_init();
-    configure_channel(&channel3, 100, CHANNEL3_VOLUME, WAVE_NOISE);
+    configure_channel_timed(&channel3, 100, CHANNEL3_VOLUME, WAVE_NOISE, 350);
 }
 
 void sound_effect_select(void) {
     if (!sound_initialized) sound_init();
-    configure_channel(&channel3, 880, CHANNEL3_VOLUME, WAVE_SQUARE);
+    configure_channel_timed(&channel3, 880, CHANNEL3_VOLUME, WAVE_SQUARE, 100);
 }
 
 void sound_effect_move(void) {
     if (!sound_initialized) sound_init();
-    configure_channel(&channel3, 660, CHANNEL3_VOLUME, WAVE_SQUARE);
+    configure_channel_timed(&channel3, 660, CHANNEL3_VOLUME, WAVE_SQUARE, 50);
 }
 
 void sound_effect_game_over(void) {
     if (!sound_initialized) sound_init();
-    configure_channel(&channel3, 180, CHANNEL3_VOLUME, WAVE_SAW);
+    configure_channel_timed(&channel3, 180, CHANNEL3_VOLUME, WAVE_SAW, 600);
 }
 
 void sound_effect_success(void) {
     if (!sound_initialized) sound_init();
-    configure_channel(&channel3, 1047, CHANNEL3_VOLUME, WAVE_TRIANGLE);
+    configure_channel_timed(&channel3, 1047, CHANNEL3_VOLUME, WAVE_TRIANGLE, 300);
 }
 
 void sound_effect_stop(void) {

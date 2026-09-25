@@ -3,52 +3,36 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
-#include "pico/stdlib.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "pong.h"
-#include "renderer.h"
-#include "controls.h"
-#include "highscores.h"
-#include "sound.h"
+#include "../renderer.h"
+#include "../controls.h"
+#include "../highscores.h"
+#include "../sound.h"
 
 /*
- * Pong -- portado de ArcadePi (https://github.com/JuanLPerea/ArcadePi),
- * mismo concepto (IA adaptativa, subida de nivel, marcador, récords),
- * adaptado a:
+ * Pong -- portado del proyecto ArcadeColor (Pico) a ESP32.
  *
- *  - Resolución: campo de juego proporcional a la pantalla real
- *    (320x240 apaisada) en vez de los 768x576 del vídeo compuesto.
- *  - Controles: controls_get_raw_delta() para el movimiento continuo
- *    de las palas (con inercia) y controls_button_pressed() para los
- *    botones, en vez de los globales de interrupción de ArcadePi
- *    (enc1_count, btn1_pressed...).
- *  - Render incremental: en vez de limpiar toda la pantalla cada
- *    frame (inasumible por SPI a este tamaño), se borra solo el
- *    rectángulo anterior de cada objeto que se mueve y se dibuja el
- *    nuevo -- igual que ya hace menu.c para sus animaciones.
- *  - Bucle propio: ArcadePi registra callbacks de dibujo/tick sobre
- *    un bucle principal común dirigido por timer; aquí game_pong_run()
- *    es una función que contiene su PROPIO bucle y no devuelve hasta
- *    que la partida (o la demo) termina, como el resto de juegos de
- *    ArcadeColor.
- *  - Sin sonido por ahora: ArcadeColor no tiene aún un driver de
- *    audio (solo el pin GP4 de salida PWM reservado). Los puntos
- *    donde ArcadePi reproducía efectos están marcados con TODO.
- *  - Entrada de iniciales: en vez de la máquina de estados no
- *    bloqueante de ArcadePi (S_ENTER_NAME + hs_input_tick), se usa
- *    la highscores_enter() bloqueante que ya tenemos, que hace su
- *    propio bucle de dibujo/espera internamente.
+ *  - time_us_32() (Pico SDK) -> esp_timer_get_time() para sembrar
+ *    srand().
+ *  - sleep_ms() (Pico SDK) -> vTaskDelay(pdMS_TO_TICKS()).
+ *  - Controles: controls_get_raw_delta() sigue existiendo con la
+ *    misma firma, pero ahora por debajo lee un joystick analogico
+ *    (eje Y) en vez de un encoder en cuadratura -- ver controls.c.
+ *    El resto del juego (enc_momentum, IA, fisica, dibujo
+ *    incremental) es IDENTICO, no ha hecho falta tocarlo.
+ *
+ * TODO LO DEMAS (IA adaptativa, fisica de la bola por
+ * magnitud+angulo, dibujo incremental con doble flush separado,
+ * minianimacion del menu) es la MISMA logica que el pong.c
+ * original: no toca hardware especifico de la Pico.
  */
 
 // ---------------------------------------------------------------------------
 // Área de juego, proporcional a la pantalla real (320x240 apaisada)
 // ---------------------------------------------------------------------------
-// Literales fijos (no TFT_WIDTH/TFT_HEIGHT): esos son en realidad
-// st7789_screen_w/h, variables en tiempo de ejecución (cambian según
-// la rotación) -- no sirven como inicializador de AI_BASE_VISION[],
-// que es un array static const y exige constantes reales en tiempo
-// de compilación. La rotación está fijada a 320x240 en st7789_init()
-// y no cambia en marcha, así que hardcodear aquí es seguro; si algún
-// día cambiara la rotación del proyecto, hay que actualizar esto.
 #define SCREEN_W 320
 #define SCREEN_H 240
 
@@ -63,60 +47,38 @@
 #define PADDLE_MARGIN 6
 #define BALL_SZ       8
 
-// Cada pala en un color distinto, para diferenciarlas de un vistazo
-// (sobre todo en 2 jugadores). La bola se queda en blanco.
 #define COLOR_P1 COLOR_CYAN
 #define COLOR_P2 COLOR_YELLOW
 
-// Tamaño de pala del jugador según su nivel (se reduce cada 15 puntos).
-// Mismas proporciones que ArcadePi (72/56/44/34 sobre un campo de 400px
-// de alto), aplicadas al alto real del campo aquí.
 #define PADDLE_H      (PLAY_H * 72 / 400)   // pala fija de la IA / P2
 #define PADDLE_H_LV0  (PLAY_H * 72 / 400)
 #define PADDLE_H_LV1  (PLAY_H * 56 / 400)
 #define PADDLE_H_LV2  (PLAY_H * 44 / 400)
 #define PADDLE_H_LV3  (PLAY_H * 34 / 400)
 
-/*
- * Movimiento de la bola: velocidad (magnitud) + ángulo, NO bx/by
- * sueltos e independientes. Con dos componentes independientes, la
- * velocidad diagonal real es sqrt(bx²+by²) -- con by pudiendo llegar
- * casi tan alto como bx, una bola muy angulada se movía hasta 9x más
- * rápido en diagonal que una plana. Aquí la magnitud (BALL_SPEED_*)
- * se mantiene constante para un ángulo dado, y solo sube un poco en
- * cada rebote en pala (como antes), no según el ángulo.
- */
-#define BALL_BASE_SPEED  2.4f   // velocidad (px/tick) al sacar
-#define BALL_SPEED_INC   0.35f  // cuánto sube la velocidad en cada rebote en pala
+#define BALL_BASE_SPEED  2.4f
+#define BALL_SPEED_INC   0.35f
 #define BALL_SPEED_MAX   6.0f
-#define BALL_MAX_ANGLE   1.0f   // radianes (~57°), ángulo máximo en rebote de pala
-#define BALL_SERVE_ANGLE 0.35f  // radianes (~20°), ángulo máximo al sacar (más plano)
-#define BALL_DEMO_MIN_ANGLE  0.30f   // ~17°
-#define BALL_DEMO_MAX_ANGLE  0.75f   // ~43°
+#define BALL_MAX_ANGLE   1.0f
+#define BALL_SERVE_ANGLE 0.35f
+#define BALL_DEMO_MIN_ANGLE  0.30f
+#define BALL_DEMO_MAX_ANGLE  0.75f
 
-#define SCORE_WIN     15   // 2P: primero en llegar gana
-#define SCORE_AI_WIN  15   // 1P: la IA gana cuando llega a 15
+#define SCORE_WIN     15
+#define SCORE_AI_WIN  15
 
-// Control de pala: PAD_ACCEL/PAD_VEL_MAX ajustados para un campo más
-// pequeño que el de ArcadePi -- son los primeros valores a tocar si
-// la pala se siente demasiado lenta/rápida en tu mando real.
 #define PAD_ACCEL     2
 #define PAD_VEL_MAX   8
 #define PAD_DECAY_NUM 6
 #define PAD_DECAY_DEN 10
 
-// "Ticks" = vueltas del bucle principal de este juego, no ms fijos
-// (nuestro bucle no está atado a un timer de periodo constante como
-// el de ArcadePi). Ajusta estos valores si las pausas se sienten
-// demasiado cortas/largas en tu hardware real.
 #define PAUSE_TICKS   40
 #define BLINK_HALF    14
 #define LEVELUP_TICKS (PAUSE_TICKS * 3)
 #define DEMO_TIMEOUT_TICKS (PAUSE_TICKS * 30)
 
 // ---------------------------------------------------------------------------
-// IA Adaptativa -- idéntico a ArcadePi, no depende de resolución ni de
-// la fuente de input, así que se porta literal.
+// IA Adaptativa -- identica al original.
 // ---------------------------------------------------------------------------
 static const int AI_BASE_SPEED[4]  = { 1, 2, 3, 5 };
 #define AI_SPEED_CAP 11
@@ -150,7 +112,7 @@ typedef struct { int x, y, score, acc; } Pad;
 static Ball  ball;
 static Pad   p1, p2;
 static State state;
-static float ball_speed; // magnitud actual de la velocidad de la bola (ver set_ball_velocity)
+static float ball_speed;
 static bool  two_p;
 static bool  demo;
 static int   demo_ticks;
@@ -163,29 +125,14 @@ static int   paddle_h;
 static bool  g_done;
 static int   menu_enc_acc = 0;
 
-// Rastro de la última posición dibujada, para el borrado incremental
-// (ver draw_playing_frame). -1 = "aún no dibujado, no borrar nada".
 static int prev_ball_x = -1, prev_ball_y = -1;
 static int prev_p1_y = -1, prev_p2_y = -1;
 static int prev_paddle_h = -1;
 static int prev_p1_score = -1, prev_p2_score = -1;
 static bool field_needs_redraw = true;
 
-// Rastro del texto inferior parpadeante y del mensaje LEVEL UP, para
-// redibujarlos solo cuando su contenido realmente cambia (no en cada
-// frame mientras el parpadeo está "encendido" -- eso era trabajo, y
-// por tanto tráfico SPI, de más).
 static char prev_bottom_msg[32] = "";
 static bool prev_levelup_shown = false;
-
-// ---------------------------------------------------------------------------
-// Minianimación del menú -- un pequeño peloteo (bola + 2 palas en
-// miniatura) corriendo en bucle debajo del título de S_SELECT, a modo
-// de "logo vivo" mientras el jugador decide 1P/2P. Usa el mismo estilo
-// de borrado incremental (erase rect anterior + draw rect nuevo) que
-// el resto del juego, así que su coste por tick es mínimo. (Definida
-// más abajo, después de clamp()/iabs(), que usa internamente.)
-// ---------------------------------------------------------------------------
 
 static int clamp(int v, int lo, int hi) { return v<lo?lo:v>hi?hi:v; }
 static int iabs(int v) { return v<0?-v:v; }
@@ -196,8 +143,8 @@ static int iabs(int v) { return v<0?-v:v; }
 #define MENU_PAD_W     3
 #define MENU_PAD_H     12
 #define MENU_BALL_SZ   4
-#define MENU_ANIM_X0   (CX-50)                    // borde izq. de la pala izquierda
-#define MENU_ANIM_X1   (CX+50-MENU_PAD_W)          // borde izq. de la pala derecha
+#define MENU_ANIM_X0   (CX-50)
+#define MENU_ANIM_X1   (CX+50-MENU_PAD_W)
 #define MENU_BALL_MINX (MENU_ANIM_X0+MENU_PAD_W)
 #define MENU_BALL_MAXX (MENU_ANIM_X1-MENU_BALL_SZ)
 
@@ -218,10 +165,6 @@ static void init_menu_anim(void) {
     menu_anim_active = true;
 }
 
-// Llamado una vez por tick mientras state==S_SELECT. Mueve la bola,
-// hace que las dos palas la sigan con un pequeño margen de reacción
-// (para que parezca una IA jugando en vez de un objeto que la sigue
-// pegada), borra las posiciones anteriores y dibuja las nuevas.
 static void menu_anim_tick(void) {
     if (!menu_anim_active) return;
 
@@ -262,8 +205,6 @@ static void pad_move(Pad *p, int dy) {
     p->y = clamp(p->y + dy, PLAY_Y, PLAY_Y + PLAY_H - ph);
 }
 
-// Sistema de momentum: 'vel' es la velocidad actual de la pala. enc_raw:
-// transiciones crudas del encoder este frame (controls_get_raw_delta).
 static int enc_momentum(int enc_raw, int *vel) {
     if (enc_raw > 0) {
         *vel += PAD_ACCEL * enc_raw;
@@ -394,7 +335,6 @@ static void ai_move_adaptive(Pad *p) {
     pad_move(p, clamp(diff, -speed, speed));
 }
 
-// IA simple para el modo demo (ambas palas siguen la pelota sin error).
 static void ai_move(Pad *p, int vis_x, int speed) {
     if (ball.x < vis_x) return;
     int diff = (ball.y + BALL_SZ/2) - (p->y + PADDLE_H/2);
@@ -417,17 +357,12 @@ static void ball_centre(void) {
     ball.bx = ball.by = 0;
 }
 
-// Fija bx/by a partir de una magnitud de velocidad y un ángulo (rad),
-// en la dirección "dir" (+1 hacia p2, -1 hacia p1). Redondea al
-// entero más cercano en cada componente por separado; a estas
-// velocidades el redondeo no introduce una variación de magnitud
-// perceptible (a diferencia del viejo modelo de bx/by sueltos).
 static void set_ball_velocity(float speed, float angle_rad, int dir) {
     float fbx = cosf(angle_rad) * speed;
     float fby = sinf(angle_rad) * speed;
 
     int bx = (int)(fbx + 0.5f);
-    if (bx < 1) bx = 1; // nunca una bola completamente vertical
+    if (bx < 1) bx = 1;
     ball.bx = dir * bx;
 
     ball.by = (fby >= 0.0f) ? (int)(fby + 0.5f) : (int)(fby - 0.5f);
@@ -439,19 +374,14 @@ static void ball_launch(void) {
     float angle;
 
     if (demo) {
-        // En demo: ángulo siempre inclinado y aleatorio.
-        // Primero elegimos una magnitud entre MIN y MAX.
         float r = (float)(rand() % 1000) / 1000.0f;
         float magnitude = BALL_DEMO_MIN_ANGLE +
                           r * (BALL_DEMO_MAX_ANGLE - BALL_DEMO_MIN_ANGLE);
-
-        // 50% hacia arriba, 50% hacia abajo.
         if (rand() & 1)
             angle = magnitude;
         else
             angle = -magnitude;
     } else {
-        // Partida normal: conserva el saque relativamente plano.
         float r = (float)(rand() % 1000) / 1000.0f;
         angle = (r * 2.0f - 1.0f) * BALL_SERVE_ANGLE;
     }
@@ -474,16 +404,13 @@ static void bounce(Pad *p, bool left) {
     int ph = (p == &p1) ? paddle_h : PADDLE_H;
     int diff = (ball.y + BALL_SZ/2) - (p->y + ph/2);
 
-    // -1..1 según dónde golpeó en la pala (centro = 0, extremos = ±1)
     float norm = (float)diff / (float)(ph/2);
     if (norm > 1.0f) norm = 1.0f;
     if (norm < -1.0f) norm = -1.0f;
     float angle = norm * BALL_MAX_ANGLE;
 
     if (!left && !two_p) {
-        // Jitter pequeño en el ÁNGULO (no en un componente suelto),
-        // así sigue sin afectar a la magnitud de la velocidad.
-        float jitter = ((float)(rand() % 100) / 100.0f - 0.5f) * 0.2f; // ±0.1 rad
+        float jitter = ((float)(rand() % 100) / 100.0f - 0.5f) * 0.2f;
         angle += jitter;
         if (angle > BALL_MAX_ANGLE)  angle = BALL_MAX_ANGLE;
         if (angle < -BALL_MAX_ANGLE) angle = -BALL_MAX_ANGLE;
@@ -494,7 +421,7 @@ static void bounce(Pad *p, bool left) {
 
     set_ball_velocity(ball_speed, angle, left ? 1 : -1);
     ball.x = left ? p->x + PADDLE_W : p->x - BALL_SZ;
-    sound_effect_shoot(); // rebote en pala
+    sound_effect_shoot();
 }
 
 // ---------------------------------------------------------------------------
@@ -506,8 +433,6 @@ static int centered_x(const char *text, int scale) {
     return (x < 0) ? 0 : x;
 }
 
-// Campo estático (bordes + línea central punteada). Se dibuja una
-// sola vez al entrar a S_SERVE/S_PLAYING, no en cada frame.
 static void draw_field_static(void) {
     renderer_clear(COLOR_BLACK);
     renderer_fill_rect(PLAY_X, PLAY_Y,          PLAY_W, 2, COLOR_WHITE);
@@ -524,7 +449,6 @@ static void draw_field_static(void) {
     field_needs_redraw = false;
 }
 
-// Devuelve true si dibujó algo (el marcador cambió).
 static bool draw_score_if_changed(void) {
     char buf[4];
     bool changed = false;
@@ -545,34 +469,9 @@ static bool draw_score_if_changed(void) {
     return changed;
 }
 
-// Frame de S_SERVE/S_PLAYING: borra solo lo que se movió y dibuja lo
-// nuevo -- nada de limpiar toda la pantalla cada vuelta.
-//
-// IMPORTANTE: se hacen DOS flush() separados, no uno. Si el marcador
-// o un mensaje parpadeante cambian el mismo tick en que se mueve la
-// bola, un único flush() transmitiría el rectángulo que ENVUELVE
-// ambas zonas (pueden estar en extremos opuestos de la pantalla),
-// disparando el tamaño de esa transmisión y haciendo ese tick mucho
-// más lento que el resto -- eso es lo que se percibía como que la
-// bola "acelera y frena". Separando los flush, el camino de la
-// bola/palas (que se ejecuta CADA tick) se mantiene siempre pequeño
-// y constante; el del marcador/mensajes solo añade una transmisión
-// extra los pocos ticks en los que de verdad cambia algo.
 static void draw_playing_frame(void) {
     if (field_needs_redraw) draw_field_static();
 
-    // --- Camino rápido: bola y palas, cada tick ---
-    //
-    // Un flush() POR OBJETO, no uno combinado: si P1 y la bola se
-    // mueven el mismo tick pero están lejos verticalmente, un flush
-    // combinado transmitiría el rectángulo que envuelve a ambos --
-    // mucho más grande que cualquiera de los dos por separado, y ese
-    // tick se nota como un frenazo. Esto es justo lo que hacía que
-    // "girar el encoder" (que solo mueve la pala) pareciera afectar
-    // a la velocidad de la bola: al moverse juntas en el mismo tick,
-    // el flush de la bola heredaba el tamaño del salto de la pala.
-    // Con un flush por objeto, el de la bola es SIEMPRE del tamaño
-    // de la bola, muevas la pala o no.
     if (prev_p1_y != p1.y || prev_paddle_h != paddle_h) {
         if (prev_p1_y >= 0)
             renderer_fill_rect(p1.x, prev_p1_y, PADDLE_W,
@@ -598,7 +497,6 @@ static void draw_playing_frame(void) {
         renderer_flush();
     }
 
-    // --- Camino lento: marcador y mensajes, solo si cambian ---
     bool ui_changed = draw_score_if_changed();
 
     bool bon = (blink / BLINK_HALF) % 2 == 0;
@@ -616,10 +514,6 @@ static void draw_playing_frame(void) {
         ui_changed = true;
     }
 
-    // Mensaje inferior: decide qué texto TOCA mostrar ahora mismo
-    // (según estado + parpadeo) y solo redibuja si es distinto del
-    // último que se dibujó -- no en cada frame mientras se mantiene
-    // igual.
     const char *target_msg = "";
     if (state == S_SERVE && !demo && bon)      target_msg = "PULSA PARA SACAR";
     else if (demo && bon)                       target_msg = "DEMO - PULSA PARA JUGAR";
@@ -638,9 +532,6 @@ static void draw_playing_frame(void) {
     if (ui_changed) renderer_flush();
 }
 
-// Pantallas "estáticas" (se redibujan enteras, pero solo al entrar en
-// el estado -- no en cada frame, así que un renderer_clear() aquí es
-// barato).
 static void draw_select_screen(void) {
     renderer_clear(COLOR_BLACK);
     renderer_draw_text(centered_x("PONG", 3), CY-60, "PONG", COLOR_CYAN, COLOR_BLACK, 3);
@@ -648,8 +539,8 @@ static void draw_select_screen(void) {
                         CY-10, two_p ? "- 2 JUGADORES -" : "  2 JUGADORES  ", COLOR_WHITE, COLOR_BLACK, 2);
     renderer_draw_text(centered_x(!two_p ? "- 1 JUGADOR   -" : "  1 JUGADOR    ", 2),
                         CY+16, !two_p ? "- 1 JUGADOR   -" : "  1 JUGADOR    ", COLOR_WHITE, COLOR_BLACK, 2);
-    renderer_draw_text(centered_x("GIRA PARA CAMBIAR - PULSA PARA JUGAR", 1),
-                        CY+60, "GIRA PARA CAMBIAR - PULSA PARA JUGAR", COLOR_WHITE, COLOR_BLACK, 1);
+    renderer_draw_text(centered_x("MUEVE PARA CAMBIAR - PULSA PARA JUGAR", 1),
+                        CY+60, "MUEVE PARA CAMBIAR - PULSA PARA JUGAR", COLOR_WHITE, COLOR_BLACK, 1);
     renderer_flush();
     init_menu_anim();
 }
@@ -719,7 +610,7 @@ static void pong_tick(void) {
             ai_profile_init();
             reset_pads(); ball_centre();
             field_needs_redraw = true;
-            sound_stop_menu_music(); // se acaba la música de inicio, empieza la partida
+            sound_stop_menu_music();
             state = S_SERVE;
         }
         break;
@@ -757,12 +648,12 @@ static void pong_tick(void) {
 
         if (ball.x + BALL_SZ < PLAY_X) {
             p2.score++;
-            sound_effect_explosion(); // se pierde la bola por la izquierda
+            sound_effect_explosion();
             if (!two_p && !demo) ai_profile_update(false);
             serve_side = 1; pause_cnt = 0; state = S_PAUSE;
         } else if (ball.x > PLAY_X + PLAY_W) {
             p1.score++;
-            sound_effect_explosion(); // se pierde la bola por la derecha
+            sound_effect_explosion();
             if (!two_p && !demo) ai_profile_update(true);
             serve_side = 0; pause_cnt = 0; state = S_PAUSE;
         }
@@ -781,19 +672,19 @@ static void pong_tick(void) {
                     player_level = new_level;
                     paddle_h = player_paddle_h();
                     levelup_timer = LEVELUP_TICKS;
-                    sound_effect_success(); // subida de nivel
+                    sound_effect_success();
                 }
             }
             if (( two_p && (p1.score >= SCORE_WIN  || p2.score >= SCORE_WIN)) ||
                 (!two_p && p2.score >= SCORE_AI_WIN)) {
-                sound_stop_menu_music(); // por si acaso siguiera sonando
+                sound_stop_menu_music();
                 if (two_p) {
-                    sound_effect_success();  // alguien ha ganado la partida
+                    sound_effect_success();
                 } else {
-                    sound_effect_game_over(); // en 1P solo se llega aquí si gana la IA
+                    sound_effect_game_over();
                 }
                 if (!demo && !two_p && highscores_is_top(PONG_GAME_ID, p1.score)) {
-                    highscores_enter(PONG_GAME_ID, (uint32_t)p1.score); // bloqueante
+                    highscores_enter(PONG_GAME_ID, (uint32_t)p1.score);
                 }
                 pause_cnt = 0; state = S_OVER;
                 draw_over_screen();
@@ -836,7 +727,7 @@ static void pong_tick(void) {
 // API pública
 // ---------------------------------------------------------------------------
 void game_pong_run(game_mode_t mode) {
-    srand(time_us_32());
+    srand((unsigned int)esp_timer_get_time());
 
     p1.score = p2.score = 0;
     player_level = 0; paddle_h = PADDLE_H_LV0; levelup_timer = 0;
@@ -858,14 +749,14 @@ void game_pong_run(game_mode_t mode) {
     } else {
         state = S_SELECT;
         draw_select_screen();
-        sound_start_menu_music(); // música de inicio, mientras se elige 1P/2P
+        sound_start_menu_music();
     }
 
     while (!g_done) {
         controls_update();
         pong_tick();
         sound_update();
-        sleep_ms(8);
+        vTaskDelay(pdMS_TO_TICKS(8));
     }
 
     highscores_flush();

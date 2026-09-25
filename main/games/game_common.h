@@ -1,17 +1,17 @@
 #ifndef GAME_COMMON_H
 #define GAME_COMMON_H
 
-// Modo de ejecución con el que el menú lanza cada juego
+// Tipos compartidos por todos los juegos. No tocan hardware, son
+// los mismos en Pico y ESP32.
+
 typedef enum {
-    GAME_MODE_1P,
+    GAME_MODE_1P = 0,
     GAME_MODE_2P,
-    GAME_MODE_DEMO
+    GAME_MODE_DEMO,
 } game_mode_t;
 
-// Firma común que debe tener la función de entrada de cada juego
 typedef void (*game_run_fn)(game_mode_t mode);
 
-// Entrada de la lista de juegos del menú: nombre a mostrar + función de arranque
 typedef struct {
     const char *name;
     game_run_fn run;

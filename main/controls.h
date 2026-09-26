@@ -30,6 +30,11 @@ bool controls_menu_select(void);
 // tenian los juegos (ver enc_momentum() en pong.c).
 int controls_get_raw_delta(int idx);
 
+// Igual que controls_get_raw_delta(), pero leyendo el eje X en vez
+// del Y -- para juegos con pala/movimiento horizontal (Breakout).
+// idx 0 = eje X de J1, idx 1 = eje X de J2.
+int controls_get_raw_delta_x(int idx);
+
 // Boton generico por indice (0=J1_A, 1=J1_B, 2=J2_A, 3=J2_B,
 // 4=J1_SW, 5=J2_SW). Nivel actual (no flanco).
 bool controls_button_down(int idx);

@@ -18,8 +18,8 @@
 #define PIN_J1_BTN_A 4
 #define PIN_J1_BTN_B 14
 #define PIN_J2_SW    13
-#define PIN_J2_BTN_A 16
-#define PIN_J2_BTN_B 17
+#define PIN_J2_BTN_A 26
+#define PIN_J2_BTN_B 27
 
 typedef enum {
     BTN_J1_A = 0, BTN_J1_B, BTN_J2_A, BTN_J2_B, BTN_J1_SW, BTN_J2_SW, BTN_COUNT
@@ -180,15 +180,20 @@ bool controls_menu_select(void) {
 // Escala el eje Y (centrado, +-2048 aprox de recorrido real) a un
 // "delta" pequeño con signo, pensado para alimentar directamente el
 // sistema de aceleracion/inercia (enc_momentum en pong.c) que antes
-// recibia cuentas de encoder. /320 da un rango util de
-// aproximadamente -6..6 a fondo de recorrido (antes /200 daba -10..10:
-// para el mismo angulo de stick, ahora sale un numero mas pequeno, asi
-// que hace falta inclinar mas para llegar al mismo valor que antes).
-#define RAW_DELTA_DIVISOR 800
+// recibia cuentas de encoder. /200 da un rango util de
+// aproximadamente -10..10 a fondo de recorrido.
+#define RAW_DELTA_DIVISOR 200
 #define RAW_DELTA_DEADZONE 60 // ignora el ruido cerca del centro
 
 int controls_get_raw_delta(int idx) {
     axis_id_t axis = (idx == 0) ? AXIS_J1_Y : AXIS_J2_Y;
+    int delta = s_axis_filtered[axis] - s_axis_center[axis];
+    if (delta > -RAW_DELTA_DEADZONE && delta < RAW_DELTA_DEADZONE) return 0;
+    return delta / RAW_DELTA_DIVISOR;
+}
+
+int controls_get_raw_delta_x(int idx) {
+    axis_id_t axis = (idx == 0) ? AXIS_J1_X : AXIS_J2_X;
     int delta = s_axis_filtered[axis] - s_axis_center[axis];
     if (delta > -RAW_DELTA_DEADZONE && delta < RAW_DELTA_DEADZONE) return 0;
     return delta / RAW_DELTA_DIVISOR;

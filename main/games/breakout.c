@@ -30,6 +30,19 @@
  *  - Render incremental: igual que el original.
  *  - Sonido: mapeado a sound_effect_move/shoot/explosion/select/
  *    lose_point, igual que en pong.c.
+ *
+ * MODO DE CONTROL DE LA PALA (seleccionable en la pantalla de titulo,
+ * arriba/abajo del stick para alternar, igual que el cursor de
+ * tetris.c/asteroids.c):
+ *  - INERCIA (por defecto, comportamiento original): enc_momentum()
+ *    acumula una velocidad con aceleracion/decaimiento a partir de
+ *    controls_get_raw_delta_x() -- hay que soltar el stick para que
+ *    la pala frene, como con un encoder "virtual".
+ *  - DIRECTO (nuevo): pad_update_direct() mapea la posicion absoluta
+ *    del eje X de J1 (controls_debug_axis_normalized(), -1000..1000)
+ *    directamente a una posicion de la pala en el campo: stick
+ *    centrado = pala centrada, stick a fondo = pala en el extremo.
+ *    Sin inercia ni velocidad acumulada.
  */
 
 #include <stdlib.h>
@@ -89,6 +102,34 @@ static float pad_xf;   // posicion real (sub-pixel) de la pala
 static float pad_vel;  // velocidad real de la pala, px/s
 static int   pad_x, pad_w; // posicion/anchura ENTERA usada para dibujar y colisiones
 
+// clampf/clamp se definen mas abajo (junto al resto de helpers), pero
+// se necesitan aqui arriba para pad_update()/pad_update_direct().
+static float clampf(float v, float lo, float hi);
+
+// ---------------------------------------------------------------------------
+// Modo de control de la pala -- seleccionable desde la pantalla de titulo.
+//
+//  BRK_CTRL_INERTIA (por defecto, comportamiento original): el stick
+//  empuja una velocidad con aceleracion/decaimiento exponencial
+//  (enc_momentum), igual que un encoder "virtual" -- hay que soltar
+//  el stick para que la pala frene.
+//
+//  BRK_CTRL_DIRECT: la pala responde directamente a la posicion del
+//  stick. Stick centrado = pala centrada; stick a fondo a un lado =
+//  pala en el extremo correspondiente del campo. No hay inercia ni
+//  velocidad acumulada, es un mapeo de posicion 1:1 por frame.
+// ---------------------------------------------------------------------------
+typedef enum { BRK_CTRL_INERTIA = 0, BRK_CTRL_DIRECT = 1, BRK_CTRL_COUNT } brk_ctrl_mode_t;
+static brk_ctrl_mode_t ctrl_mode = BRK_CTRL_INERTIA;
+
+static const char * const ctrl_mode_names[BRK_CTRL_COUNT] = { "INERCIA", "DIRECTO" };
+
+// Zona muerta central para el modo directo, sobre el rango normalizado
+// -1000..1000 de controls_debug_axis_normalized(). Sin esto, el ruido
+// residual cerca del centro (tras el filtro EMA de controls.c) haria
+// temblar la pala en reposo.
+#define PAD_DIRECT_DEADZONE 40
+
 static float enc_momentum(int enc_raw, float *vel, float dt) {
     if (enc_raw != 0) {
         *vel += PAD_ACCEL * (float)enc_raw * dt;
@@ -98,6 +139,49 @@ static float enc_momentum(int enc_raw, float *vel, float dt) {
         *vel *= expf(-PAD_DECAY_PER_SEC * dt);
     }
     return *vel;
+}
+
+// Mapea la posicion del eje X de J1 (normalizada, -1000..1000, 0=centro)
+// directamente a una posicion de la pala: 0 -> pala centrada en el
+// campo, +-1000 -> pala pegada al extremo correspondiente. pad_vel se
+// mantiene a 0 porque este modo no usa inercia (si se cambia de modo
+// a mitad de partida, el modo INERCIA debe arrancar sin velocidad
+// heredada).
+static void pad_update_direct(void) {
+    int norm = controls_debug_axis_normalized(0); // eje X de J1
+
+    if (norm > -PAD_DIRECT_DEADZONE && norm < PAD_DIRECT_DEADZONE) {
+        norm = 0;
+    } else if (norm > 0) {
+        norm -= PAD_DIRECT_DEADZONE;
+    } else {
+        norm += PAD_DIRECT_DEADZONE;
+    }
+    // Reescala para que, tras quitar la zona muerta, se pueda seguir
+    // alcanzando +-1000 (el extremo del campo) sin necesitar mas
+    // inclinacion de la que ya haria falta sin zona muerta.
+    float scale = 1000.0f / (float)(1000 - PAD_DIRECT_DEADZONE);
+    float t = clampf((float)norm * scale / 1000.0f, -1.0f, 1.0f); // -1..1
+
+    float half_range = (float)(PLAY_W - pad_w) / 2.0f;
+    float center = (float)(CX) - (float)pad_w / 2.0f;
+
+    pad_xf  = clampf(center + t * half_range, (float)PLAY_X, (float)(PLAY_X + PLAY_W - pad_w));
+    pad_vel = 0.0f;
+    pad_x   = (int)(pad_xf + 0.5f);
+}
+
+// Punto unico de entrada para mover la pala segun el modo activo --
+// llamado desde BRK_SERVE y BRK_PLAYING (solo cuando !demo; la IA de
+// la demo sigue usando demo_ai() en los dos modos).
+static void pad_update(float dt) {
+    if (ctrl_mode == BRK_CTRL_DIRECT) {
+        pad_update_direct();
+    } else {
+        int d = controls_get_raw_delta_x(0);
+        pad_xf = clampf(pad_xf + enc_momentum(d, &pad_vel, dt), (float)PLAY_X, (float)(PLAY_X + PLAY_W - pad_w));
+        pad_x = (int)(pad_xf + 0.5f);
+    }
 }
 
 #define WARP_GAP_H   40
@@ -608,6 +692,20 @@ static void draw_playing_frame(void) {
 // ---------------------------------------------------------------------------
 // Pantallas estáticas
 // ---------------------------------------------------------------------------
+// Franja de seleccion del modo de control, en la pantalla de titulo.
+// Separada de draw_title_screen() para poder redibujar SOLO esta
+// linea cuando el jugador cambia de modo con arriba/abajo, en vez de
+// repintar toda la pantalla (evita parpadeo del resto del titulo).
+#define TITLE_CTRL_Y (CY + 78)
+
+static void draw_title_ctrl_mode(void) {
+    char line[32];
+    snprintf(line, sizeof(line), ">  CONTROL: %s  <", ctrl_mode_names[ctrl_mode]);
+    renderer_fill_rect(0, TITLE_CTRL_Y - 2, TFT_WIDTH, 18, COLOR_BLACK);
+    renderer_draw_text(centered_x(line,2), TITLE_CTRL_Y, line, COLOR_YELLOW, COLOR_BLACK, 2);
+    renderer_flush();
+}
+
 static void draw_title_screen(void) {
     renderer_clear(COLOR_BLACK);
 
@@ -627,6 +725,8 @@ static void draw_title_screen(void) {
 
     renderer_fill_rect(CX - 18, deco_y + 38, 36, 5, COLOR_WHITE);
     renderer_fill_rect(CX - 3, deco_y + 29, 5, 5, COLOR_WHITE);
+
+    draw_title_ctrl_mode();
 
     prev_bottom_msg[0]='\0';
     renderer_flush();
@@ -873,6 +973,11 @@ static void brk_tick(float dt) {
     switch (brk_state) {
 
     case BRK_TITLE:
+        if (controls_menu_up() || controls_menu_down()) {
+            ctrl_mode = (ctrl_mode == BRK_CTRL_INERTIA) ? BRK_CTRL_DIRECT : BRK_CTRL_INERTIA;
+            pad_vel = 0.0f; // sin velocidad heredada si se entra en INERCIA
+            draw_title_ctrl_mode();
+        }
         if (controls_menu_select()) {
             game_start();
             sound_stop_menu_music();
@@ -881,9 +986,7 @@ static void brk_tick(float dt) {
 
     case BRK_SERVE:
         if (!demo) {
-            int d = controls_get_raw_delta_x(0);
-            pad_xf = clampf(pad_xf + enc_momentum(d, &pad_vel, dt), (float)PLAY_X, (float)(PLAY_X+PLAY_W-pad_w));
-            pad_x = (int)(pad_xf + 0.5f);
+            pad_update(dt);
         } else {
             demo_ai(dt);
         }
@@ -898,9 +1001,7 @@ static void brk_tick(float dt) {
 
     case BRK_PLAYING:
         if (!demo) {
-            int d = controls_get_raw_delta_x(0);
-            pad_xf = clampf(pad_xf + enc_momentum(d, &pad_vel, dt), (float)PLAY_X, (float)(PLAY_X+PLAY_W-pad_w));
-            pad_x = (int)(pad_xf + 0.5f);
+            pad_update(dt);
             if (controls_menu_select()) {
                 if (ball_magnet) {
                     ball_magnet=false; ball_held=false;

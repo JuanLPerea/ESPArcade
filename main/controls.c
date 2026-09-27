@@ -204,6 +204,11 @@ bool controls_button_down(int idx) {
     return s_btn_level[idx];
 }
 
+bool controls_button_pressed(int idx) {
+    if (idx < 0 || idx >= BTN_COUNT) return false;
+    return btn_pressed((button_id_t)idx);
+}
+
 int controls_debug_axis_raw(int axis_id) {
     if (axis_id < 0 || axis_id >= AXIS_COUNT) return 0;
     return s_axis_filtered[axis_id];

@@ -37,7 +37,7 @@
 #define PIN_RST   22
 
 #define TFT_SPI_HOST SPI2_HOST
-#define TFT_SPI_HZ   (40 * 1000 * 1000)
+#define TFT_SPI_HZ   (80 * 1000 * 1000)
 
 // Resolucion: retrato nativo 240x320, confirmado funcionando en
 // el benchmark de referencia. TFT_WIDTH/TFT_HEIGHT (en st7789.h)

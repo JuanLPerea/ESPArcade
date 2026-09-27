@@ -39,6 +39,16 @@ int controls_get_raw_delta_x(int idx);
 // 4=J1_SW, 5=J2_SW). Nivel actual (no flanco).
 bool controls_button_down(int idx);
 
+// Igual que controls_button_down(), pero por FLANCO: true solo en
+// el frame en que el boton pasa de suelto a pulsado (equivalente al
+// "btn_pressed()" que ya se usaba internamente para
+// controls_menu_select()). Util para acciones de un solo disparo
+// que no deben repetirse mientras se mantiene pulsado -- p.ej. el
+// hyperdrive de Asteroids con el click del propio joystick
+// (idx 4/5), en vez de tener que llevar el estado "anterior" del
+// boton en cada juego.
+bool controls_button_pressed(int idx);
+
 // Para la pantalla de "PRUEBA CONTROLES" del menu: valor crudo del
 // ADC (0-4095) y normalizado (-1000..1000, centro calibrado) de un
 // eje. axis_id: 0=J1 X, 1=J1 Y, 2=J2 X, 3=J2 Y.

@@ -64,10 +64,12 @@
  *    ese acumulador ha desaparecido -- ya no hace falta.
  *  - Menos objetos simultáneos: MAX_AST 24->14, MAX_BULLETS 8->6,
  *    MAX_PARTICLES 64->32 (menos carga de render incremental).
- *  - Render incremental: naves/asteroides/OVNI con su propio
- *    borrado+flush; balas y partículas agrupadas en un flush
- *    compartido cada una (son muchas y diminutas, moviéndose casi
- *    siempre juntas en el tiempo/espacio de una explosión o ráfaga).
+ *  - Render incremental: nave/asteroide/OVNI con su propio
+ *    borrado+flush individual; balas y partículas agrupadas en un
+ *    único flush cada una (ver nota de rendimiento junto a
+ *    draw_bullets_if_moved()/draw_particles_if_moved() -- el driver
+ *    ESP32 ya soporta varios rectángulos sucios independientes, así
+ *    que agrupar aquí no dispara una caja gigante como antes).
  *  - Sonido: reutiliza sound_siren_start()/stop() (la sirena del
  *    platillo de Space Invaders) para el OVNI -- incluso más
  *    apropiado aquí, ya que el original también usaba una sirena en
@@ -598,10 +600,20 @@ static void draw_saucer_if_moved(void) {
     renderer_flush();
 }
 
-// Balas y partículas: se agrupan en un único flush cada una (son
-// muchas y diminutas, y suelen estar juntas en el tiempo/espacio de
-// una ráfaga o una explosión -- un flush por unidad sería demasiada
-// sobrecarga de transacciones SPI para lo poco que aportaría).
+// Balas y partículas: un único flush() agrupando TODAS las balas
+// (y otro agrupando TODAS las partículas) -- ver st7789.c para el
+// porqué esto vuelve a ser lo correcto. El driver de vídeo ya NO
+// lleva un único rectángulo sucio (una caja englobante): lleva una
+// LISTA de varios rectángulos, y solo fusiona los que están
+// realmente cerca entre sí (should_merge() en st7789.c). Así que
+// agrupar aquí varias balas/partículas dispersas en un solo
+// renderer_flush() ya no dispara una caja gigante -- el driver las
+// mantiene como regiones separadas y pequeñas por su cuenta. Y como
+// cada llamada a renderer_flush() en ESP32 tiene un coste fijo no
+// trivial (transacción DMA + espera real de semáforo, nada que ver
+// con el spi_write_blocking() de la Pico), agrupar sigue siendo
+// mejor que un flush() por unidad: menos llamadas, mismo resultado
+// en pantalla.
 static int prev_bullet_x[MAX_BULLETS], prev_bullet_y[MAX_BULLETS];
 static bool prev_bullet_active[MAX_BULLETS];
 static int prev_part_x[MAX_PARTICLES], prev_part_y[MAX_PARTICLES];
@@ -680,7 +692,7 @@ static void draw_hud_if_changed(void) {
 
     if ((int)ships[0].score != prev_score[0] || force) {
         renderer_fill_rect(PLAY_X+2, PLAY_Y+3, 70, 14, COLOR_BLACK);
-        snprintf(buf, sizeof(buf), "%u", (unsigned int)ships[0].score);
+        snprintf(buf, sizeof(buf), "%u", (unsigned)ships[0].score);
         renderer_draw_text(PLAY_X+2, PLAY_Y+3, buf, COLOR_SHIP0, COLOR_BLACK, 2);
         prev_score[0] = (int)ships[0].score;
         changed = true;
@@ -703,7 +715,7 @@ static void draw_hud_if_changed(void) {
     if (num_players == 2) {
         if ((int)ships[1].score != prev_score[1] || force) {
             renderer_fill_rect(PLAY_X+PLAY_W-72, PLAY_Y+3, 70, 14, COLOR_BLACK);
-            snprintf(buf, sizeof(buf), "%u", (unsigned int)ships[1].score);
+            snprintf(buf, sizeof(buf), "%u", (unsigned)ships[1].score);
             int x = PLAY_X+PLAY_W-2-(int)st7789_text_width(buf, 2);
             renderer_draw_text(x, PLAY_Y+3, buf, COLOR_SHIP1, COLOR_BLACK, 2);
             prev_score[1] = (int)ships[1].score;

@@ -23,9 +23,52 @@
  *     SIN swap_xy, evita el lio de gap+rotacion que dio tantos
  *     problemas en landscape.
  *
- * El framebuffer en RAM, el rectangulo "sucio" y la fuente 5x7
- * siguen siendo la misma logica de siempre (C puro, no toca
- * hardware).
+ * RECTANGULO(S) SUCIO(S) -- SEGUNDA VUELTA:
+ *
+ * La primera version llevaba UN solo rectangulo sucio (una caja
+ * englobante de todo lo dibujado desde el ultimo flush). Con pocos
+ * objetos moviendose eso es barato, pero con muchos objetos
+ * PEQUEÑOS y DISPERSOS por la pantalla (balas, particulas de varias
+ * explosiones a la vez) esa caja crece hasta cubrir casi todo el
+ * campo de juego -- se manda muchisimos mas bytes de los que
+ * realmente cambiaron.
+ *
+ * El primer intento de arreglo (en asteroids.c) fue hacer un
+ * flush() por objeto individual para mantener cada caja minima.
+ * Eso evita la caja gigante, pero cambia el problema por otro: cada
+ * flush() en ESP32 no es gratis como spi_write_blocking() en la
+ * Pico (un bucle directo sin sistema operativo de por medio) --
+ * aqui cada flush() implica encolar una transaccion DMA y esperar
+ * de verdad al callback on_color_trans_done via un semaforo, que
+ * tiene su propio coste fijo (turno de ISR, cambio de contexto de
+ * FreeRTOS...). Con decenas de objetos pequeños cada uno con su
+ * propio flush(), ese coste fijo, multiplicado por muchos, puede
+ * pesar tanto o mas que la caja gigante que se queria evitar.
+ *
+ * La solucion de verdad es llevar una LISTA de varios rectangulos
+ * sucios en vez de uno solo (s_dirty[], hasta MAX_DIRTY_RECTS), y
+ * fusionar SOLO los que estan realmente cerca entre si (ver
+ * should_merge() -- el criterio es que fusionarlos no desperdicie
+ * mas del triple del area real). Dos balas en polos opuestos de la
+ * pantalla quedan como dos rectangulos separados y pequeños; un
+ * grupo de particulas de una misma explosion, al estar juntas, se
+ * fusiona solo entre ellas en un rectangulo razonable. Si en algun
+ * momento hay mas zonas sueltas de las que caben en la lista (caso
+ * raro: caos total en pantalla), se renuncia a la lista ESE frame y
+ * se cae de vuelta al comportamiento anterior (un unico rectangulo
+ * englobante) -- sigue siendo correcto, solo menos eficiente, y
+ * nunca peor que la version anterior a este cambio.
+ *
+ * Ademas, la transmision de banda a banda ahora usa DOBLE BUFFER
+ * (s_band_buf[0]/[1], ping-pong): mientras la DMA transmite una
+ * banda, la CPU ya puede ir copiando la siguiente al OTRO buffer,
+ * en vez de quedarse parada esperando a que la banda actual termine
+ * antes de tocar nada mas. Solo se espera de verdad cuando hace
+ * falta reutilizar un buffer que todavia esta en vuelo (como mucho
+ * 2 transacciones en vuelo a la vez, una por buffer).
+ *
+ * El framebuffer en RAM y la fuente 5x7 siguen siendo la misma
+ * logica de siempre (C puro, no toca hardware).
  *
  * Pines: SCK=18 MOSI=23 CS=5 DC=21 RST=22
  * =========================================================== */
@@ -49,10 +92,12 @@ uint16_t st7789_screen_h = 320;
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 
-// Semaforo que se libera cuando el callback on_color_trans_done
-// confirma que una transferencia ha terminado FISICAMENTE. Sin
-// esto no hay forma segura de saber cuando se puede reutilizar el
-// buffer de origen (ver cabecera del fichero).
+// Semaforo CONTADOR (no binario): cada banda en vuelo suma una
+// "cuenta pendiente" al encolarse, y se resta al esperarla. Con
+// doble buffer puede haber como mucho 2 en vuelo a la vez, de ahi
+// el limite de 2. Un binario no vale aqui porque necesitamos saber
+// CUANTAS transacciones han terminado, no solo si alguna ha
+// terminado.
 static SemaphoreHandle_t s_color_done_sem;
 
 static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
@@ -70,23 +115,77 @@ static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
 #define FB_MAX_PIXELS ((uint32_t)320 * 240)
 static uint16_t framebuffer[FB_MAX_PIXELS];
 
-static bool fb_dirty = false;
-static uint16_t fb_dirty_x0, fb_dirty_y0, fb_dirty_x1, fb_dirty_y1;
+/* ---------------------------------------------------------
+ * Lista de rectangulos sucios -- ver comentario largo de arriba.
+ * --------------------------------------------------------- */
+#define MAX_DIRTY_RECTS 8
 
-static inline void mark_dirty(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+typedef struct { uint16_t x0, y0, x1, y1; } dirty_rect_t;
+
+static dirty_rect_t s_dirty[MAX_DIRTY_RECTS];
+static int          s_dirty_count = 0;
+
+static inline uint32_t rect_area(const dirty_rect_t *r) {
+    return (uint32_t)(r->x1 - r->x0 + 1) * (uint32_t)(r->y1 - r->y0 + 1);
+}
+
+static inline void rect_union(dirty_rect_t *dst, const dirty_rect_t *a, const dirty_rect_t *b) {
+    dst->x0 = a->x0 < b->x0 ? a->x0 : b->x0;
+    dst->y0 = a->y0 < b->y0 ? a->y0 : b->y0;
+    dst->x1 = a->x1 > b->x1 ? a->x1 : b->x1;
+    dst->y1 = a->y1 > b->y1 ? a->y1 : b->y1;
+}
+
+// Cuanto se "desperdicia" al fusionar dos rectangulos en uno solo,
+// respecto a la suma de sus areas reales. Un valor bajo (p.ej. 3)
+// significa que solo se fusionan los que ya estaban realmente cerca
+// -- dos objetos en polos opuestos de la pantalla producen una
+// union enorme comparada con la suma de sus areas, asi que NUNCA
+// pasan este umbral y se quedan como rectangulos separados.
+#define MERGE_WASTE_FACTOR 3
+
+static inline bool should_merge(const dirty_rect_t *a, const dirty_rect_t *b) {
+    dirty_rect_t u;
+    rect_union(&u, a, b);
+    return (uint64_t)rect_area(&u) <= (uint64_t)(rect_area(a) + rect_area(b)) * MERGE_WASTE_FACTOR;
+}
+
+static void mark_dirty(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     if (x0 >= TFT_WIDTH || y0 >= TFT_HEIGHT) return;
-    if (x1 >= TFT_WIDTH) x1 = TFT_WIDTH - 1;
+    if (x1 >= TFT_WIDTH)  x1 = TFT_WIDTH - 1;
     if (y1 >= TFT_HEIGHT) y1 = TFT_HEIGHT - 1;
-    if (!fb_dirty) {
-        fb_dirty_x0 = x0; fb_dirty_y0 = y0;
-        fb_dirty_x1 = x1; fb_dirty_y1 = y1;
-        fb_dirty = true;
-    } else {
-        if (x0 < fb_dirty_x0) fb_dirty_x0 = x0;
-        if (y0 < fb_dirty_y0) fb_dirty_y0 = y0;
-        if (x1 > fb_dirty_x1) fb_dirty_x1 = x1;
-        if (y1 > fb_dirty_y1) fb_dirty_y1 = y1;
+
+    dirty_rect_t nr = { x0, y0, x1, y1 };
+
+    // 1) Si ya hay un rectangulo cercano/solapado en la lista,
+    //    fusiona ahi mismo (no cuenta como una region nueva).
+    for (int i = 0; i < s_dirty_count; i++) {
+        if (should_merge(&s_dirty[i], &nr)) {
+            rect_union(&s_dirty[i], &s_dirty[i], &nr);
+            return;
+        }
     }
+
+    // 2) Si no, y todavia hay hueco en la lista, se añade como
+    //    region nueva independiente.
+    if (s_dirty_count < MAX_DIRTY_RECTS) {
+        s_dirty[s_dirty_count++] = nr;
+        return;
+    }
+
+    // 3) Lista llena y esta nueva zona no esta cerca de ninguna de
+    //    las que ya hay -- en vez de acumular MAS listas/mas
+    //    transacciones sueltas (la misma sobrecarga que queremos
+    //    evitar), se renuncia a la lista ESTE frame y se colapsa
+    //    TODO en un unico rectangulo englobante, exactamente el
+    //    comportamiento (correcto, aunque menos eficiente) de la
+    //    version anterior. Con MAX_DIRTY_RECTS=8 deberia ser rarisimo
+    //    en la practica -- solo con caos simultaneo de verdad.
+    dirty_rect_t all = s_dirty[0];
+    for (int i = 1; i < s_dirty_count; i++) rect_union(&all, &all, &s_dirty[i]);
+    rect_union(&all, &all, &nr);
+    s_dirty[0] = all;
+    s_dirty_count = 1;
 }
 
 static inline uint32_t fb_index(uint16_t x, uint16_t y) {
@@ -94,44 +193,68 @@ static inline uint32_t fb_index(uint16_t x, uint16_t y) {
 }
 
 /* ---------------------------------------------------------
- * Banda de volcado: igual que antes (agrupar filas para no hacer
- * una llamada a draw_bitmap por fila), pero AHORA con espera real
- * al semaforo tras cada banda, antes de reutilizar s_band_buf
- * para la siguiente. Eso es lo que faltaba.
+ * Banda de volcado: agrupa filas para no hacer una llamada a
+ * draw_bitmap por fila, con DOBLE BUFFER (ping-pong) para que la
+ * DMA de una banda pueda ir transmitiendo mientras la CPU ya
+ * prepara la siguiente en el OTRO buffer -- ver comentario largo
+ * de cabecera.
  * --------------------------------------------------------- */
 #define FLUSH_BAND_ROWS 40
-static uint16_t *s_band_buf; // heap_caps_malloc, DMA-capable
+static uint16_t *s_band_buf[2]; // heap_caps_malloc, DMA-capable
 
 void st7789_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     (void)x0; (void)y0; (void)x1; (void)y1;
 }
 
-void st7789_flush(void) {
-    if (!fb_dirty) return;
-
-    uint16_t x0 = fb_dirty_x0, y0 = fb_dirty_y0;
-    uint16_t x1 = fb_dirty_x1, y1 = fb_dirty_y1;
+// Manda UN rectangulo (ya recortado a pantalla) en bandas de
+// FLUSH_BAND_ROWS filas, con doble buffer: como mucho 2 bandas en
+// vuelo a la vez (una por buffer), solo se espera de verdad cuando
+// hace falta reutilizar un buffer que la DMA todavia no ha
+// terminado de transmitir.
+static void flush_one_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     uint16_t w = x1 - x0 + 1;
+    int buf_idx = 0;
+    int in_flight = 0;
 
     for (uint16_t band_y0 = y0; band_y0 <= y1; band_y0 += FLUSH_BAND_ROWS) {
         uint16_t rows = (band_y0 + FLUSH_BAND_ROWS - 1 <= y1)
                              ? FLUSH_BAND_ROWS
                              : (uint16_t)(y1 - band_y0 + 1);
-        for (uint16_t r = 0; r < rows; r++) {
-            uint32_t off = fb_index(x0, band_y0 + r);
-            memcpy(&s_band_buf[(size_t)r * w], &framebuffer[off], (size_t)w * sizeof(uint16_t));
+
+        if (in_flight == 2) {
+            // Los 2 buffers estan ocupados -- espera a que el mas
+            // antiguo (el que estamos a punto de reescribir) haya
+            // terminado de verdad.
+            xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
+            in_flight--;
         }
 
-        // Limpia cualquier senal residual antes de encolar, igual
-        // que el patron del benchmark de referencia.
-        xSemaphoreTake(s_color_done_sem, 0);
-        esp_lcd_panel_draw_bitmap(s_panel, x0, band_y0, x1 + 1, band_y0 + rows, s_band_buf);
-        // Espera BLOQUEANTE a que esta banda termine de verdad
-        // antes de tocar s_band_buf otra vez en la siguiente
-        // vuelta del bucle. Esto es lo que evita la corrupcion.
-        xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
+        uint16_t *buf = s_band_buf[buf_idx];
+        for (uint16_t r = 0; r < rows; r++) {
+            uint32_t off = fb_index(x0, band_y0 + r);
+            memcpy(&buf[(size_t)r * w], &framebuffer[off], (size_t)w * sizeof(uint16_t));
+        }
+
+        esp_lcd_panel_draw_bitmap(s_panel, x0, band_y0, x1 + 1, band_y0 + rows, buf);
+        in_flight++;
+        buf_idx ^= 1;
     }
-    fb_dirty = false;
+
+    // Antes de volver, hay que asegurarse de que TODAS las bandas en
+    // vuelo de este rectangulo han terminado de verdad -- si no, el
+    // siguiente rectangulo (u otra llamada) podria pisar un buffer
+    // que la DMA todavia esta leyendo.
+    while (in_flight > 0) {
+        xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
+        in_flight--;
+    }
+}
+
+void st7789_flush(void) {
+    for (int i = 0; i < s_dirty_count; i++) {
+        flush_one_rect(s_dirty[i].x0, s_dirty[i].y0, s_dirty[i].x1, s_dirty[i].y1);
+    }
+    s_dirty_count = 0;
 }
 
 void st7789_fill_screen(uint16_t color) {
@@ -326,7 +449,6 @@ uint16_t st7789_text_width(const char *str, uint8_t scale) {
  * transmitirse.
  * --------------------------------------------------------- */
 void st7789_blit(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_t *buf) {
-    xSemaphoreTake(s_color_done_sem, 0);
     esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x0 + w, y0 + h, buf);
     xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
 }
@@ -383,7 +505,7 @@ void st7789_init(void) {
     };
     spi_bus_initialize(TFT_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
 
-    s_color_done_sem = xSemaphoreCreateBinary();
+    s_color_done_sem = xSemaphoreCreateCounting(2, 0); // maximo 2 en vuelo (doble buffer)
 
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = PIN_DC,
@@ -416,7 +538,8 @@ void st7789_init(void) {
     st7789_set_rotation(1); // apaisada 320x240
     esp_lcd_panel_disp_on_off(s_panel, true);
 
-    s_band_buf = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
+    s_band_buf[0] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
+    s_band_buf[1] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
 
     memset(framebuffer, 0, sizeof(framebuffer));
     mark_dirty(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);

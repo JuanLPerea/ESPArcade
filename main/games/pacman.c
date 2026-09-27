@@ -29,7 +29,7 @@
  *  3) ENTRADA. La versión original leía variables globales volátiles
  *     rellenadas por una ISR (enc1_count, btn1_pressed, ...) y un menú de
  *     callbacks (set_draw_callback/set_tick_callback). Aquí se usa la
- *     API actual de controls.c (controls_update/controls_get_raw_delta/
+ *     API actual de controls.c (controls_update/controls_debug_axis_normalized/
  *     controls_button_pressed/controls_button_down/controls_menu_*) y un
  *     bucle propio game_pacman_run(), igual que game_asteroids_run().
  *
@@ -78,9 +78,9 @@
  * PORT A ESP32 -- igual que asteroids.c/breakout.c: nada de Pico SDK
  * (pico/stdlib.h, absolute_time_t, sleep_ms...), sustituido por
  * esp_timer.h + FreeRTOS. Este archivo YA venía escrito contra la API
- * actual de controls.c (controls_get_raw_delta, controls_menu_up/down,
- * controls_button_down, todas iguales en ESP32), así que el grueso de
- * la entrada no cambia. Lo que sí cambia:
+ * actual de controls.c (controls_menu_up/down, controls_button_down,
+ * todas iguales en ESP32), así que el grueso de la entrada no cambia
+ * (la lectura de movimiento sí, ver más abajo). Lo que cambia:
  *
  *  - Tiempo real: get_absolute_time()/absolute_time_diff_us() ->
  *    esp_timer_get_time() vía una now_ms() propia del archivo (igual
@@ -99,16 +99,17 @@
  *    definen aquí BTN_IDX_* con esos índices (mismo patrón que
  *    asteroids.c) y el click del propio joystick (BTN_IDX_J1_SW/
  *    BTN_IDX_J2_SW) hace de "SW de encoder" para el combo de salida.
- *  - Giro (arriba/abajo) DELIBERADAMENTE sin cambios: sigue leyendo
- *    controls_get_raw_delta() (eje Y del stick) para arriba/abajo e
- *    izquierda/derecha por botones, en vez de leer las DOS magnitudes
- *    del stick como un pad de 4 direcciones. Un botón o un giro de eje
- *    Y no tienen una orientación física que pueda desalinearse cuando
- *    la pantalla rota 90° para la partida (ver punto 1 de más arriba)
- *    -- pero un stick SÍ la tiene, y no hay forma de confirmar aquí
- *    si sus ejes físicos necesitarían intercambiarse para seguir
- *    sintiéndose "arriba es arriba" con la pantalla ya rotada. Mismo
- *    esquema de entrada que la versión Pico, por seguridad.
+ *  - Movimiento: la primera versión de este port mantuvo el esquema
+ *    original (giro del eje Y = arriba/abajo, botones A/B = izquierda/
+ *    derecha) por precaución -- un stick tiene una orientación física
+ *    real que podría desalinearse con la rotación de pantalla de este
+ *    juego (ver punto 1 de más arriba), y sin poder probarlo en el
+ *    hardware real no había forma de confirmarlo. Confirmado ya en el
+ *    cabinet real que el eje X se corresponde de forma natural con
+ *    derecha/izquierda, read_player_turn() lee ahora las DOS
+ *    magnitudes del stick directamente como un pad de 4 direcciones
+ *    (PM_INVERT_X/PM_INVERT_Y ahí mismo son el punto único para
+ *    invertir un eje si alguna dirección sale al revés).
  */
 
 #include <stdlib.h>
@@ -146,9 +147,11 @@
 
 // Índices de controls_button_down()/controls_button_pressed(), tal
 // cual los documenta controls.h: 0=J1_A, 1=J1_B, 2=J2_A, 3=J2_B,
-// 4=J1_SW (click del propio joystick 1), 5=J2_SW. Sustituyen a las
-// macros BTN_J1_A/BTN_J1_B/BTN_J2_A/BTN_J2_B/BTN_ENC1_SW/BTN_ENC2_SW
-// de la versión Pico, que ya no existen.
+// 4=J1_SW (click del propio joystick 1), 5=J2_SW. Solo J1_SW/J2_SW
+// se usan ya (combo de salida al menú) -- el movimiento ahora lee
+// las 4 direcciones directamente del stick (ver read_player_turn()),
+// así que BTN_IDX_J1_A/J1_B/J2_A/J2_B ya no hacen falta para jugar,
+// pero se dejan definidos por si se quieren reutilizar para otra cosa.
 #define BTN_IDX_J1_A  0
 #define BTN_IDX_J1_B  1
 #define BTN_IDX_J2_A  2
@@ -352,8 +355,6 @@ static int    bonus_spawn;
 static int    bonus_type;
 static int    scatter_timer;
 static bool   scatter_phase;
-static int    enc_acc;
-static int    enc2_acc;
 static int    waa_phase;
 
 static bool   two_player;
@@ -578,7 +579,7 @@ static void level_init(void) {
     frighten_timer=0; ghost_combo=0; waa_phase=0;
     bonus_visible=0; bonus_type = (level-1) % 6;
     bonus_spawn = T_BONUS_LO + rand()%(T_BONUS_HI - T_BONUS_LO);
-    scatter_timer=T_SCATTER; scatter_phase=true; enc_acc=0; enc2_acc=0;
+    scatter_timer=T_SCATTER; scatter_phase=true;
     bonus_winner=0;
     p2_dead_anim=false; p2_dead_cnt=0;
     demo_nearest_c = 0; demo_nearest_r = 0;
@@ -1377,25 +1378,53 @@ static void draw_frame(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entrada: J1 = encoder 0 (izq/der) + BTN_J1_A (arriba) + BTN_J1_B
-// (abajo). J2 = encoder 1 + BTN_J2_A/BTN_J2_B. Salir al menú:
-// mantener pulsados ambos SW de encoder a la vez (BTN_ENC1_SW/BTN_ENC2_SW).
+// Entrada: J1 = joystick de J1 con las 4 direcciones directas (arriba/
+// abajo/izquierda/derecha según hacia dónde se incline), J2 = joystick
+// de J2. Salir al menú: mantener pulsados ambos SW de joystick a la
+// vez (BTN_IDX_J1_SW/BTN_IDX_J2_SW).
+//
+// Antes este juego usaba el eje Y como un "giro de encoder" (arriba/
+// abajo) y los botones A/B para izquierda/derecha, heredado de la
+// versión con mando de encoder + 2 botones. Confirmado en hardware
+// real que el eje X ya se corresponde de forma natural con derecha/
+// izquierda, así que ahora se leen directamente las DOS magnitudes
+// del stick (como un pad digital de 4 direcciones) en vez de mezclar
+// un eje con botones.
 // ─────────────────────────────────────────────────────────────────────────────
-#define ENC_DETENT 4   // 4 transiciones de cuadratura = 1 detent físico
+#define PM_DIR_DEADZONE 350  // sobre el rango -1000..1000 de controls_debug_axis_normalized()
 
-static void read_player_turn(int encoder_index, int *acc, Dir *want) {
-    int32_t d = controls_get_raw_delta(encoder_index);
-    if (d == 0) return;
-    *acc += (int)d;
-    if (*acc >= ENC_DETENT)  { *want = DIR_DOWN; *acc = 0; }
-    if (*acc <= -ENC_DETENT) { *want = DIR_UP;   *acc = 0; }
+// Si al probar en el cabinet real alguna dirección sale invertida
+// (p.ej. empujar arriba mueve hacia abajo en pantalla), cambia el 1
+// por -1 en el eje correspondiente -- es un detalle de cableado/
+// orientación del joystick, no de la lógica del juego, así que no
+// hace falta tocar el resto de read_player_turn() para ajustarlo.
+#define PM_INVERT_X 1
+#define PM_INVERT_Y 1
+
+static inline int absi(int v) { return v < 0 ? -v : v; }
+
+static void read_player_turn(int player_idx, Dir *want) {
+    // player_idx: 0 = J1, 1 = J2. controls_debug_axis_normalized():
+    // 0=J1 X, 1=J1 Y, 2=J2 X, 3=J2 Y.
+    int axis_x = (player_idx == 0) ? 0 : 2;
+    int axis_y = (player_idx == 0) ? 1 : 3;
+
+    int dx = controls_debug_axis_normalized(axis_x) * PM_INVERT_X;
+    int dy = controls_debug_axis_normalized(axis_y) * PM_INVERT_Y;
+
+    if (absi(dx) < PM_DIR_DEADZONE && absi(dy) < PM_DIR_DEADZONE) return; // sin dirección clara
+
+    // La magnitud mayor de las dos gana -- evita diagonales
+    // ambiguas cuando el stick no está inclinado justo en un eje.
+    if (absi(dx) > absi(dy)) *want = (dx > 0) ? DIR_RIGHT : DIR_LEFT;
+    else                     *want = (dy > 0) ? DIR_DOWN  : DIR_UP;
 }
 
 static void pm_tick(void) {
     if (demo_mode) {
         bool any = controls_menu_select()
-                || controls_get_raw_delta(0) != 0
-                || controls_get_raw_delta(1) != 0;
+                || absi(controls_debug_axis_normalized(0)) >= PM_DIR_DEADZONE  // J1 X
+                || absi(controls_debug_axis_normalized(1)) >= PM_DIR_DEADZONE; // J1 Y
         if (any || ++demo_ticks >= TICKS_S*30) { g_done = true; return; }
     }
 
@@ -1418,8 +1447,11 @@ static void pm_tick(void) {
             state=PM_READY;
             // El menú se mostró en horizontal (rotation=1); el juego en
             // sí necesita vertical para encajar el laberinto -- ver
-            // nota sobre rotación en game_pacman_run().
-            st7789_set_rotation(0);
+            // nota sobre rotación en game_pacman_run(). rotation=2 (no
+            // rotation=0): misma resolución 240x320, pero girada 180°
+            // respecto a rotation=0 -- es la que queda bien orientada
+            // en este panel concreto.
+            st7789_set_rotation(2);
             renderer_clear(COLOR_BLACK);
             renderer_flush();
         }
@@ -1434,14 +1466,10 @@ static void pm_tick(void) {
         if (demo_mode) {
             demo_ai();
         } else {
-            read_player_turn(0, &enc_acc, &pac.want);
-            if (controls_button_pressed(BTN_IDX_J1_A)) pac.want = DIR_LEFT;
-            if (controls_button_pressed(BTN_IDX_J1_B)) pac.want = DIR_RIGHT;
+            read_player_turn(0, &pac.want);
 
             if (two_player) {
-                read_player_turn(1, &enc2_acc, &pac2.want);
-                if (controls_button_pressed(BTN_IDX_J2_A)) pac2.want = DIR_LEFT;
-                if (controls_button_pressed(BTN_IDX_J2_B)) pac2.want = DIR_RIGHT;
+                read_player_turn(1, &pac2.want);
             }
         }
 
@@ -1588,7 +1616,6 @@ void game_pacman_run(game_mode_t mode) {
     state = demo_mode ? PM_PLAYING : PM_SELECT;
 
     blink=0; pause_cnt=0; g_done=false; demo_ticks=0;
-    enc_acc=0; enc2_acc=0;
 
     if (demo_mode) {
         score=0; lives=3; level=1; score2=0; lives2=3;
@@ -1600,13 +1627,13 @@ void game_pacman_run(game_mode_t mode) {
     // Rotación inicial. El menú de 1/2 jugadores (PM_SELECT) se dibuja
     // en horizontal (rotation=1), igual que el resto de menús
     // compartidos (records, selector de juego) -- se pasa a vertical
-    // (rotation=0, para encajar el laberinto) justo al confirmar la
+    // (rotation=2, para encajar el laberinto) justo al confirmar la
     // partida, ver el case PM_SELECT en pm_tick(). En modo demo no hay
     // pantalla de selección, así que se entra directo en vertical.
-    // rotation=0 -> 240x320; si en tu panel sale al revés, prueba rotation=2
-    // (misma resolución, 180° girada) -- ver comentario de st7789_set_rotation
-    // en st7789.h.
-    st7789_set_rotation(demo_mode ? 0 : 1);
+    // rotation=2 -> 240x320, la orientación correcta confirmada en
+    // este panel (180° girada respecto a rotation=0, que salía al
+    // revés) -- ver comentario de st7789_set_rotation en st7789.h.
+    st7789_set_rotation(demo_mode ? 2 : 1);
     renderer_clear(COLOR_BLACK);
     renderer_flush();
 

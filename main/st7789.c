@@ -1,6 +1,8 @@
 #include "st7789.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <assert.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "driver/spi_master.h"
@@ -111,9 +113,24 @@ static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
 /* ---------------------------------------------------------
  * Framebuffer (doble buffer), en uint16_t nativo (RGB565 normal,
  * sin swap manual de bytes).
+ *
+ * RESERVADO EN HEAP, no static -- 320*240*2 = 153600 bytes (150KB)
+ * es demasiado para vivir como array `static` en dram0_0_seg (la
+ * región fija del enlazador donde tiene que caber TODA la memoria
+ * .bss/.data de TODOS los .c del proyecto, juegos incluidos). Con
+ * esta placa (ESP32 WROOM, sin PSRAM) sigue siendo RAM interna
+ * normal -- heap_caps_malloc() sin más flags que MALLOC_CAP_8BIT
+ * tira del heap general, que es una región del enlazador bastante
+ * más holgada que dram0_0_seg. st7789_init() lo reserva una sola
+ * vez al arrancar y no se libera nunca (vive toda la vida del
+ * firmware, igual que antes como array `static`) -- si
+ * heap_caps_malloc() devuelve NULL aquí, no hay pantalla posible,
+ * así que se aborta con ESP_ERROR_CHECK en vez de seguir con un
+ * puntero nulo.
  * --------------------------------------------------------- */
 #define FB_MAX_PIXELS ((uint32_t)320 * 240)
-static uint16_t framebuffer[FB_MAX_PIXELS];
+#define FB_SIZE_BYTES  (FB_MAX_PIXELS * sizeof(uint16_t))
+static uint16_t *framebuffer;
 
 /* ---------------------------------------------------------
  * Lista de rectangulos sucios -- ver comentario largo de arriba.
@@ -538,10 +555,65 @@ void st7789_init(void) {
     st7789_set_rotation(1); // apaisada 320x240
     esp_lcd_panel_disp_on_off(s_panel, true);
 
-    s_band_buf[0] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
-    s_band_buf[1] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
+    // Framebuffer principal PRIMERO, antes que s_band_buf[] -- orden
+    // importante, no arbitrario. En esta placa (ESP32 WROOM) el heap
+    // interno arranca ya fragmentado en varios bloques no contiguos
+    // (así es el mapa de memoria de la ESP32); el framebuffer (150KB)
+    // solo cabe entero en el bloque más grande de todos. Si
+    // s_band_buf[] se reservara antes y el asignador metiera esos
+    // ~50KB en ese mismo bloque grande, ya no quedaría hueco
+    // contiguo para el framebuffer después -- eso es exactamente lo
+    // que pasaba en el orden anterior (assert saltando en tiempo de
+    // arranque con heap total de sobra, pero sin un solo bloque de
+    // 150KB libre). Reservando el framebuffer primero se queda con
+    // ese bloque grande casi entero, y s_band_buf[] (más pequeño)
+    // encaja después en el siguiente bloque libre sin problema.
+    //
+    // NOTA: en la ESP32 "clásica" (a diferencia de la S2/S3) casi
+    // toda la RAM interna es DMA-capable, así que MALLOC_CAP_DMA y
+    // MALLOC_CAP_8BIT tiran del mismo heap, no de pools separados --
+    // el framebuffer no necesita MALLOC_CAP_DMA porque nunca se pasa
+    // directo a esp_lcd_panel_draw_bitmap() (solo se copia banda a
+    // banda a s_band_buf[], que sí lo es), pero eso no lo aísla de
+    // competir por el mismo espacio; lo que de verdad evita el
+    // conflicto es el ORDEN de reserva, no la capability distinta.
+    // DIAGNÓSTICO TEMPORAL -- ver qué bloque libre hay de verdad justo
+    // antes de cada reserva, y qué puntero concreto sale NULL. El
+    // assert combinado no decía CUÁL de los tres fallaba; esto sí.
+    // Quitar este bloque (dejando solo las 3 líneas de malloc + un
+    // assert normal) en cuanto boot sin problemas.
+    printf("[st7789] antes de framebuffer: 8BIT free=%u largest=%u | DMA free=%u largest=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
-    memset(framebuffer, 0, sizeof(framebuffer));
+    framebuffer = heap_caps_malloc(FB_SIZE_BYTES, MALLOC_CAP_8BIT);
+    printf("[st7789] framebuffer (%u bytes) = %p\n", (unsigned)FB_SIZE_BYTES, (void *)framebuffer);
+
+    printf("[st7789] antes de band_buf: 8BIT free=%u largest=%u | DMA free=%u largest=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+
+    s_band_buf[0] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
+    printf("[st7789] s_band_buf[0] (%u bytes) = %p\n",
+           (unsigned)(320 * FLUSH_BAND_ROWS * sizeof(uint16_t)), (void *)s_band_buf[0]);
+
+    s_band_buf[1] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
+    printf("[st7789] s_band_buf[1] (%u bytes) = %p\n",
+           (unsigned)(320 * FLUSH_BAND_ROWS * sizeof(uint16_t)), (void *)s_band_buf[1]);
+
+    if (!framebuffer)     printf("[st7789] FALLO: framebuffer es NULL\n");
+    if (!s_band_buf[0])   printf("[st7789] FALLO: s_band_buf[0] es NULL\n");
+    if (!s_band_buf[1])   printf("[st7789] FALLO: s_band_buf[1] es NULL\n");
+    fflush(stdout);
+
+    assert(framebuffer && s_band_buf[0] && s_band_buf[1]
+           && "st7789: sin RAM suficiente para framebuffer/band buffers");
+
+    memset(framebuffer, 0, FB_SIZE_BYTES);
     mark_dirty(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);
     st7789_flush();
 }

@@ -21,5 +21,5 @@
   },
   "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf",
   "idf.flashType": "UART",
-  "idf.port": "/dev/ttyUSB0"
+  "idf.port": "COM5"
 }

@@ -937,7 +937,7 @@ static void draw_ready_screen(void) {
 
     const char *l1 = "STICK: GIRAR NAVE";
     const char *l2 = "A: SUAVE   B: FUERTE";
-    const char *l3 = "CLICK STICK: MANIOBRA";
+    const char *l3 = "ARRIBA: MANIOBRA ATERRIZAJE";
     const char *l4 = "MENOS ANCHO = MAS PUNTOS";
     const char *l5 = "PULSA PARA JUGAR";
 
@@ -1026,7 +1026,7 @@ static void ll_tick(void) {
              * Corregido: antes exigía que la nave YA estuviera casi
                 Maniobra de aterrizaje solo si se está a baja altura y la velocidad es baja
              */
-             if (controls_button_pressed(BTN_IDX_J1_SW) && fuel > 0) {
+             if (controls_get_raw_delta(0) < 0 && fuel > 0) {
              int vx_disp = ll_abs(FP2PX(ship_vx));
              int vy_disp = ll_abs(FP2PX(ship_vy));
     

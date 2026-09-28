@@ -68,8 +68,8 @@ static bool btn_pressed(button_id_t b) {
  * Eje Y de J1 -> eventos discretos arriba/abajo para el menu, con
  * zona muerta + histeresis + autorepeticion.
  * ----------------------------------------------------------------- */
-#define MENU_AXIS_DEADZONE_RAW   250 // sobre 0-4095
-#define MENU_AXIS_RELEASE_RAW    120 // histeresis
+#define MENU_AXIS_DEADZONE_RAW   600 // sobre 0-4095
+#define MENU_AXIS_RELEASE_RAW    750 // histeresis
 #define MENU_AXIS_REPEAT_MS      180
 
 static bool s_axis_y_held_down = false, s_axis_y_held_up = false;
@@ -182,7 +182,7 @@ bool controls_menu_select(void) {
 // sistema de aceleracion/inercia (enc_momentum en pong.c) que antes
 // recibia cuentas de encoder. /200 da un rango util de
 // aproximadamente -10..10 a fondo de recorrido.
-#define RAW_DELTA_DIVISOR 200
+#define RAW_DELTA_DIVISOR 800
 #define RAW_DELTA_DEADZONE 60 // ignora el ruido cerca del centro
 
 int controls_get_raw_delta(int idx) {

@@ -589,7 +589,8 @@ static void level_init(void) {
 // ─────────────────────────────────────────────────────────────────────────────
 // IA de fantasmas
 // ─────────────────────────────────────────────────────────────────────────────
-#define absi(x)       ((x) < 0 ? -(x) : (x))
+//#define absi(x)       ((x) < 0 ? -(x) : (x))
+static inline int absi(int v) { return v < 0 ? -v : v; }
 #define manh(ac,ar,bc,br) (absi((ac)-(bc)) + absi((ar)-(br)))
 
 // Distancia REAL por el laberinto (BFS) desde el objetivo (tc,tr) a cada
@@ -1398,16 +1399,16 @@ static void draw_frame(void) {
 // por -1 en el eje correspondiente -- es un detalle de cableado/
 // orientación del joystick, no de la lógica del juego, así que no
 // hace falta tocar el resto de read_player_turn() para ajustarlo.
-#define PM_INVERT_X 1
+#define PM_INVERT_X -1
 #define PM_INVERT_Y 1
 
-static inline int absi(int v) { return v < 0 ? -v : v; }
+
 
 static void read_player_turn(int player_idx, Dir *want) {
     // player_idx: 0 = J1, 1 = J2. controls_debug_axis_normalized():
     // 0=J1 X, 1=J1 Y, 2=J2 X, 3=J2 Y.
-    int axis_x = (player_idx == 0) ? 0 : 2;
-    int axis_y = (player_idx == 0) ? 1 : 3;
+    int axis_x = (player_idx == 0) ? 1 : 3;
+    int axis_y = (player_idx == 0) ? 0 : 2;
 
     int dx = controls_debug_axis_normalized(axis_x) * PM_INVERT_X;
     int dy = controls_debug_axis_normalized(axis_y) * PM_INVERT_Y;

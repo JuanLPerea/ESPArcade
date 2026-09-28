@@ -130,7 +130,24 @@ static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
  * --------------------------------------------------------- */
 #define FB_MAX_PIXELS ((uint32_t)320 * 240)
 #define FB_SIZE_BYTES  (FB_MAX_PIXELS * sizeof(uint16_t))
-static uint16_t *framebuffer;
+
+// TROCEADO en FB_CHUNKS bloques independientes, no un único bloque de
+// 150KB: en esta placa (ESP32 WROOM) el mayor bloque contiguo libre
+// al llegar a st7789_init() es de ~144KiB (147456 bytes, medido con
+// heap_caps_get_largest_free_block()), menos de los 153600 que pide
+// un framebuffer completo, aunque hay ~276KB libres en total. Cada
+// trozo son 19200 pixeles = 60 filas de 320 (o 80 de 240 en
+// vertical): múltiplo exacto de ambos anchos, así que una fila NUNCA
+// cruza de un trozo a otro en ninguna rotación y las copias por fila
+// siguen siendo contiguas.
+#define FB_CHUNKS        4
+#define FB_CHUNK_PIXELS  (FB_MAX_PIXELS / FB_CHUNKS)
+static uint16_t *fb_chunk[FB_CHUNKS];
+
+// Puntero al pixel de índice lineal idx (y*ancho + x).
+static inline uint16_t *fb_ptr(uint32_t idx) {
+    return &fb_chunk[idx / FB_CHUNK_PIXELS][idx % FB_CHUNK_PIXELS];
+}
 
 /* ---------------------------------------------------------
  * Lista de rectangulos sucios -- ver comentario largo de arriba.
@@ -249,7 +266,7 @@ static void flush_one_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
         uint16_t *buf = s_band_buf[buf_idx];
         for (uint16_t r = 0; r < rows; r++) {
             uint32_t off = fb_index(x0, band_y0 + r);
-            memcpy(&buf[(size_t)r * w], &framebuffer[off], (size_t)w * sizeof(uint16_t));
+            memcpy(&buf[(size_t)r * w], fb_ptr(off), (size_t)w * sizeof(uint16_t));
         }
 
         esp_lcd_panel_draw_bitmap(s_panel, x0, band_y0, x1 + 1, band_y0 + rows, buf);
@@ -277,7 +294,8 @@ void st7789_flush(void) {
 void st7789_fill_screen(uint16_t color) {
     if (color == COLOR_BLACK || color == COLOR_WHITE) {
         uint8_t b = (color == COLOR_BLACK) ? 0x00 : 0xFF;
-        memset(framebuffer, b, (size_t)TFT_WIDTH * TFT_HEIGHT * sizeof(uint16_t));
+        for (int i = 0; i < FB_CHUNKS; i++)
+            memset(fb_chunk[i], b, FB_CHUNK_PIXELS * sizeof(uint16_t));
         mark_dirty(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);
         return;
     }
@@ -286,7 +304,7 @@ void st7789_fill_screen(uint16_t color) {
 
 void st7789_draw_pixel(uint16_t x, uint16_t y, uint16_t color) {
     if (x >= TFT_WIDTH || y >= TFT_HEIGHT) return;
-    framebuffer[fb_index(x, y)] = color;
+    *fb_ptr(fb_index(x, y)) = color;
     mark_dirty(x, y, x, y);
 }
 
@@ -297,9 +315,9 @@ void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c
     if (y + h > TFT_HEIGHT) h = TFT_HEIGHT - y;
 
     for (uint16_t row = 0; row < h; row++) {
-        uint32_t offset = fb_index(x, y + row);
+        uint16_t *p = fb_ptr(fb_index(x, y + row));
         for (uint16_t col = 0; col < w; col++) {
-            framebuffer[offset + col] = color;
+            p[col] = color;
         }
     }
     mark_dirty(x, y, x + w - 1, y + h - 1);
@@ -477,7 +495,7 @@ void st7789_blit_to_buffer(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, con
 
     for (uint16_t row = 0; row < h; row++) {
         uint32_t offset = fb_index(x0, y0 + row);
-        memcpy(&framebuffer[offset], buf + (uint32_t)row * w, (size_t)w * sizeof(uint16_t));
+        memcpy(fb_ptr(offset), buf + (uint32_t)row * w, (size_t)w * sizeof(uint16_t));
     }
     mark_dirty(x0, y0, x0 + w - 1, y0 + h - 1);
 }
@@ -555,65 +573,29 @@ void st7789_init(void) {
     st7789_set_rotation(1); // apaisada 320x240
     esp_lcd_panel_disp_on_off(s_panel, true);
 
-    // Framebuffer principal PRIMERO, antes que s_band_buf[] -- orden
-    // importante, no arbitrario. En esta placa (ESP32 WROOM) el heap
-    // interno arranca ya fragmentado en varios bloques no contiguos
-    // (así es el mapa de memoria de la ESP32); el framebuffer (150KB)
-    // solo cabe entero en el bloque más grande de todos. Si
-    // s_band_buf[] se reservara antes y el asignador metiera esos
-    // ~50KB en ese mismo bloque grande, ya no quedaría hueco
-    // contiguo para el framebuffer después -- eso es exactamente lo
-    // que pasaba en el orden anterior (assert saltando en tiempo de
-    // arranque con heap total de sobra, pero sin un solo bloque de
-    // 150KB libre). Reservando el framebuffer primero se queda con
-    // ese bloque grande casi entero, y s_band_buf[] (más pequeño)
-    // encaja después en el siguiente bloque libre sin problema.
-    //
-    // NOTA: en la ESP32 "clásica" (a diferencia de la S2/S3) casi
-    // toda la RAM interna es DMA-capable, así que MALLOC_CAP_DMA y
-    // MALLOC_CAP_8BIT tiran del mismo heap, no de pools separados --
-    // el framebuffer no necesita MALLOC_CAP_DMA porque nunca se pasa
-    // directo a esp_lcd_panel_draw_bitmap() (solo se copia banda a
-    // banda a s_band_buf[], que sí lo es), pero eso no lo aísla de
-    // competir por el mismo espacio; lo que de verdad evita el
-    // conflicto es el ORDEN de reserva, no la capability distinta.
-    // DIAGNÓSTICO TEMPORAL -- ver qué bloque libre hay de verdad justo
-    // antes de cada reserva, y qué puntero concreto sale NULL. El
-    // assert combinado no decía CUÁL de los tres fallaba; esto sí.
-    // Quitar este bloque (dejando solo las 3 líneas de malloc + un
-    // assert normal) en cuanto boot sin problemas.
-    printf("[st7789] antes de framebuffer: 8BIT free=%u largest=%u | DMA free=%u largest=%u\n",
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-
-    framebuffer = heap_caps_malloc(FB_SIZE_BYTES, MALLOC_CAP_8BIT);
-    printf("[st7789] framebuffer (%u bytes) = %p\n", (unsigned)FB_SIZE_BYTES, (void *)framebuffer);
-
-    printf("[st7789] antes de band_buf: 8BIT free=%u largest=%u | DMA free=%u largest=%u\n",
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-
+    // Framebuffer en FB_CHUNKS trozos (ver comentario en su declaración)
+    // y ANTES que s_band_buf[]: los trozos son los que más espacio
+    // piden, así que se reservan primero mientras el heap está menos
+    // fragmentado. Los band buffers (25KB c/u) caben después en lo
+    // que quede.
+    bool ok = true;
+    for (int i = 0; i < FB_CHUNKS; i++) {
+        fb_chunk[i] = heap_caps_malloc(FB_CHUNK_PIXELS * sizeof(uint16_t), MALLOC_CAP_8BIT);
+        if (!fb_chunk[i]) { printf("[st7789] FALLO: fb_chunk[%d] NULL\n", i); ok = false; }
+    }
     s_band_buf[0] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
-    printf("[st7789] s_band_buf[0] (%u bytes) = %p\n",
-           (unsigned)(320 * FLUSH_BAND_ROWS * sizeof(uint16_t)), (void *)s_band_buf[0]);
-
     s_band_buf[1] = heap_caps_malloc(320 * FLUSH_BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
-    printf("[st7789] s_band_buf[1] (%u bytes) = %p\n",
-           (unsigned)(320 * FLUSH_BAND_ROWS * sizeof(uint16_t)), (void *)s_band_buf[1]);
+    if (!s_band_buf[0] || !s_band_buf[1]) { printf("[st7789] FALLO: s_band_buf NULL\n"); ok = false; }
+    if (!ok) {
+        printf("[st7789] heap libre=%u mayor bloque=%u\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        fflush(stdout);
+    }
+    assert(ok && "st7789: sin RAM suficiente para framebuffer/band buffers");
 
-    if (!framebuffer)     printf("[st7789] FALLO: framebuffer es NULL\n");
-    if (!s_band_buf[0])   printf("[st7789] FALLO: s_band_buf[0] es NULL\n");
-    if (!s_band_buf[1])   printf("[st7789] FALLO: s_band_buf[1] es NULL\n");
-    fflush(stdout);
-
-    assert(framebuffer && s_band_buf[0] && s_band_buf[1]
-           && "st7789: sin RAM suficiente para framebuffer/band buffers");
-
-    memset(framebuffer, 0, FB_SIZE_BYTES);
+    for (int i = 0; i < FB_CHUNKS; i++)
+        memset(fb_chunk[i], 0, FB_CHUNK_PIXELS * sizeof(uint16_t));
     mark_dirty(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);
     st7789_flush();
 }

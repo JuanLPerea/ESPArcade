@@ -1010,7 +1010,7 @@ static void update_big_ship(void) {
     int32_t zone_start_px = (int32_t)(ZONE_BIG_SHIP * ZONE_LENGTH);
     int32_t screen_left_px = scroll_px - 80;
 
-    int base_sx = alien_screen_x();
+  //  int base_sx = alien_screen_x();
 
     if (!scroll_locked && screen_left_px >= zone_start_px) {
         scroll_locked = true;
@@ -1267,7 +1267,7 @@ static void draw_bombs(void) {
 
 static void draw_ship(void) {
     int x0=ship_x, x1=ship_x+SHIP_W;
-    int ytop=ship_y, ybot=ship_y+SHIP_H-1, ymid=ship_y+SHIP_H/2;
+    int ytop=ship_y, ymid=ship_y+SHIP_H/2;
     bool hide = (ship_inv_ticks>0) && ((blink/4)%2==0);
     if (hide) return;
 
@@ -1341,7 +1341,7 @@ static void draw_zone_banner(void) {
     int tw = (int)st7789_text_width(txt, (uint8_t)fs);
     int pad = 8;
   //  int bx = CX - tw/2 - pad, by = CY - 14;
-    int bw = tw + 2*pad,      bh = 28;
+  
    // renderer_fill_rect(bx, by, bw, bh, COLOR_BLACK);
    // renderer_fill_rect(bx, by, bw, 1, COLOR_WHITE);
    // renderer_fill_rect(bx, by+bh-1, bw, 1, COLOR_WHITE);
@@ -1402,7 +1402,7 @@ static void draw_title_screen(void) {
     // ==========================================
     int start_y = 70;
     int col1_x = 55;
-    int col2_x = 180;
+   // int col2_x = 180;
 
     // Fila 1: Base / Radar
     // Dibujito simple de base

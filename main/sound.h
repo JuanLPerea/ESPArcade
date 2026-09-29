@@ -54,6 +54,61 @@ bool sound_tetris_music_is_playing(void);
 
 
 /*
+ * Fanfarria de victoria de Scramble (~3200ms, una sola vez, no
+ * bloqueante). Melodía original de este proyecto: arpegio ascendente
+ * de Do mayor y resolución en el Do agudo, canal 1 (melodía,
+ * triangular) + canal 2 (bajo, cuadrada) -- si sonaba música de menú
+ * o de Tetris, la para.
+ *
+ * El canal 3 (efectos) queda libre a propósito, así las explosiones
+ * del jefe se siguen oyendo por encima de la música. Termina sola;
+ * sound_stop_scramble_victory() la corta antes de tiempo si hace
+ * falta (p.ej. al salir del juego a mitad).
+ */
+void sound_start_scramble_victory(void);
+void sound_stop_scramble_victory(void);
+bool sound_scramble_victory_is_playing(void);
+
+
+/*
+ * Pistas de la música del menú.
+ *
+ *   0 -> GREENSLEEVES   (la original, Mi menor, 6/4)
+ *   1 -> NEON CIRCUIT   (La menor, arcade de arpegios, 12.8s)
+ *   2 -> STAR PATROL    (Do mayor, marcha espacial más rápida, 9.6s)
+ *
+ * sound_set_menu_track() se puede llamar con la música ya sonando:
+ * el cambio se nota al momento. Un valor fuera de rango se ignora.
+ */
+#define SOUND_MENU_TRACK_COUNT 3
+
+void    sound_set_menu_track(uint8_t track);
+void    sound_next_menu_track(void);
+uint8_t sound_get_menu_track(void);
+
+/* Duración en ms de una vuelta completa a la pista "track" (suma de
+ * todas sus notas). Para encadenar pistas con un hueco de silencio
+ * entre medias sin tener que llevar esa cuenta aparte -- ver el menú
+ * principal. Un "track" fuera de rango devuelve 0. */
+uint32_t sound_menu_track_duration_ms(uint8_t track);
+
+
+/*
+ * Jingle de inicio de Paratrooper: Toccata y fuga en re menor BWV 565
+ * (J. S. Bach, dominio público), adaptación del compás de apertura a
+ * 2 voces en octavas, canales 1+2. UNA SOLA PASADA (~8.6s, no en
+ * bucle) -- igual que sound_start_pacman_intro(): suena una vez al
+ * empezar la partida y se apaga sola, dejando sonar solo los efectos
+ * del canal 3 (disparos, explosiones...) el resto de la partida.
+ * sound_stop_paratrooper_music() la corta antes de tiempo si hace
+ * falta (p.ej. al salir del juego a mitad).
+ */
+void sound_start_paratrooper_music(void);
+void sound_stop_paratrooper_music(void);
+bool sound_paratrooper_music_is_playing(void);
+
+
+/*
  * Efectos de sonido.
  *
  * Todos son NO BLOQUEANTES.
@@ -68,6 +123,27 @@ void sound_effect_lose_point(void);
 void sound_effect_victory(void);
 void sound_siren_start(void);
 void sound_siren_stop(void);
+
+/*
+ * Efectos añadidos. Todos sobre el canal 3 (no pisan la música de
+ * fondo de los canales 1+2) y todos NO BLOQUEANTES.
+ *
+ * Los marcados como "barrido" deslizan la frecuencia de forma
+ * continua en vez de saltar de nota en nota, que es lo que les da el
+ * carácter de "pew" / "whoop" en vez de sonar a escalera.
+ */
+void sound_effect_laser(void);        /* barrido: disparo agudo y seco   */
+void sound_effect_laser_big(void);    /* barrido: disparo grave y potente*/
+void sound_effect_powerup(void);      /* barrido ascendente: mejora      */
+void sound_effect_powerdown(void);    /* barrido descendente: pérdida    */
+void sound_effect_coin(void);         /* 2 notas: bonus recogido         */
+void sound_effect_jump(void);         /* barrido corto ascendente: salto */
+void sound_effect_hit(void);          /* ruido seco: impacto recibido    */
+void sound_effect_alarm(void);        /* 4 notas alternas: aviso         */
+void sound_effect_teleport(void);     /* barrido largo: materialización  */
+void sound_effect_bounce(void);       /* 2 notas cortas: rebote          */
+void sound_effect_thrust(void);       /* ruido grave: propulsor          */
+void sound_effect_extra_life(void);   /* arpegio de 4 notas: 1UP         */
 
 /*
  * Motor -- zumbido continuo cuyo tono sube con la velocidad (canal 2,
@@ -145,4 +221,4 @@ void sound_effect_pacman_levelup(void);
 void sound_start_pacman_intro(void);
 void sound_stop_pacman_intro(void);
 
-#endif
+#endif

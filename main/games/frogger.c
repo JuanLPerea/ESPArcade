@@ -812,7 +812,7 @@ static void perform_hop(int player, HopDir dir) {
 
     if (new_row == f->row && new_x == f->x_fp) return;   // bloqueado contra un borde
 
-    sound_effect_move();
+    sound_effect_jump();
 
     if (new_row == ROW_HOME) {
         // Borra el sprite de la rana en su última posición dibujada
@@ -829,7 +829,7 @@ static void perform_hop(int player, HopDir dir) {
             home_filled[k] = true; home_filled_by[k] = player;
             int32_t bonus = (f->timer_ms / 1000) * TIME_BONUS_PER_SEC;
             f->score += HOME_POINTS + bonus;
-            sound_effect_success();
+            sound_effect_powerup();
             draw_home_row();
             renderer_flush();
             f->pause_until = make_timeout_ms(900);
@@ -1051,7 +1051,7 @@ static void fr_tick(void) {
         for (int k = 0; k < N_HOME_SLOTS; k++) if (!home_filled[k]) all_filled = false;
         if (all_filled) {
             for (int p = 0; p < n_players; p++) frogs[p].score += LEVEL_CLEAR_BONUS;
-            sound_effect_victory();
+            sound_effect_extra_life();
             update_message("NIVEL COMPLETO", COLOR_YELLOW, 2);
             pause_until = make_timeout_ms(1500);
             state = FR_LEVEL_CLEAR;
@@ -1061,7 +1061,7 @@ static void fr_tick(void) {
         bool all_done = true;
         for (int p = 0; p < n_players; p++) if (frogs[p].pstate != PS_DONE) all_done = false;
         if (all_done) {
-            sound_effect_game_over();
+            sound_effect_powerdown();
             update_message("GAME OVER", COLOR_RED, 3);
             pause_until = make_timeout_ms(2000);
             game_over_deadline = make_timeout_ms(8000);   // avanza solo si nadie pulsa nada

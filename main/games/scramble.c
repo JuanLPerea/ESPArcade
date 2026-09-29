@@ -1,66 +1,44 @@
 /**
- * scramble.c -- recreación ampliada del clásico de Konami (1981),
- * portado de la version Pico (scramble_Pico.c) a ArcadeColor / ESP32,
- * mismo concepto que asteroids.c/breakout.c/pong.c: 6 zonas (Montañas,
- * OVNIs, Meteoritos, Picos Altos, Cueva Estrecha, Jefe Final), objetos
- * de tierra/aire, jefe final con parrilla de "ladrillos" destructibles
- * + núcleo, partículas de explosión, bombas parabólicas y colores de
- * zona aleatorios por nivel.
+ * scramble.c -- recreación ampliada del clásico de Konami (1981) para
+ * ArcadeColor / ESP32. Portado de la última versión de la Pico
+ * (scramble_pico.c); 6 zonas (Montañas, OVNIs, Meteoritos, Picos Altos,
+ * Cueva Estrecha, Jefe Final), objetos de tierra/aire, jefe final con
+ * parrilla de "ladrillos" destructibles + núcleo, partículas de
+ * explosión, bombas parabólicas y colores de zona aleatorios por nivel.
  *
- * PORT A ESP32 -- igual que asteroids.c: nada de Pico SDK
- * (pico/stdlib.h, absolute_time_t, sleep_ms, time_us_32...), sustituido
- * por esp_timer.h + FreeRTOS. La lógica de juego (terreno procedural,
- * pool de objetos, jefe, partículas, bombas parabólicas con sinf/cosf)
- * es idéntica a la version Pico -- no depende de nada del SDK, así que
- * se porta literal. Lo que cambia:
+ * ACTUALIZADO con los cambios de la versión Pico:
+ *  - Campo a pantalla completa (320x240, sin marco blanco).
+ *  - Terreno: las columnas se recortan a la parte visible. Antes, una
+ *    columna con screen_x negativo llegaba a renderer_fill_rect() como
+ *    uint16_t gigante y el driver descartaba la llamada entera, dejando
+ *    rastros de nave/balas en el nivel del jefe. Con esto ya no hace
+ *    falta el renderer_clear() por frame que se usaba de apaño.
+ *  - Jefe: entra por la derecha (alien_x = scroll + PLAY_W + 40) y
+ *    bloquea el scroll al llegar a PLAY_W-160; al bloquear se limpian
+ *    los objetos de tierra que quedarían flotando.
+ *  - Muerte del jefe: fanfarria sound_start_scramble_victory() (canales
+ *    1+2, deja libre el 3 para las explosiones), oleadas de explosiones
+ *    BOOM_HUGE repartidas por su cuerpo durante BOSS_BOOM_TICKS,
+ *    MAX_PARTICLES 48 -> 110 y pausa de victoria de 5 s.
+ *  - Vida extra cada 5000 puntos (while: un bonus grande puede cruzar
+ *    varios umbrales) con aviso "EXTRA LIFE!" y sound_effect_extra_life().
+ *  - Vidas iniciales: 3 (antes 99, valor de depuración).
+ *  - Sonidos: disparo = sound_effect_laser(), bomba = sound_effect_bounce().
  *
- *  - Bucle a ritmo fijo con vTaskDelayUntil() (igual que asteroids.c/
- *    pong.c/breakout.c) en vez de sleep_ms(1): con el tick rate por
- *    defecto de FreeRTOS en ESP-IDF (100Hz) un sleep_ms(1) no tiene
- *    equivalente fino, así que se apunta directamente a TARGET_FPS=60
- *    con pdMS_TO_TICKS(). A diferencia de asteroids.c, aquí NO se
- *    añade escalado de física por delta-time real (g_dt_scale): el
- *    scramble.c original de Pico ya tenía todas sus constantes de
- *    velocidad (SCROLL_SPD*, SHIP_*, BULLET_SPD...) ajustadas a mano
- *    asumiendo un tick de ritmo fijo, no tiempo real medido -- meter
- *    dt_scale aquí habría alterado el balance del juego sin necesidad.
- *    Si en tu hardware el reparto de trabajo por SPI hace que el
- *    juego se note "acelerado" o "a tirones", es la primera pista a
- *    revisar (ver el mismo comentario, más largo, en asteroids.c).
- *  - Tiempo real: rng_state_v se siembra con esp_timer_get_time() en
- *    vez de time_us_32() (no existe fuera del Pico SDK).
- *  - Controles: el encoder 1 del original (giro = inercia vertical de
- *    la nave, click = empuje horizontal) se sustituye por el joystick
- *    1 -- MISMO PATRÓN que controls_get_raw_delta(0) ya tenía en la
- *    version Pico: en controls.h de ESP32 ese índice YA ES el eje Y
- *    del joystick 1, así que la llamada no cambia ni una letra
- *    (ver enc_momentum() en scr_tick(), idéntica a la original). El
- *    empuje horizontal, que en el original dependía del switch del
- *    encoder (BTN_ENC1_SW), pasa a leerse del eje X del MISMO stick
- *    vía controls_get_raw_delta_x(0) -- inclinar a la derecha empuja,
- *    soltar retrae -- así que Scramble no usa ya ningún botón para
- *    el empuje (ver update_ship_thrust()). BTN_J1_A/BTN_J1_B
- *    (disparo/bomba) pasan a ser los índices 0/1 de
- *    controls_button_down()/controls_button_pressed(), tal como los
- *    documenta controls.h -- incluida la pantalla de título, que
- *    ahora menciona "STICK: ALTURA & EMPUJE" en vez de "GIRO ENC".
- *  - Sonido/highscores: sound_effect_*()/highscores_*() ya coinciden
- *    exactamente con sound.h/highscores.h de ESP32 (mismas firmas que
- *    ya usaba space_invaders.c/asteroids.c), así que no cambia nada.
- *  - Sin hs_input/SCR_ENTER_NAME: highscores_enter() bloqueante, como
- *    en los otros juegos.
- *  - Bucle propio: game_scramble_run(mode) con su propio bucle, nada
- *    de callbacks de dibujo/tick registrados aparte.
- *
- * OJO -- revisar antes de dar el port por bueno:
- *  - game_start() fija `lives = 99`, pero el comentario original de
- *    cabecera de la version Pico decía "Vidas: 3 (como el scramble.c
- *    original), no 99 (el HTML usaba 99 como ayuda de depuración)".
- *    Es decir, el propio autor de la version Pico ya avisaba de que
- *    99 era un valor de depuración que debía volver a 3 y se quedó
- *    sin cambiar en el .c. Se ha portado tal cual (99) para no alterar
- *    el comportamiento sin que lo decidas tú -- cambia el literal en
- *    game_start() si quieres las 3 vidas "de producción".
+ * SE MANTIENE lo específico de la ESP32 (no viene de la Pico):
+ *  - Bucle a ritmo fijo con vTaskDelayUntil() a TARGET_FPS=60 en vez de
+ *    sleep_ms(1), y esp_timer_get_time() en vez de time_us_32(). No hay
+ *    escalado de física por delta-time: las constantes de velocidad
+ *    están ajustadas a mano para un tick fijo.
+ *  - Controles con joystick 1: eje Y = altura con inercia
+ *    (controls_get_raw_delta(0) + enc_momentum()), eje X = empuje
+ *    horizontal (controls_get_raw_delta_x(0) > THRUST_X_DEADZONE);
+ *    BTN_IDX_J1_A = disparo, BTN_IDX_J1_B = bomba. Constantes de
+ *    respuesta de la nave (SHIP_ACCEL, SHIP_VEL_MAX, THRUST_*) más
+ *    suaves que las de la Pico, pensadas para stick analógico.
+ *  - Pantalla de título: "STICK: ALTURA & EMPUJE (DER.)".
+ *  - Sin hs_input/SCR_ENTER_NAME: highscores_enter() bloqueante.
+ *  - Bucle propio: game_scramble_run(mode).
  */
 
 #include <stdlib.h>
@@ -102,12 +80,12 @@
 #define SCREEN_W 320
 #define SCREEN_H 240
 
-#define PLAY_X   4
-#define PLAY_Y   3
-#define PLAY_W   (SCREEN_W - 2 * PLAY_X)   // 312
-#define PLAY_H   (SCREEN_H - 2 * PLAY_Y)   // 234
-#define CX       (PLAY_X + PLAY_W / 2)
-#define CY       (PLAY_Y + PLAY_H / 2)
+#define PLAY_X   0
+#define PLAY_Y   0
+#define PLAY_W   SCREEN_W
+#define PLAY_H   SCREEN_H
+#define CX       (SCREEN_W / 2)
+#define CY       (SCREEN_H / 2)
 
 #define TICKS_S  60   // referencia nominal para pausas simples (no rítmicas)
 #define ZONE_BANNER_TICKS (TICKS_S * 2)   // duración del rótulo de zona sobreimpreso
@@ -177,6 +155,7 @@ static int ship_vel = 0;
 static int ship_x  = SHIP_X_MIN;
 static int ship_vx = 0;
 static int ship_y, ship_inv_ticks;
+static int centered_x(const char *text, int scale);
 
 static int enc_momentum(int enc_raw, int *vel) {
     if (enc_raw > 0) {
@@ -381,14 +360,23 @@ static EnemyBullet enemy_bullets[MAX_ENEMY_BULLETS];
 // Partículas de explosión (versión reducida del HTML para no saturar
 // el bus SPI con demasiados renderer_fill_rect() por frame).
 // ---------------------------------------------------------------------------
-#define MAX_PARTICLES 48
+// Subido de 48 a 110: la muerte del jefe lanza varias oleadas de
+// partículas solapadas (ver boss_boom_ticks en scr_tick()) y con 48
+// se agotaba el pool enseguida, así que las oleadas siguientes se
+// quedaban sin partículas y la explosión se veía pobre.
+#define MAX_PARTICLES 110
 
 typedef struct { bool active; float x,y,vx,vy; int life; uint16_t color; } Particle;
 static Particle particles[MAX_PARTICLES];
 
-static void add_explosion(float x, float y, bool big) {
+// Tamaños de explosión. HUGE es el de la muerte del jefe: más
+// partículas, más rápidas y con vida más larga que el "big" normal
+// (que se sigue usando para la nave del jugador).
+typedef enum { BOOM_SMALL, BOOM_BIG, BOOM_HUGE } boom_size_t;
+
+static void add_explosion_sz(float x, float y, boom_size_t sz) {
     static const uint16_t pcolors[4] = { COLOR_WHITE, COLOR_YELLOW, COLOR_RED, COLOR_CYAN };
-    int count = big ? 40 : 8;
+    int count = (sz==BOOM_HUGE) ? 34 : (sz==BOOM_BIG) ? 40 : 8;
     int created = 0;
     for (int i=0;i<MAX_PARTICLES && created<count;i++) {
         if (particles[i].active) continue;
@@ -396,13 +384,22 @@ static void add_explosion(float x, float y, bool big) {
         p->active = true;
         p->x = x; p->y = y;
         float angle = rng_float() * 2.0f * (float)M_PI;
-        float speed = big ? (1.5f + rng_float()*6.0f) : (1.0f + rng_float()*3.5f);
+        float speed = (sz==BOOM_HUGE) ? (2.0f + rng_float()*8.0f)
+                    : (sz==BOOM_BIG)  ? (1.5f + rng_float()*6.0f)
+                                      : (1.0f + rng_float()*3.5f);
         p->vx = cosf(angle) * speed;
         p->vy = sinf(angle) * speed;
-        p->life = big ? (18 + (int)(rng_next()%20)) : (10 + (int)(rng_next()%10));
+        p->life = (sz==BOOM_HUGE) ? (30 + (int)(rng_next()%30))
+                : (sz==BOOM_BIG)  ? (18 + (int)(rng_next()%20))
+                                  : (10 + (int)(rng_next()%10));
         p->color = pcolors[rng_next() % 4];
         created++;
     }
+}
+
+// Se mantiene la firma antigua para no tocar el resto de llamadas.
+static void add_explosion(float x, float y, bool big) {
+    add_explosion_sz(x, y, big ? BOOM_BIG : BOOM_SMALL);
 }
 
 static void update_particles(void) {
@@ -495,9 +492,7 @@ static void init_big_ship(int32_t scroll_px_now) {
             num_bricks++;
         }
     }
-    
-    int32_t zone_start_px = (int32_t)ZONE_BIG_SHIP * ZONE_LENGTH;
-    alien_x = zone_start_px + PLAY_W - 80;
+    alien_x = scroll_px_now + PLAY_W + 40;
     alien_base_y = PLAY_Y + 35;
     alien_t = rng_float() * 2.0f * (float)M_PI;
     alien_hp = ALIEN_MAX_HP;
@@ -532,13 +527,58 @@ typedef enum {
 static ScrState state;
 static bool demo, g_done;
 static bool scroll_locked, boss_engaged;
+
+// Muerte del jefe: durante BOSS_BOOM_TICKS el OVNI deja de dibujarse
+// y se van soltando oleadas de explosiones repartidas por donde
+// estaba su cuerpo, en vez de un único estallido en el centro.
+#define BOSS_BOOM_TICKS (TICKS_S*2)
+static int  boss_boom_ticks;
+static int  boss_boom_x, boss_boom_y;   // esquina sup-izq del OVNI al morir
+static bool boss_destroyed;
 static int  blink, demo_ticks, pause_cnt;
 static int  lives, level, score, fuel, fuel_cd;
 static int  zone;
 static int  zone_banner_ticks;   // ver draw_zone_banner()
+static int extra_life_banner_ticks;
 static int32_t scroll_px, next_spawn_world;
 static int  scroll_acc, scroll_spd;
 static int  shoot_cd, bomb_cd;
+
+// Vida extra cada EXTRA_LIFE_SCORE puntos (5000). next_extra_life
+// guarda el próximo umbral a superar; se reinicia en game_start().
+// Usa un "while" en vez de un "if" porque un bonus grande de una
+// sola vez (p.ej. destruir al jefe: SCR_ALIEN_BONUS*level, que ya
+// supera los 5000 a partir del nivel 2) puede cruzar más de un
+// umbral de golpe -- así se conceden todas las vidas que tocan, no
+// solo una.
+#define EXTRA_LIFE_SCORE 5000
+static int  next_extra_life;
+
+static void check_extra_life(void) {
+    while (score >= next_extra_life) {
+        lives++;
+        sound_effect_stop();
+        sound_effect_extra_life();
+
+        // Mostrar aviso de vida extra
+        extra_life_banner_ticks = TICKS_S * 2;
+
+        next_extra_life += EXTRA_LIFE_SCORE;
+    }
+}
+
+static void draw_extra_life_banner(void) {
+    if (extra_life_banner_ticks <= 0) return;
+
+    const char *txt = "EXTRA LIFE!";
+    const int fs = 2;
+
+    renderer_draw_text(centered_x(txt, fs), CY - 90,
+                       txt,
+                       COLOR_YELLOW,
+                       COLOR_BLACK,
+                       fs);
+}
 
 static int fuel_ticks_for_level(void) {
     int t = 20 - (level-1)*2;
@@ -576,13 +616,17 @@ static void ship_respawn(void) {
 }
 
 static void game_start(void) {
-    lives = 99; level = 1; zone = ZONE_STEEP_MOUNTAINS; score = 0;
+    lives = 3; level = 1; zone = ZONE_STEEP_MOUNTAINS; score = 0;
+    next_extra_life = EXTRA_LIFE_SCORE;
+    extra_life_banner_ticks = 0;
     fuel = FUEL_MAX; fuel_cd = fuel_ticks_for_level();
     scroll_px = 0; scroll_acc = 0;
     scroll_spd = SCROLL_SPD0;
     next_spawn_world = 250;
     scroll_locked = false;
     boss_engaged = false;
+    boss_destroyed = false;
+    boss_boom_ticks = 0;
     rng_state_v = (uint32_t)esp_timer_get_time();
     randomize_level_colors();
 
@@ -601,6 +645,8 @@ static void next_level_setup(void) {
     zone = ZONE_STEEP_MOUNTAINS;
     scroll_locked = false;
     boss_engaged = false;
+    boss_destroyed = false;
+    boss_boom_ticks = 0;
     scroll_px = 0; scroll_acc = 0;
     scroll_spd = SCROLL_SPD0 + (level-1)*SCROLL_SPD_INC;
     if (scroll_spd > SCROLL_SPD_MAX) scroll_spd = SCROLL_SPD_MAX;
@@ -769,7 +815,7 @@ static void try_shoot(void) {
         bullets[i].x = ship_x+SHIP_W;
         bullets[i].y = ship_y+SHIP_H/2-1;
         shoot_cd = SHOOT_COOLDOWN;
-        sound_effect_shoot();
+        sound_effect_laser();
         return;
     }
 }
@@ -784,7 +830,7 @@ static void try_bomb(void) {
         bombs[i].vx = BOMB_INIT_VX;
         bombs[i].vy = BOMB_INIT_VY;
         bomb_cd = BOMB_COOLDOWN;
-        sound_effect_shoot();
+        sound_effect_bounce();
         return;
     }
 }
@@ -831,10 +877,24 @@ static bool check_alien_hit(float x, float y, int w, int h) {
         sound_effect_select();
         add_explosion(ax+ALIEN_CORE_W/2, ay+ALIEN_CORE_H/2, false);
         if (alien_hp <= 0) {
-            sound_effect_success();
-            add_explosion(ax+ALIEN_CORE_W/2, ay+ALIEN_CORE_H/2, true);
+            // Fanfarria completa en vez del "beep" de sound_effect_success():
+            // usa canales 1+2 y deja libre el 3, así los estallidos de las
+            // oleadas siguientes se siguen oyendo por encima.
+            sound_start_scramble_victory();
+
+            // Primer estallido en el núcleo; el resto lo va soltando
+            // scr_tick() mientras boss_boom_ticks baja, repartido por
+            // todo el cuerpo del OVNI (ver BOSS_BOOM_TICKS).
+            add_explosion_sz(ax+ALIEN_CORE_W/2, ay+ALIEN_CORE_H/2, BOOM_HUGE);
+            boss_boom_x = alien_screen_x();
+            boss_boom_y = (int)top;
+            boss_boom_ticks = BOSS_BOOM_TICKS;
+            boss_destroyed = true;
+
             score += SCR_ALIEN_BONUS * level;
-            pause_cnt = TICKS_S*3;
+            // Antes TICKS_S*3: se alarga para que dé tiempo a ver la
+            // explosión entera y a que suene la fanfarria (~3200ms).
+            pause_cnt = TICKS_S*5;
             state = SCR_VICTORY;
         }
         return true;
@@ -1006,16 +1066,18 @@ static void update_scroll(void) {
 static void update_big_ship(void) {
     if (zone != ZONE_BIG_SHIP) return;
 
-        // Calculamos cuántos píxeles de la pantalla actual pertenecen a la zona del jefe
-    int32_t zone_start_px = (int32_t)(ZONE_BIG_SHIP * ZONE_LENGTH);
-    int32_t screen_left_px = scroll_px - 80;
-
-  //  int base_sx = alien_screen_x();
-
-    if (!scroll_locked && screen_left_px >= zone_start_px) {
+    int base_sx = alien_screen_x();
+    if (!scroll_locked && base_sx <= PLAY_X+PLAY_W-160) {
         scroll_locked = true;
         boss_engaged = true;
- 
+        // Al congelar el scroll para el combate, cualquier cohete/fuel/base
+        // que aún estuviera en pantalla deja de recibir scroll (su sx sólo
+        // depende de world_x - scroll_px, y scroll_px ya no avanza), así
+        // que se quedaba "flotando" fijo para siempre -- la franja de
+        // basura por la izquierda que se veía en el nivel del jefe. Los
+        // OVNIs y meteoritos no tienen este problema (se mueven solos por
+        // world_x independientemente del scroll), así que basta con
+        // limpiar aquí el resto del pool.
         for (int i=0;i<MAX_OBJECTS;i++) {
             if (gobjs[i].active && gobjs[i].type != OBJ_UFO && gobjs[i].type != OBJ_METEOR)
                 gobjs[i].active = false;
@@ -1109,19 +1171,46 @@ static void draw_terrain(void) {
     for (int i=0;i<NUM_COLS;i++) {
         int32_t world_x = (start_col + i) * COL_W;
         int screen_x = PLAY_X + offset_x + i*COL_W;
+        int col_w = COL_W;
+
+        // renderer_fill_rect() recibe x como uint16_t: un screen_x
+        // negativo (columna 0 cuando offset_x anda cerca de -(COL_W-1),
+        // ~84% de los valores posibles) se convertiría al pasarlo en un
+        // número gigante y st7789_fill_rect() descartaría la llamada
+        // ENTERA sin dibujar nada -- ni siquiera la parte que sí cae en
+        // pantalla. Con scroll normal se autocorrige solo frame a
+        // frame (offset_x cambia constantemente), pero en el nivel del
+        // jefe el scroll queda fijo (scroll_locked): si el offset
+        // congelado es de los malos, la columna izquierda del terreno
+        // no se repinta en TODO el combate, y ahí se acumulan sin
+        // borrar los rastros de nave/balas que sí se dibujan encima.
+        // Recortamos la columna a la parte visible en vez de perderla.
+        if (screen_x < PLAY_X) {
+            col_w -= (PLAY_X - screen_x);
+            screen_x = PLAY_X;
+            if (col_w <= 0) continue;
+        }
+        // Por la derecha no hay bug de signo (el driver ya recorta al
+        // ancho del panel), pero NUM_COLS lleva 2 columnas de margen y
+        // sin esto la última se comería el borde blanco del marco.
+        if (screen_x + col_w > PLAY_X + PLAY_W) {
+            col_w = PLAY_X + PLAY_W - screen_x;
+            if (col_w <= 0) continue;
+        }
+
         int col_zone = zone_for_world(world_x);
 
         int fh = floor_h_for(world_x, col_zone);
         int ch = ceil_h_for(world_x, col_zone);
         int ground_top = PLAY_Y+PLAY_H-1-fh;
 
-        if (ch > 0) renderer_fill_rect(screen_x, PLAY_Y+1, COL_W, ch, zone_colors[col_zone]);
+        if (ch > 0) renderer_fill_rect(screen_x, PLAY_Y+1, col_w, ch, zone_colors[col_zone]);
 
         int sky_y0 = PLAY_Y+1+ch;
         int sky_h  = ground_top - sky_y0;
-        if (sky_h > 0) renderer_fill_rect(screen_x, sky_y0, COL_W, sky_h, COLOR_BLACK);
+        if (sky_h > 0) renderer_fill_rect(screen_x, sky_y0, col_w, sky_h, COLOR_BLACK);
 
-        renderer_fill_rect(screen_x, ground_top, COL_W, fh, zone_colors[col_zone]);
+        renderer_fill_rect(screen_x, ground_top, col_w, fh, zone_colors[col_zone]);
     }
 }
 
@@ -1200,6 +1289,9 @@ static void draw_alien_icon(int cx, int cy) {
 
 static void draw_big_ship(void) {
     if (zone != ZONE_BIG_SHIP) return;
+    // Una vez muerto no se dibuja: en su sitio quedan solo las oleadas
+    // de partículas que va soltando scr_tick() durante SCR_VICTORY.
+    if (boss_destroyed) return;
     float top = alien_top();
     int ax = alien_screen_x();
 
@@ -1338,47 +1430,29 @@ static void draw_zone_banner(void) {
     if (zone_banner_ticks <= 0) return;
     const char *txt = zone_short_names[zone];
     int fs = 2;
-    int tw = (int)st7789_text_width(txt, (uint8_t)fs);
-    int pad = 8;
-  //  int bx = CX - tw/2 - pad, by = CY - 14;
-  
-   // renderer_fill_rect(bx, by, bw, bh, COLOR_BLACK);
-   // renderer_fill_rect(bx, by, bw, 1, COLOR_WHITE);
-   // renderer_fill_rect(bx, by+bh-1, bw, 1, COLOR_WHITE);
     renderer_draw_text(centered_x(txt, fs), CY-90, txt,
                         COLOR_YELLOW, COLOR_BLACK, fs);
 }
 
 static void draw_playing_frame(void) {
-
-    // borrar el fondo de la zona del jefe 
-    if (zone == ZONE_BIG_SHIP) {
-        renderer_clear(COLOR_BLACK);
-    }
-
     draw_terrain();
     draw_objects();
     draw_big_ship();
-    draw_enemy_bullets();
     draw_bullets();
     draw_bombs();
     draw_particles();
-
-    if (state == SCR_PLAYING || state == SCR_DEAD)
-        draw_ship();
-
+    if (state == SCR_PLAYING || state == SCR_DEAD) draw_ship();
     draw_hud();
     draw_zone_banner();
-
+    draw_extra_life_banner();
     renderer_flush();
 }
+
 // ---------------------------------------------------------------------------
 // Pantallas estáticas
 // ---------------------------------------------------------------------------
 static void draw_field_static(void) {
     renderer_clear(COLOR_BLACK);
-    renderer_fill_rect(PLAY_X, PLAY_Y,          PLAY_W, 1, COLOR_WHITE);
-    renderer_fill_rect(PLAY_X, PLAY_Y+PLAY_H-1, PLAY_W, 1, COLOR_WHITE);
     renderer_flush();
 }
 
@@ -1492,6 +1566,9 @@ static void draw_scores_screen(void) {
 static void scr_tick(void) {
     blink++;
     if (zone_banner_ticks > 0) zone_banner_ticks--;
+    if (extra_life_banner_ticks > 0) extra_life_banner_ticks--;
+
+    check_extra_life();   // vida extra cada EXTRA_LIFE_SCORE puntos
 
     if (demo) {
         bool any = controls_menu_select()
@@ -1570,9 +1647,23 @@ static void scr_tick(void) {
         break;
 
     case SCR_VICTORY:
+        // Oleadas sucesivas repartidas por el cuerpo del OVNI mientras
+        // dura boss_boom_ticks: cada 4 ticks un estallido nuevo en un
+        // punto al azar de la parrilla, para que se vea desmontarse
+        // entero en vez de un único fogonazo central.
+        if (boss_boom_ticks > 0) {
+            boss_boom_ticks--;
+            if ((boss_boom_ticks % 4) == 0) {
+                float ex = boss_boom_x + (float)(rng_next() % (SHIP_GRID_COLS*BRICK_W));
+                float ey = boss_boom_y + (float)(rng_next() % (SHIP_GRID_ROWS*BRICK_H));
+                add_explosion_sz(ex, ey, BOOM_HUGE);
+                sound_effect_explosion();   // canal 3, por encima de la fanfarria
+            }
+        }
         update_particles();
         draw_playing_frame();
-        draw_victory_screen();
+        // El cartel espera a que pase lo gordo de la explosión.
+        if (boss_boom_ticks <= 0) draw_victory_screen();
         if (--pause_cnt <= 0) {
             next_level_setup();
             pause_cnt = TICKS_S*2;
@@ -1656,6 +1747,10 @@ void game_scramble_run(game_mode_t mode) {
         }
 #endif
     }
+
+    // Por si se sale del juego justo mientras sonaba la fanfarria de
+    // victoria (canales 1+2): si ya había terminado sola, no hace nada.
+    sound_stop_scramble_victory();
 
     highscores_flush();
 }

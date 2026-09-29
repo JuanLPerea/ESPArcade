@@ -13,6 +13,25 @@
  *    idéntico mecanismo, solo cambia la fuente de tiempo real -- ver
  *    nota de PORT A ESP32 más abajo.
  *
+ * ACTUALIZADO con la última versión de la Pico:
+ *  - Jingle de inicio: Toccata y fuga en re menor (BWV 565), una sola
+ *    pasada de ~8,6 s (sound_start_paratrooper_music()); se corta al
+ *    morir la torreta y al salir del juego.
+ *  - Bombas del avión: apuntan a la altura de la TORRETA (CANNON_OY) en
+ *    vez de al suelo, vy0 = 24, el homing se detiene al pasar esa altura
+ *    (antes daba un bandazo) y el impacto se juzga por altura + alineación
+ *    horizontal con TURRET_X.
+ *  - Soldados en verde, caja del mensaje inferior según la escala del
+ *    texto y mensaje DEMO a escala 2.
+ *  - Pantalla de título nueva con torreta y dos paracaidistas dibujados
+ *    con las mismas primitivas del juego.
+ *  - Demo: se vacía el acumulador del stick antes de arrancar, para que
+ *    un rebote antiguo no la corte en el primer tick.
+ * SE MANTIENE lo específico de la ESP32: DROP_PROB=2 y DROP_PROB_ATTACK=1
+ * (más agresivos que los 5 y 3 de la Pico), controles con eje X del
+ * joystick 1, click de stick (índices 4/5) para salir, bucle a 60 fps con
+ * vTaskDelayUntil y esp_timer.
+ *
  * PORT A ESP32 -- igual que asteroids.c/scramble.c/space_invaders.c/
  * lunar_lander.c: nada de Pico SDK (pico/stdlib.h, absolute_time_t,
  * sleep_ms, time_us_32...), sustituido por esp_timer.h + FreeRTOS. Lo
@@ -465,7 +484,7 @@ static void draw_chute_filled(int cx, int cy, int rw, int rh, uint16_t color) {
 #define COLOR_TURRET_GUN   COLOR_CYAN
 #define COLOR_HELI_BODY    COLOR_WHITE
 #define COLOR_HELI_ACCENT  COLOR_MAGENTA
-#define COLOR_SOLDIER      COLOR_WHITE
+#define COLOR_SOLDIER      COLOR_GREEN
 #define COLOR_CHUTE        COLOR_CYAN
 #define COLOR_JET          COLOR_CYAN
 #define COLOR_BOMB         COLOR_MAGENTA
@@ -555,6 +574,12 @@ static void game_start(void) {
     cannon_alive=true; cannon_inv=TICKS_S*2; cannon_enc_acc=0;
     fire_held=false;
     reset_wave();
+    // Jingle de inicio (una sola pasada, ~8.6s) -- se apaga solo y a
+    // partir de ahí solo se oyen los efectos (sound_effect_shoot/
+    // explosion/..., y la sirena del avión, que cede/retoma el canal 2
+    // sin cortar la música mientras suena -- ver sound_update() y
+    // sound_siren_stop() en sound.c).
+    sound_start_paratrooper_music();
     state=PT_PLAYING;
 }
 
@@ -855,20 +880,30 @@ static void update_tower(void) {
 #define BOMB_DROP_DELAY  30
 
 /*
- * Ticks (nominales) que le quedan a la bomba hasta tocar el suelo,
- * dado su estado vertical actual. Se usa tanto al lanzarla como, cada
- * tick, para RECALCULAR la vx necesaria -- así el impacto siempre cae
- * justo en TURRET_X sin importar que el dt real fluctúe de un tick a
- * otro (antes se calculaba una vez al lanzar asumiendo un tick nominal
- * fijo, y con el dt real variable el número de ticks reales hasta
- * tocar el suelo no coincidía con el planeado, así que la bomba caía
- * a un lado u otro de la torreta en vez de encima).
+ * Ticks (nominales) que le quedan a la bomba hasta llegar a la
+ * ALTURA DE LA TORRETA (CANNON_OY) -- que es donde check_collisions()
+ * de verdad comprueba si la bomba acierta, NO cuando toca el suelo
+ * (GROUND_Y, bastante más abajo). Antes se apuntaba a GROUND_Y: la
+ * corrección de rumbo (vx) se repartía en el tiempo hasta tocar
+ * suelo, así que al llegar a la altura de la torreta -- donde de
+ * verdad se juzga el impacto -- la bomba aún no había terminado de
+ * centrarse, y a veces fallaba por poco aunque "en teoría" iba a
+ * caer justo encima. Apuntando a CANNON_OY, la x ya está corregida
+ * del todo para cuando importa.
+ *
+ * Se usa tanto al lanzarla como, cada tick, para RECALCULAR la vx
+ * necesaria -- así el impacto siempre cae justo en TURRET_X sin
+ * importar que el dt real fluctúe de un tick a otro (antes se
+ * calculaba una vez al lanzar asumiendo un tick nominal fijo, y con
+ * el dt real variable el número de ticks reales hasta llegar no
+ * coincidía con el planeado, así que la bomba caía a un lado u otro
+ * de la torreta en vez de encima).
  */
 static int bomb_ticks_to_ground(int32_t y, int32_t vy, int32_t ay) {
     int32_t sim_vy=vy, sim_y=y;
     for (int t=1; t<=500; t++) {
         sim_vy += ay; sim_y += sim_vy;
-        if (FP2PX(sim_y) >= GROUND_Y) return t;
+        if (FP2PX(sim_y) >= CANNON_OY) return t;
     }
     return 500;
 }
@@ -890,7 +925,7 @@ static void update_plane(void) {
                  * el suelo, sin apenas margen para dispararle; ahora
                  * tarda ~3s) para que dé tiempo real a acertarla.
                  */
-                int32_t vy0 = 14, ay = 3;
+                int32_t vy0 = 24, ay = 3;
                 int tof = bomb_ticks_to_ground(by, vy0, ay);
                 int32_t vx = (PX2FP(TURRET_X) - bx) / tof;
                 bombs[bi].active=true;
@@ -909,9 +944,21 @@ static void update_bombs(void) {
     for (int i=0;i<MAX_BOMBS;i++) {
         Bomb *b = &bombs[i]; if (!b->active) continue;
 
-        int rem = bomb_ticks_to_ground(b->y, b->vy, b->ay);
-        if (rem < 1) rem = 1;
-        b->vx = (PX2FP(TURRET_X) - b->x) / rem;
+        /*
+         * Solo recalculamos vx (homing hacia TURRET_X) mientras la
+         * bomba TODAVÍA no ha llegado a la altura de la torreta.
+         * Una vez pasada esa altura (falló o ya no hay nada que
+         * comprobar), "rem" se quedaría clavado en 1 tick para
+         * siempre y cada frame intentaría cerrar TODA la distancia
+         * restante de golpe -- un bandazo visible en la caída en
+         * vez de seguir recta hasta salir de pantalla.
+         */
+        if (FP2PX(b->y) < CANNON_OY) {
+            int rem = bomb_ticks_to_ground(b->y, b->vy, b->ay);
+            if (rem < 1) rem = 1;
+            b->vx = (PX2FP(TURRET_X) - b->x) / rem;
+        }
+
 
         b->vy += b->ay;
         b->x  += b->vx * g_dt_scale / FP;
@@ -1015,10 +1062,16 @@ static void check_collisions(void) {
 
     for (int i=0;i<MAX_BOMBS;i++) {
         Bomb *b = &bombs[i]; if (!b->active) continue;
-        if (chit(FP2PX(b->x),FP2PX(b->y),3,CANNON_OX,CANNON_OY,TURRET_R)) {
+        int bx = FP2PX(b->x);
+        int by = FP2PX(b->y);
+
+        // Si la bomba baja a la altura de la torreta (o más) y está
+        // alineada horizontalmente con ella, impacta.
+        if (by >= CANNON_OY && absi(bx - TURRET_X) < (BASE_W / 2 + 4)) {
             b->active = cannon_alive = false;
-            spawn_expl(CANNON_OX,CANNON_OY,18,5,32);
-            sound_effect_explosion(); return;
+            spawn_expl(CANNON_OX, CANNON_OY, 18, 5, 32);
+            sound_effect_explosion();
+            return;
         }
     }
     for (int i=0;i<MAX_HELIS;i++) {
@@ -1450,8 +1503,20 @@ static void update_center_message(const char *target, uint16_t color, int scale)
 
 static void update_bottom_message(const char *target, int scale) {
     if (strcmp(target, prev_bottom_msg)==0) return;
-    renderer_fill_rect(0, PLAY_Y+PLAY_H-18, TFT_WIDTH, 16, COLOR_BLACK);
-    if (target[0]) st7789_draw_text(centered_x(target,scale), PLAY_Y+PLAY_H-16, target, COLOR_WHITE, COLOR_BLACK, scale);
+    /*
+     * Caja de borrado/dibujo dimensionada según "scale" -- antes era
+     * un hueco fijo de 16px pensado solo para escala 1; con textos a
+     * escala 2 (el doble de alto) se salían por abajo o quedaban mal
+     * encajados. Con esto cabe cualquier escala razonable y siempre
+     * queda a la misma distancia (2px) del borde inferior del área
+     * de juego.
+     */
+    int text_h = 8*scale;
+    int box_h = text_h + 4;
+    int box_y = PLAY_Y+PLAY_H-2-box_h;
+
+    renderer_fill_rect(0, box_y, TFT_WIDTH, box_h, COLOR_BLACK);
+    if (target[0]) st7789_draw_text(centered_x(target,scale), box_y+2, target, COLOR_WHITE, COLOR_BLACK, scale);
     strncpy(prev_bottom_msg, target, sizeof(prev_bottom_msg)-1);
     prev_bottom_msg[sizeof(prev_bottom_msg)-1]='\0';
     renderer_flush();
@@ -1487,18 +1552,96 @@ static void draw_playing_frame(void) {
 
     const char *bottom = "";
     if (demo_mode && bon) bottom = "DEMO - PULSA PARA JUGAR";
-    update_bottom_message(bottom, 1);
+    update_bottom_message(bottom, 2);
 }
 
 // ---------------------------------------------------------------------------
 // Pantallas estáticas
 // ---------------------------------------------------------------------------
+/*
+ * Torreta y paracaidista decorativos para la pantalla de título --
+ * mismas primitivas que draw_turret()/draw_para() (fill_top_ellipse,
+ * draw_chute_filled, draw_soldier_at, line con can_dx/can_dy), pero
+ * en tamaño propio y sin depender del estado de partida
+ * (cannon_alive/cannon_angle_deg/Para), para poder colocarlos donde
+ * convenga en una pantalla estática. El dibujo anterior (un par de
+ * rectángulos sueltos) no llegaba a parecerse a una torreta ni a un
+ * paracaidista -- esto reutiliza la forma real del juego, solo que
+ * un poco más grande para que se lea bien como decoración.
+ */
+#define TITLE_TURRET_BASE_W   26
+#define TITLE_TURRET_BASE_H   20
+#define TITLE_TURRET_RX       9
+#define TITLE_TURRET_RY       14
+#define TITLE_TURRET_GUN_LEN  18
+#define TITLE_TURRET_GUN_W    2
+#define TITLE_TURRET_GUN_ANGLE (-18)   // grados, misma convención que cannon_angle_deg
+
+static void draw_title_turret(int tx, int ground_y) {
+    int base_top = ground_y - TITLE_TURRET_BASE_H;
+
+    renderer_fill_rect(
+        tx - TITLE_TURRET_BASE_W/2, base_top,
+        TITLE_TURRET_BASE_W, TITLE_TURRET_BASE_H,
+        COLOR_TURRET_BASE
+    );
+    fill_top_ellipse(tx, base_top, TITLE_TURRET_RX, TITLE_TURRET_RY, COLOR_TURRET_BASE);
+    renderer_fill_rect(tx-1, base_top-TITLE_TURRET_RY+2, 2, 2, COLOR_BLACK);
+
+    int ox = tx;
+    int oy = base_top - TITLE_TURRET_RY/2;
+    int dx = can_dx(TITLE_TURRET_GUN_ANGLE);
+    int dy = can_dy(TITLE_TURRET_GUN_ANGLE);
+    int tip_x = ox + dx*TITLE_TURRET_GUN_LEN/256;
+    int tip_y = oy + dy*TITLE_TURRET_GUN_LEN/256;
+
+    for (int t=-TITLE_TURRET_GUN_W; t<=TITLE_TURRET_GUN_W; t++) {
+        int ex = (int)(t*(-dy)/256);
+        int ey = (int)(t*( dx)/256);
+        line(ox+ex, oy+ey, tip_x+ex, tip_y+ey, COLOR_TURRET_GUN);
+    }
+}
+
+#define TITLE_PARA_RW 10
+#define TITLE_PARA_RH 8
+
+static void draw_title_para(int px, int hang_y) {
+    int db = hang_y - TITLE_PARA_RH;
+    draw_chute_filled(px, db, TITLE_PARA_RW, TITLE_PARA_RH, COLOR_CHUTE);
+    line(px-TITLE_PARA_RW, db, px, hang_y, COLOR_CHUTE);
+    line(px+TITLE_PARA_RW, db, px, hang_y, COLOR_CHUTE);
+    line(px-2, hang_y, px+2, hang_y, COLOR_CHUTE);
+    draw_soldier_at(px, hang_y+SOLDIER_H, false, COLOR_SOLDIER);
+}
+
 static void draw_title_screen(void) {
     renderer_clear(COLOR_BLACK);
-    st7789_draw_text(centered_x("PARATROOPER",3), CY-70, "PARATROOPER", COLOR_GREEN, COLOR_BLACK, 3);
-    st7789_draw_text(centered_x("STICK: ROTAR CANON",1), CY-20, "STICK: ROTAR CANON", COLOR_WHITE, COLOR_BLACK, 1);
-    st7789_draw_text(centered_x("BOTON A/B: DISPARAR",1), CY-4, "BOTON A/B: DISPARAR", COLOR_WHITE, COLOR_BLACK, 1);
-    st7789_draw_text(centered_x("CLICK STICK: SALIR",1), CY+12, "CLICK STICK: SALIR", COLOR_WHITE, COLOR_BLACK, 1);
+
+    // --- Título, centrado de verdad (centered_x mide el ancho real
+    // de la fuente en vez de asumirlo a mano) ---
+    static const char *title = "PARATROOPER";
+    st7789_draw_text(centered_x(title, 3), 10, title, COLOR_WHITE, COLOR_BLACK, 3);
+
+    renderer_fill_rect(30, 38, TFT_WIDTH-60, 2, COLOR_TURRET_GUN);
+
+    // --- Escena decorativa: dos paracaidistas bajando hacia la
+    // torreta central, con las mismas formas que se ven en partida ---
+    draw_title_para(66, 58);
+    draw_title_turret(CX, 108);
+    draw_title_para(254, 58);
+
+    // --- Instrucciones -- centradas, con hueco de sobra antes del
+    // "PULSA A/B PARA JUGAR" parpadeante que pinta pt_tick() más abajo ---
+    static const char *line1 = "GIRA Y DISPARA";
+    static const char *line2 = "DEFIENDE LA TORRETA";
+
+    st7789_draw_text(centered_x(line1, 2), 155, line1, COLOR_YELLOW, COLOR_BLACK, 2);
+    st7789_draw_text(centered_x(line2, 2), 183, line2, COLOR_CYAN, COLOR_BLACK, 2);
+
+    // Específico de la ESP32: cómo se sale (click del stick).
+    static const char *line3 = "CLICK STICK: SALIR";
+    st7789_draw_text(centered_x(line3, 1), 207, line3, COLOR_WHITE, COLOR_BLACK, 1);
+
     prev_center_msg[0]='\0';
     prev_bottom_msg[0]='\0';
     renderer_flush();
@@ -1662,6 +1805,7 @@ static void pt_tick(void) {
         if (!cannon_alive) {
             for (int i=0;i<MAX_HELIS;i++) helis[i].active=false;
             state=PT_DEAD; pause_cnt=TICKS_S*3;
+            sound_stop_paratrooper_music(); // por si el jingle de inicio seguía sonando
             draw_playing_frame();
             break;
         }
@@ -1772,6 +1916,19 @@ void game_paratrooper_run(game_mode_t mode) {
     reset_render_trace();
 
     if (is_demo) {
+        /*
+         * Vaciamos el acumulador de controls_get_raw_delta_x(0) antes
+         * de arrancar -- es la señal que usa pt_tick() para saber si
+         * un jugador de verdad ha tocado el encoder y así cortar la
+         * demo. Sin este vaciado, cualquier ruido/rebote mecánico
+         * acumulado desde la ÚLTIMA vez que alguien leyó ese
+         * acumulador -- que puede ser rato antes, mientras el menú
+         * estaba en el marcador o en otra pantalla que no lo consume
+         * -- se lee como "el jugador ha tocado el mando" en el
+         * primerísimo tick, y la demo se corta antes de llegar a
+         * dibujar un solo fotograma.
+         */
+        controls_get_raw_delta_x(0);
         game_start();
     } else {
         state = PT_TITLE;
@@ -1791,5 +1948,6 @@ void game_paratrooper_run(game_mode_t mode) {
     }
 
     sound_siren_stop();
+    sound_stop_paratrooper_music(); // por si se sale a mitad del jingle de inicio
     highscores_flush();
 }

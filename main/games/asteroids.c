@@ -64,12 +64,19 @@
  *    ese acumulador ha desaparecido -- ya no hace falta.
  *  - Menos objetos simultáneos: MAX_AST 24->14, MAX_BULLETS 8->6,
  *    MAX_PARTICLES 64->32 (menos carga de render incremental).
- *  - Render incremental: nave/asteroide/OVNI con su propio
- *    borrado+flush individual; balas y partículas agrupadas en un
- *    único flush cada una (ver nota de rendimiento junto a
- *    draw_bullets_if_moved()/draw_particles_if_moved() -- el driver
- *    ESP32 ya soporta varios rectángulos sucios independientes, así
- *    que agrupar aquí no dispara una caja gigante como antes).
+ *  - Render incremental, UN SOLO renderer_flush() por tick: nave,
+ *    asteroides, balas, partículas, OVNI y HUD dibujan cada uno su
+ *    borrado+trazado incremental sobre el framebuffer, pero SIN
+ *    llamar a renderer_flush() por su cuenta -- draw_playing_frame()
+ *    hace la única llamada, al final, para todo el frame junto (ver
+ *    nota de rendimiento ahí mismo). Antes cada categoría (e incluso
+ *    cada asteroide individual, el bug más gordo) tenía su propio
+ *    flush -- hasta ~20 llamadas por tick con la pantalla llena, cada
+ *    una con coste fijo de DMA+semáforo nada despreciable en ESP32.
+ *    El sistema de varios rectángulos sucios independientes de
+ *    st7789.c (con fusión automática de los que están cerca) está
+ *    pensado precisamente para permitir esto sin que degenere en una
+ *    caja gigante.
  *  - Sonido: reutiliza sound_siren_start()/stop() (la sirena del
  *    platillo de Space Invaders) para el OVNI -- incluso más
  *    apropiado aquí, ya que el original también usaba una sirena en
@@ -192,6 +199,15 @@ static void update_dt_scale(void) {
 #define HYPER_DEATH_PCT 15
 #define RESPAWN_INV     (2 * TICKS_S)
 #define BLINK_HALF      15
+
+// Parpadeo de invencibilidad de la nave -- MÁS RÁPIDO y en su propia
+// constante, separada de BLINK_HALF (que también usan los mensajes
+// READY/NIVEL SUPERADO/GAME OVER/DEMO en draw_playing_frame(); tocar
+// BLINK_HALF habría acelerado esos textos también, y no es lo que se
+// pidió). Con 4 ticks de media, cada fase dura ~67ms a 60Hz -- un
+// destello rápido en vez de un apagado de ~250ms que se sentía como
+// que la nave desaparecía un momento.
+#define SHIP_BLINK_HALF 4
 
 typedef struct {
     int32_t  x, y, vx, vy;
@@ -397,7 +413,7 @@ static int centered_x(const char *text, int scale) {
 // ---------------------------------------------------------------------------
 static void draw_ship(const Ship *s, int p, uint16_t color) {
     if (!s->alive) return;
-    if (s->inv_ticks > 0 && (blink / BLINK_HALF) % 2 == 1) return;
+    if (s->inv_ticks > 0 && (blink / SHIP_BLINK_HALF) % 2 == 1) return;
 
     int cx = FP2PX(s->x), cy = FP2PX(s->y), a = s->angle;
 
@@ -560,7 +576,6 @@ static void draw_ship_if_moved(int p) {
         draw_ship(s, p, p==0 ? COLOR_SHIP0 : COLOR_SHIP1);
 
     prev_ship[p].x = cx; prev_ship[p].y = cy; prev_ship[p].alive = show;
-    renderer_flush();
 }
 
 static void draw_asteroids_if_moved(void) {
@@ -580,7 +595,6 @@ static void draw_asteroids_if_moved(void) {
             draw_ast(a, COLOR_AST);
 
         prev_ast[i].x = cx; prev_ast[i].y = cy; prev_ast[i].alive = show;
-        renderer_flush();
     }
 }
 
@@ -597,23 +611,18 @@ static void draw_saucer_if_moved(void) {
         draw_saucer(&saucer, COLOR_SAUCER);
 
     prev_saucer_pos.x = cx; prev_saucer_pos.y = cy; prev_saucer_pos.alive = show;
-    renderer_flush();
 }
 
-// Balas y partículas: un único flush() agrupando TODAS las balas
-// (y otro agrupando TODAS las partículas) -- ver st7789.c para el
-// porqué esto vuelve a ser lo correcto. El driver de vídeo ya NO
-// lleva un único rectángulo sucio (una caja englobante): lleva una
-// LISTA de varios rectángulos, y solo fusiona los que están
-// realmente cerca entre sí (should_merge() en st7789.c). Así que
-// agrupar aquí varias balas/partículas dispersas en un solo
-// renderer_flush() ya no dispara una caja gigante -- el driver las
-// mantiene como regiones separadas y pequeñas por su cuenta. Y como
-// cada llamada a renderer_flush() en ESP32 tiene un coste fijo no
-// trivial (transacción DMA + espera real de semáforo, nada que ver
-// con el spi_write_blocking() de la Pico), agrupar sigue siendo
-// mejor que un flush() por unidad: menos llamadas, mismo resultado
-// en pantalla.
+// Balas y partículas: NINGÚN renderer_flush() propio -- ni siquiera
+// uno agrupado por categoría como antes. Todo lo que dibujan aquí se
+// acumula en el framebuffer (vía mark_dirty() en st7789.c, hasta
+// MAX_DIRTY_RECTS regiones independientes con fusión automática de
+// las que están cerca) y draw_playing_frame() hace la ÚNICA llamada
+// a renderer_flush() para el frame entero -- ver la nota de
+// rendimiento ahí mismo. Cada llamada a renderer_flush() en ESP32
+// tiene un coste fijo no trivial (transacción DMA + espera real de
+// semáforo, nada que ver con el spi_write_blocking() de la Pico), así
+// que cuantas menos, mejor -- una por tick es el mínimo posible.
 static int prev_bullet_x[MAX_BULLETS], prev_bullet_y[MAX_BULLETS];
 static bool prev_bullet_active[MAX_BULLETS];
 static int prev_part_x[MAX_PARTICLES], prev_part_y[MAX_PARTICLES];
@@ -642,7 +651,7 @@ static void draw_bullets_if_moved(void) {
         prev_bullet_x[i] = x; prev_bullet_y[i] = y; prev_bullet_active[i] = show;
         any = true;
     }
-    if (any) renderer_flush();
+    (void)any; // el flush ahora es único, al final de draw_playing_frame()
 }
 
 static void draw_particles_if_moved(void) {
@@ -664,7 +673,7 @@ static void draw_particles_if_moved(void) {
         prev_part_x[i] = x; prev_part_y[i] = y; prev_part_active[i] = show;
         any = true;
     }
-    if (any) renderer_flush();
+    (void)any; // el flush ahora es único, al final de draw_playing_frame()
 }
 
 // ---------------------------------------------------------------------------
@@ -730,7 +739,7 @@ static void draw_hud_if_changed(void) {
             changed = true;
         }
     }
-    if (changed) renderer_flush();
+    (void)changed; // el flush ahora es único, al final de draw_playing_frame()
 }
 
 // Mensaje central grande (READY / NIVEL SUPERADO / GAME OVER), solo
@@ -745,7 +754,6 @@ static void update_center_message(const char *target, uint16_t color, int scale)
     }
     strncpy(prev_center_msg, target, sizeof(prev_center_msg) - 1);
     prev_center_msg[sizeof(prev_center_msg) - 1] = '\0';
-    renderer_flush();
 }
 
 static void update_bottom_message(const char *target, int scale) {
@@ -757,7 +765,6 @@ static void update_bottom_message(const char *target, int scale) {
     }
     strncpy(prev_bottom_msg, target, sizeof(prev_bottom_msg) - 1);
     prev_bottom_msg[sizeof(prev_bottom_msg) - 1] = '\0';
-    renderer_flush();
 }
 
 static void draw_playing_frame(void) {
@@ -786,6 +793,30 @@ static void draw_playing_frame(void) {
     if (state == AS_GAME_OVER && bon) bottom = "PULSA PARA CONTINUAR";
     else if (demo && bon)              bottom = "DEMO - PULSA PARA JUGAR";
     update_bottom_message(bottom, 1);
+
+    // UN SOLO renderer_flush() por tick para TODO el frame (nave,
+    // asteroides, balas, particulas, platillo, HUD y mensajes),
+    // en vez de hasta ~20 llamadas sueltas repartidas por cada
+    // dibujo individual (el bug real: antes draw_asteroids_if_moved()
+    // hacia una llamada A CADA asteroide, hasta MAX_AST=14 veces por
+    // tick). Cada renderer_flush() en ESP32 tiene un coste fijo no
+    // trivial (transaccion DMA + espera real de semaforo), asi que
+    // acumular todo el frame y volcarlo de una vez es MUCHO mas
+    // barato -- el sistema de rectangulos sucios de st7789.c (hasta
+    // MAX_DIRTY_RECTS regiones independientes, con fusion automatica
+    // de las que estan cerca) esta pensado precisamente para esto.
+    //
+    // Esto tambien explica el sintoma de "la nave desaparece": el
+    // parpadeo de invencibilidad tras respawnear (ver el "return"
+    // temprano en draw_ship() cuando inv_ticks>0) cuenta medios
+    // ciclos en TICKS logicos (BLINK_HALF), no en tiempo real -- con
+    // el tick real arrastrandose por el exceso de flush() de antes
+    // (mas lento cuanto mas llena esta la pantalla de asteroides,
+    // que es justo cuando mas se dispara), cada medio ciclo de
+    // parpadeo se estiraba en tiempo real mucho mas de lo pensado, y
+    // la nave se quedaba "apagada" un buen rato en vez del parpadeo
+    // rapido normal.
+    renderer_flush();
 }
 
 // ---------------------------------------------------------------------------

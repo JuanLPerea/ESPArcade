@@ -526,21 +526,21 @@ static void draw_hud_if_changed(bool force) {
     bool changed = false;
     if (snakes[0].score != prev_hud_p1 || snakes[0].lives != prev_hud_lives1 || force) {
         renderer_fill_rect(PLAY_X+1, PLAY_Y+1, 130, 14, COLOR_BLACK);
-        snprintf(buf, sizeof(buf), "P1 %05ld x%d", (long)snakes[0].score, snakes[0].lives);
-        renderer_draw_text(PLAY_X+3, PLAY_Y+3, buf, COLOR_P1, COLOR_BLACK, 1);
+        snprintf(buf, sizeof(buf), "%05ld x%d", (long)snakes[0].score, snakes[0].lives);
+        renderer_draw_text(PLAY_X+3, PLAY_Y+3, buf, COLOR_P1, COLOR_BLACK, 2);
         prev_hud_p1 = snakes[0].score; prev_hud_lives1 = snakes[0].lives; changed = true;
     }
     if (level != prev_hud_level || force) {
         renderer_fill_rect(CX-30, PLAY_Y+1, 60, 14, COLOR_BLACK);
-        snprintf(buf, sizeof(buf), "LVL %d", level);
-        renderer_draw_text(centered_x(buf, 1), PLAY_Y+3, buf, COLOR_WHITE, COLOR_BLACK, 1);
+        snprintf(buf, sizeof(buf), "L%d", level);
+        renderer_draw_text(centered_x(buf, 2), PLAY_Y+3, buf, COLOR_WHITE, COLOR_BLACK, 2);
         prev_hud_level = level; changed = true;
     }
     if (snakes[1].score != prev_hud_p2 || snakes[1].lives != prev_hud_lives2 || force) {
         renderer_fill_rect(PLAY_X+PLAY_W-131, PLAY_Y+1, 130, 14, COLOR_BLACK);
-        snprintf(buf, sizeof(buf), "P2 %05ld x%d", (long)snakes[1].score, snakes[1].lives);
-        int tx = PLAY_X+PLAY_W-3-(int)st7789_text_width(buf, 1);
-        renderer_draw_text(tx, PLAY_Y+3, buf, COLOR_P2, COLOR_BLACK, 1);
+        snprintf(buf, sizeof(buf), "%05ld x%d", (long)snakes[1].score, snakes[1].lives);
+        int tx = PLAY_X+PLAY_W-3-(int)st7789_text_width(buf, 2);
+        renderer_draw_text(tx, PLAY_Y+3, buf, COLOR_P2, COLOR_BLACK, 2);
         prev_hud_p2 = snakes[1].score; prev_hud_lives2 = snakes[1].lives; changed = true;
     }
     if (changed) renderer_flush();
@@ -669,7 +669,7 @@ static void do_move_step(void) {
         if (food.active && nx == food.x && ny == food.y) {
             sn->pending_growth += 1;
             sn->score += 100 * level;
-            sound_effect_success();
+            sound_effect_coin();
             uint16_t fcols[2] = { COLOR_FOOD, COLOR_WHITE };
             spawn_burst(cell_x(nx)+CELL/2, cell_y(ny)+CELL/2, 8, fcols, 2);
             spawn_food();
@@ -684,7 +684,7 @@ static void do_move_step(void) {
         if (sfood.active && nx == sfood.x && ny == sfood.y) {
             sn->pending_growth += SPECIAL_FOOD_GROWTH;
             sn->score += SPECIAL_FOOD_SCORE_MUL * level;
-            sound_effect_success();
+            sound_effect_coin();
             uint16_t scols[3] = { COLOR_SFOOD, COLOR_WHITE, COLOR_YELLOW };
             spawn_burst(cell_x(nx)+CELL/2, cell_y(ny)+CELL/2, 14, scols, 3);
             sfood.active = false;
@@ -739,7 +739,7 @@ static void do_move_step(void) {
     if (combined >= next_level_score) {
         level++;
         next_level_score += 1000L * level;
-        sound_effect_victory();
+        sound_effect_teleport();
         begin_round();
         state = SN_ROUND_START;
     }

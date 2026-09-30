@@ -616,7 +616,7 @@ static void ship_respawn(void) {
 }
 
 static void game_start(void) {
-    lives = 3; level = 1; zone = ZONE_STEEP_MOUNTAINS; score = 0;
+    lives = 5; level = 1; zone = ZONE_STEEP_MOUNTAINS; score = 0;
     next_extra_life = EXTRA_LIFE_SCORE;
     extra_life_banner_ticks = 0;
     fuel = FUEL_MAX; fuel_cd = fuel_ticks_for_level();

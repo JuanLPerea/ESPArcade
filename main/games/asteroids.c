@@ -209,9 +209,18 @@ static void update_dt_scale(void) {
 // que la nave desaparecía un momento.
 #define SHIP_BLINK_HALF 4
 
+// Giro más lento: antes la nave avanzaba un paso (de ANGLE_STEPS,
+// 11.25 grados) en CADA tick que el stick estuviera inclinado -- a
+// 60 ticks/seg, una vuelta completa en ~0.53s. Con SHIP_ROT_TICKS=2
+// solo se aplica un paso de cada 2 ticks, así que tarda el doble
+// (~1.07s por vuelta). Sube este número para un giro aún más lento
+// (o vuelve a 1 para el comportamiento original).
+#define SHIP_ROT_TICKS 2
+
 typedef struct {
     int32_t  x, y, vx, vy;
     int      angle;
+    int      rot_cd;    // ticks que faltan para el próximo paso de giro (ver SHIP_ROT_TICKS)
     int      lives;
     uint32_t score;
     bool     alive;
@@ -285,14 +294,25 @@ static Bullet bullets[MAX_BULLETS];
 // Asteroides -- radios reescalados
 // ---------------------------------------------------------------------------
 #define MAX_AST     14   // reducido de 24 (ver cabecera)
+#define R_HUGE      20   // tamaño nuevo, más grande que R_LARGE -- ver AstSz
 #define R_LARGE     14
 #define R_MED        9
 #define R_SMALL      5
 
-typedef enum { SZ_LARGE=0, SZ_MED=1, SZ_SMALL=2 } AstSz;
-static const int  AST_R[3]     = { R_LARGE, R_MED, R_SMALL };
-static const int  AST_PTS[3]   = { 20, 50, 100 };
-static const int  AST_SPD[3]   = { FP*3/4, FP*5/4, FP*2 };
+// SZ_HUGE se añade al FINAL (índice 3) a propósito, sin renumerar los
+// tamaños existentes: nada en el archivo compara por orden numérico,
+// solo por igualdad (==), así que añadir aquí es seguro y no obliga a
+// tocar ningún otro sitio que ya use SZ_LARGE/SZ_MED/SZ_SMALL.
+// Conceptualmente SZ_HUGE es el tamaño INICIAL, del que salen dos
+// SZ_LARGE al romperse (ver break_ast()) -- justo el mismo papel que
+// tenía SZ_LARGE antes de este cambio.
+typedef enum { SZ_LARGE=0, SZ_MED=1, SZ_SMALL=2, SZ_HUGE=3 } AstSz;
+static const int  AST_R[4]     = { R_LARGE, R_MED, R_SMALL, R_HUGE };
+// Puntos: menos que SZ_LARGE a propósito -- son un blanco enorme y
+// fácil de alcanzar, la puntuación premia acertar a los pequeños.
+static const int  AST_PTS[4]   = { 20, 50, 100, 10 };
+// Velocidad: más lento que SZ_LARGE -- una roca más grande y pesada.
+static const int  AST_SPD[4]   = { FP*3/4, FP*5/4, FP*2, FP/2 };
 
 // 4 variantes de forma (offsets radiales para 12 vértices) -- idéntico al original
 static const int8_t AST_SHAPE[4][12] = {
@@ -585,7 +605,7 @@ static void draw_asteroids_if_moved(void) {
         bool show = a->active;
 
         if (!show && !prev_ast[i].alive) continue;
-        int r = AST_R[a->active ? a->size : SZ_LARGE] + 4;
+        int r = AST_R[a->active ? a->size : SZ_HUGE] + 4; // SZ_HUGE = radio más grande posible, para no dejar rastro
 
         if (prev_ast[i].alive) {
             int pr = r; // usamos el mismo margen; el radio real no cambia mientras está vivo
@@ -940,7 +960,7 @@ static void level_init(void) {
             case 2: ax=PX2FP(PLAY_X);              ay=PX2FP(PLAY_Y+rnd(PLAY_H)); break;
             default:ax=PX2FP(PLAY_X+PLAY_W);       ay=PX2FP(PLAY_Y+rnd(PLAY_H)); break;
         }
-        spawn_ast(SZ_LARGE, ax, ay);
+        spawn_ast(SZ_HUGE, ax, ay);
     }
     field_needs_redraw = true;
 }
@@ -990,15 +1010,18 @@ static void break_ast(int idx) {
     Asteroid *a = &asts[idx];
     int32_t sx = a->x, sy = a->y;
 
-    int nparts = (a->size==SZ_LARGE) ? 12 : (a->size==SZ_MED) ? 8 : 5;
-    int pspd   = (a->size==SZ_LARGE) ? FP*2 : (a->size==SZ_MED) ? FP*3 : FP*4;
+    int nparts = (a->size==SZ_HUGE) ? 16 : (a->size==SZ_LARGE) ? 12 : (a->size==SZ_MED) ? 8 : 5;
+    int pspd   = (a->size==SZ_HUGE) ? FP*3/2 : (a->size==SZ_LARGE) ? FP*2 : (a->size==SZ_MED) ? FP*3 : FP*4;
     spawn_explosion(a->x, a->y, nparts, pspd, PART_LIFE_AST);
 
     sound_effect_explosion();
     a->active = false;
 
     if (a->size != SZ_SMALL) {
-        AstSz next = (a->size==SZ_LARGE) ? SZ_MED : SZ_SMALL;
+        // HUGE -> 2x LARGE -> 2x MED -> 2x SMALL -> (fin de la cadena)
+        AstSz next = (a->size==SZ_HUGE)  ? SZ_LARGE
+                   : (a->size==SZ_LARGE) ? SZ_MED
+                   :                       SZ_SMALL;
         spawn_ast(next, sx, sy);
         spawn_ast(next, sx, sy);
     }
@@ -1170,7 +1193,16 @@ static bool update_ship(int p, int enc, bool thrust, bool fire_btn, bool hyper_b
     if (s->hyper_cd>0)     s->hyper_cd--;
     if (s->inv_ticks>0)    s->inv_ticks--;
 
-    if (enc) s->angle = (s->angle - (enc>0?1:-1) + ANGLE_STEPS) % ANGLE_STEPS;
+    if (enc) {
+        if (s->rot_cd <= 0) {
+            s->angle = (s->angle - (enc>0?1:-1) + ANGLE_STEPS) % ANGLE_STEPS;
+            s->rot_cd = SHIP_ROT_TICKS - 1;
+        } else {
+            s->rot_cd--;
+        }
+    } else {
+        s->rot_cd = 0; // stick soltado: el próximo toque gira al instante, sin arrastrar cooldown
+    }
 
     s->thrusting = thrust;
     if (thrust) {

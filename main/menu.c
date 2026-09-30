@@ -526,7 +526,7 @@ static void animate_transition(
  * ===========================================================
  */
 
-#define FIRMWARE_VERSION "v1.5 EMT SPECIAL"
+#define FIRMWARE_VERSION "v1.5 ESP32"
 #define FIRMWARE_AUTHOR  "JUANLU"
 
 typedef enum {

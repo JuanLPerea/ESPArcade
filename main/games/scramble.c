@@ -136,8 +136,19 @@ static float rng_float(void) { return (float)(rng_next() % 1000) / 1000.0f; }
 // bajo = techo de velocidad vertical más contenido.
 #define SHIP_ACCEL      1
 #define SHIP_VEL_MAX    3
-#define SHIP_DECAY_NUM  5
-#define SHIP_DECAY_DEN 5
+
+// Qué hace la nave al soltar el stick (centro):
+//   1 = PARA EN SECO (velocidad vertical a 0 en ese mismo tick): la nave
+//       solo se mueve mientras mantienes el stick inclinado, y soltarlo
+//       la deja quieta. Es lo más fácil de controlar.
+//   0 = frena con inercia, multiplicando la velocidad por
+//       SHIP_DECAY_NUM/SHIP_DECAY_DEN en cada tick. OJO: antes estaban a
+//       5/5 = multiplicar por 1 = NO FRENABA NUNCA (la nave seguía
+//       subiendo/bajando hasta chocar). Con 3/5 se detiene en 2 ticks;
+//       con 4/5 en 3; cuanto más cerca de 5/5, más desliza.
+#define SHIP_STOP_WHEN_CENTERED 1
+#define SHIP_DECAY_NUM  3
+#define SHIP_DECAY_DEN  5
 #define SHIP_AI_SPEED   3
 
 // THRUST_ACCEL ya estaba al mínimo entero posible (1) -- con el
@@ -165,7 +176,11 @@ static int enc_momentum(int enc_raw, int *vel) {
         *vel += SHIP_ACCEL * enc_raw;
         if (*vel < -SHIP_VEL_MAX) *vel = -SHIP_VEL_MAX;
     } else {
+#if SHIP_STOP_WHEN_CENTERED
+        *vel = 0;
+#else
         *vel = *vel * SHIP_DECAY_NUM / SHIP_DECAY_DEN;
+#endif
     }
     return *vel;
 }

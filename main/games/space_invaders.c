@@ -113,6 +113,28 @@ static inline uint32_t make_timeout_ms(uint32_t ms) { return now_ms() + ms; }
 static inline bool time_reached_ms(uint32_t deadline) { return (int32_t)(now_ms() - deadline) >= 0; }
 
 // ---------------------------------------------------------------------------
+// Medición de tiempos (diagnóstico). Pon SI_PROFILE a 1 para que cada
+// segundo se imprima por el monitor serie el TIEMPO MÁXIMO (en us) que
+// ha tardado cada parte del frame durante ese segundo. Con 0 no
+// compila nada de esto y no cuesta nada.
+// ---------------------------------------------------------------------------
+#define SI_PROFILE 0
+
+#if SI_PROFILE
+enum { P_FORM, P_BULLET, P_BOMBS, P_SAUCER, P_PLAYER, P_HUD, P_TICK, P_SOUND, P_WORK, P_N };
+static uint32_t prof_max[P_N];
+static uint32_t prof_over;   // frames cuyo trabajo superó el período del bucle
+#define PROF(slot, call) do {                                         \
+        int64_t _t0 = esp_timer_get_time();                           \
+        call;                                                         \
+        uint32_t _d = (uint32_t)(esp_timer_get_time() - _t0);         \
+        if (_d > prof_max[slot]) prof_max[slot] = _d;                 \
+    } while (0)
+#else
+#define PROF(slot, call) call
+#endif
+
+// ---------------------------------------------------------------------------
 // Área de juego -- literales fijos (no TFT_WIDTH/TFT_HEIGHT): son en
 // realidad variables en tiempo de ejecución y no sirven como
 // inicializador de un array static const (ver el mismo comentario,
@@ -208,6 +230,11 @@ typedef struct {
     int  x, y;
     bool alive;
     int  anim;      // 0 ó 1 -- alterna cada paso de formación
+    // Lo que hay REALMENTE dibujado en pantalla para este alien, para
+    // poder borrar/redibujar solo los que cambian (y flushear solo su
+    // rectángulo) en vez de toda la formación.
+    int  dx, dy, danim;
+    bool drawn;
 } Alien;
 
 typedef struct {
@@ -280,7 +307,6 @@ static int clamp(int v, int lo, int hi) { return v<lo?lo:v>hi?hi:v; }
 // ---------------------------------------------------------------------------
 // Rastro para el borrado incremental (ver cabecera del archivo)
 // ---------------------------------------------------------------------------
-static int  prev_formation_x0 = -1, prev_formation_y0, prev_formation_x1, prev_formation_y1;
 static int  prev_player_x = -1;
 static bool prev_bullet_active = false;
 static int  prev_bullet_x, prev_bullet_y;
@@ -293,8 +319,21 @@ static int  prev_score = -1, prev_lives = -1, prev_level = -1;
 static char prev_bottom_msg[40] = "";
 static bool field_needs_redraw = true;
 
+// La formación solo se redibuja cuando algo la ha cambiado (paso de
+// formación, alien muerto, platillo pasando por encima...). Antes se
+// borraba y repintaba entera en CADA tick -- ~300 fill_rect + un flush
+// SPI enorme por tick, que es lo que ralentizaba el juego.
+static bool formation_dirty = true;
+// La nave hay que repintarla aunque no se haya movido si una bala/bomba
+// ha borrado (al limpiar su rastro) parte del cañón.
+static bool player_dirty = false;
+
 static void reset_render_trace(void) {
-    prev_formation_x0 = -1;
+    formation_dirty = true;
+    player_dirty = false;
+    for (int r = 0; r < ALIEN_ROWS; r++)
+        for (int c = 0; c < ALIEN_COLS; c++)
+            aliens[r][c].drawn = false;   // nada dibujado todavía
     prev_player_x = -1;
     prev_bullet_active = false;
     for (int i = 0; i < MAX_BOMBS; i++) prev_bomb_active[i] = false;
@@ -388,7 +427,10 @@ static void init_formation(void) {
     falive      = ALIEN_ROWS * ALIEN_COLS;
     fanim_phase = 0;
     next_formation_step = make_timeout_ms(formation_interval_ms(falive));
-    prev_formation_x0 = -1; // fuerza redibujado completo la próxima vez
+    for (int r = 0; r < ALIEN_ROWS; r++)
+        for (int c = 0; c < ALIEN_COLS; c++)
+            aliens[r][c].drawn = false;   // fuerza dibujado completo la próxima vez
+    formation_dirty = true;
 }
 
 static void init_bunkers(void) {
@@ -435,6 +477,41 @@ static void clear_input_buffer(void) {
 }
 
 
+// Aplica una operación sobre las celdas de bunker que solapan un
+// rectángulo:
+//   draw == false -> ELIMINA esas celdas del modelo (cells[][] = false),
+//                    para que dejen de existir también para las balas.
+//   draw == true  -> repinta las celdas que sigan vivas (para restaurar
+//                    el bunker tras borrar con negro un área que lo pisa).
+static void bunkers_rect(int rx, int ry, int rw, int rh, bool draw) {
+    for (int b = 0; b < BUNKER_COUNT; b++) {
+        int x0 = bunkers[b].x, y0 = bunkers[b].y;
+        int ax0 = (rx > x0) ? rx : x0;
+        int ay0 = (ry > y0) ? ry : y0;
+        int ax1 = (rx + rw < x0 + BUNKER_W) ? rx + rw : x0 + BUNKER_W;
+        int ay1 = (ry + rh < y0 + BUNKER_H) ? ry + rh : y0 + BUNKER_H;
+        if (ax0 >= ax1 || ay0 >= ay1) continue;
+
+        int c0 = (ax0 - x0) / BUNKER_CELL_W, c1 = (ax1 - 1 - x0) / BUNKER_CELL_W;
+        int r0 = (ay0 - y0) / BUNKER_CELL_H, r1 = (ay1 - 1 - y0) / BUNKER_CELL_H;
+
+        for (int row = r0; row <= r1; row++)
+            for (int col = c0; col <= c1; col++) {
+                if (!bunkers[b].cells[row][col]) continue;
+                if (draw)
+                    renderer_fill_rect(x0 + col * BUNKER_CELL_W, y0 + row * BUNKER_CELL_H,
+                                       BUNKER_CELL_W, BUNKER_CELL_H, COLOR_GREEN);
+                else {
+                    bunkers[b].cells[row][col] = false;
+                    // Borrar también en pantalla: la celda entera, no solo la
+                    // parte que tape el alien (si no, quedarían restos).
+                    renderer_fill_rect(x0 + col * BUNKER_CELL_W, y0 + row * BUNKER_CELL_H,
+                                       BUNKER_CELL_W, BUNKER_CELL_H, COLOR_BLACK);
+                }
+            }
+    }
+}
+
 static void formation_step(void) {
     int xmin, ymin, xmax, ymax;
     formation_bounds(&xmin, &ymin, &xmax, &ymax);
@@ -459,6 +536,18 @@ static void formation_step(void) {
     for (int r = 0; r < ALIEN_ROWS; r++)
         for (int c = 0; c < ALIEN_COLS; c++)
             aliens[r][c].anim = fanim_phase;
+
+    formation_dirty = true;
+
+    // Los aliens que alcanzan la altura de los bunkers los destruyen
+    // por completo: se eliminan las celdas del modelo (no solo del
+    // dibujo), así las balas ya no chocan con bunkers invisibles.
+    if (formation_bottom() > BUNKER_Y) {
+        for (int r = 0; r < ALIEN_ROWS; r++)
+            for (int c = 0; c < ALIEN_COLS; c++)
+                if (aliens[r][c].alive)
+                    bunkers_rect(aliens[r][c].x, aliens[r][c].y, ALIEN_W, ALIEN_H, false);
+    }
 
     next_formation_step = make_timeout_ms(formation_interval_ms(falive));
 
@@ -493,26 +582,32 @@ static void alien_fire(void) {
     }
 }
 
-static bool bullet_hits_bunker(int rx, int ry, int rw, int rh, bool erase) {
+// Colisión de una bala (dir = -1, sube) o una bomba (dir = +1, baja)
+// con los bunkers. Se revisan TODAS las celdas vivas que solapa el
+// rectángulo (no solo la de la esquina), empezando por el borde
+// delantero, y se destruye la primera que se encuentre.
+static bool bullet_hits_bunker(int rx, int ry, int rw, int rh, int dir) {
     for (int b = 0; b < BUNKER_COUNT; b++) {
-        if (rx + rw <= bunkers[b].x) continue;
-        if (rx >= bunkers[b].x + BUNKER_W) continue;
-        if (ry + rh <= bunkers[b].y) continue;
-        if (ry >= bunkers[b].y + BUNKER_H) continue;
-        int col = (rx - bunkers[b].x) / BUNKER_CELL_W;
-        int row = (ry - bunkers[b].y) / BUNKER_CELL_H;
-        col = clamp(col, 0, BUNKER_CELLS_X - 1);
-        row = clamp(row, 0, BUNKER_CELLS_Y - 1);
-        if (bunkers[b].cells[row][col]) {
-            if (erase) {
+        int x0 = bunkers[b].x, y0 = bunkers[b].y;
+        int ax0 = (rx > x0) ? rx : x0;
+        int ay0 = (ry > y0) ? ry : y0;
+        int ax1 = (rx + rw < x0 + BUNKER_W) ? rx + rw : x0 + BUNKER_W;
+        int ay1 = (ry + rh < y0 + BUNKER_H) ? ry + rh : y0 + BUNKER_H;
+        if (ax0 >= ax1 || ay0 >= ay1) continue;
+
+        int c0 = (ax0 - x0) / BUNKER_CELL_W, c1 = (ax1 - 1 - x0) / BUNKER_CELL_W;
+        int r0 = (ay0 - y0) / BUNKER_CELL_H, r1 = (ay1 - 1 - y0) / BUNKER_CELL_H;
+
+        for (int i = 0; i <= r1 - r0; i++) {
+            int row = (dir < 0) ? r0 + i : r1 - i;   // borde delantero primero
+            for (int col = c0; col <= c1; col++) {
+                if (!bunkers[b].cells[row][col]) continue;
                 bunkers[b].cells[row][col] = false;
-                renderer_fill_rect(
-                    bunkers[b].x + col * BUNKER_CELL_W,
-                    bunkers[b].y + row * BUNKER_CELL_H,
-                    BUNKER_CELL_W, BUNKER_CELL_H, COLOR_BLACK);
+                renderer_fill_rect(x0 + col * BUNKER_CELL_W, y0 + row * BUNKER_CELL_H,
+                                   BUNKER_CELL_W, BUNKER_CELL_H, COLOR_BLACK);
                 renderer_flush();
+                return true;
             }
-            return true;
         }
     }
     return false;
@@ -620,15 +715,34 @@ static void draw_alien_C(int x, int y, int anim, uint16_t color) {
     }
 }
 
+// Dibuja el sprite del alien de la fila r en (x, y) con la animación dada.
+static void draw_alien_at(int r, int c, int x, int y, int anim) {
+    (void)c;
+    uint16_t color = (r == 0) ? COLOR_ALIEN_A : (r <= 2) ? COLOR_ALIEN_B : COLOR_ALIEN_C;
+
+    if (r == 0)      draw_alien_A(x, y, anim, color);
+    else if (r <= 2) draw_alien_B(x, y, anim, color);
+    else             draw_alien_C(x, y, anim, color);
+}
+
 static void draw_alien(int r, int c) {
     Alien *a = &aliens[r][c];
     if (!a->alive) return;
+    draw_alien_at(r, c, a->x, a->y, a->anim);
+}
 
-    uint16_t color = (r == 0) ? COLOR_ALIEN_A : (r <= 2) ? COLOR_ALIEN_B : COLOR_ALIEN_C;
-
-    if (r == 0)      draw_alien_A(a->x, a->y, a->anim, color);
-    else if (r <= 2) draw_alien_B(a->x, a->y, a->anim, color);
-    else             draw_alien_C(a->x, a->y, a->anim, color);
+// Repinta solo los aliens vivos cuyo rectángulo solapa la zona dada
+// (p. ej. tras borrar el rastro del platillo sobre la fila superior).
+// Mucho más barato que redibujar la formación entera.
+static void draw_aliens_in_rect(int rx, int ry, int rw, int rh) {
+    for (int r = 0; r < ALIEN_ROWS; r++)
+        for (int c = 0; c < ALIEN_COLS; c++) {
+            const Alien *a = &aliens[r][c];
+            if (!a->drawn) continue;   // solo lo que hay realmente en pantalla (puede ir por detrás de x,y)
+            if (a->dx >= rx + rw || a->dx + ALIEN_W <= rx) continue;
+            if (a->dy >= ry + rh || a->dy + ALIEN_H <= ry) continue;
+            draw_alien_at(r, c, a->dx, a->dy, a->danim);
+        }
 }
 
 static void draw_player(int x, int y) {
@@ -669,36 +783,159 @@ static void draw_field_static(void) {
     renderer_flush();
 }
 
+// Repinta bala/bombas/platillo (tal como están en pantalla) si solapan
+// la zona dada: al borrar con negro el rectángulo de un alien pueden
+// quedar pisados.
+static void repaint_movers_in_rect(int rx, int ry, int rw, int rh) {
+#define OVL(ax, ay, aw, ah) ((ax) < rx + rw && (ax) + (aw) > rx && (ay) < ry + rh && (ay) + (ah) > ry)
+    if (prev_bullet_active && OVL(prev_bullet_x, prev_bullet_y, BULLET_W, BULLET_H))
+        renderer_fill_rect(prev_bullet_x, prev_bullet_y, BULLET_W, BULLET_H, COLOR_YELLOW);
+    for (int i = 0; i < MAX_BOMBS; i++)
+        if (prev_bomb_active[i] && OVL(prev_bomb_x[i], prev_bomb_y[i], BOMB_W, BOMB_H))
+            renderer_fill_rect(prev_bomb_x[i], prev_bomb_y[i], BOMB_W, BOMB_H, COLOR_RED);
+    if (prev_saucer_active && OVL(prev_saucer_x, SAUCER_Y, SAUCER_W, SAUCER_H))
+        draw_saucer(prev_saucer_x, SAUCER_Y);
+#undef OVL
+}
+
+// Presupuesto de píxeles de formación por tick. Un tick del bucle dura
+// ~10 ms y el SPI cuesta ~1 us/px, así que redibujar entera la formación
+// de golpe (~17.000 px) se comía 2 ticks seguidos y congelaba disparos,
+// nave y sonido. Ahora se reparte: como mucho ~una fila por tick (las
+// filas con pocos aliens son baratas y caben varias).
+#define FORM_BUDGET_PX      5000   // la primera fila de cada tick se hace siempre, aunque la supere
+
+static inline bool alien_needs_draw(const Alien *a) {
+    return a->alive
+        ? (!a->drawn || a->x != a->dx || a->y != a->dy || a->anim != a->danim)
+        : a->drawn;
+}
+
+// Rectángulo que hay que repintar para un alien: unión de la posición
+// antigua (si estaba dibujado) y la nueva (si sigue vivo).
+static void alien_union_rect(const Alien *a, int *x0, int *y0, int *x1, int *y1) {
+    bool has = false;
+    *x0 = *y0 = *x1 = *y1 = 0;
+    if (a->drawn) {
+        *x0 = a->dx; *y0 = a->dy; *x1 = a->dx + ALIEN_W; *y1 = a->dy + ALIEN_H;
+        has = true;
+    }
+    if (a->alive) {
+        if (!has) { *x0 = a->x; *y0 = a->y; *x1 = a->x + ALIEN_W; *y1 = a->y + ALIEN_H; }
+        else {
+            if (a->x < *x0) *x0 = a->x;
+            if (a->y < *y0) *y0 = a->y;
+            if (a->x + ALIEN_W > *x1) *x1 = a->x + ALIEN_W;
+            if (a->y + ALIEN_H > *y1) *y1 = a->y + ALIEN_H;
+        }
+    }
+}
+
+// Píxeles que transmitirá el flush de esta fila (suma de las áreas de
+// sus tramos de aliens contiguos que han cambiado). 0 = nada que hacer.
+static int formation_row_cost(int r) {
+    int cost = 0;
+    bool run = false;
+    int rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+    for (int c = 0; c <= ALIEN_COLS; c++) {
+        const Alien *a = (c < ALIEN_COLS) ? &aliens[r][c] : NULL;
+        if (a && alien_needs_draw(a)) {
+            int x0, y0, x1, y1;
+            alien_union_rect(a, &x0, &y0, &x1, &y1);
+            if (!run) { rx0 = x0; ry0 = y0; rx1 = x1; ry1 = y1; run = true; }
+            else {
+                if (x0 < rx0) rx0 = x0;
+                if (y0 < ry0) ry0 = y0;
+                if (x1 > rx1) rx1 = x1;
+                if (y1 > ry1) ry1 = y1;
+            }
+        } else if (run) {
+            cost += (rx1 - rx0) * (ry1 - ry0);
+            run = false;
+        }
+    }
+    return cost;
+}
+
+// Redibuja la formación en TRAMOS de aliens contiguos que han cambiado,
+// de abajo a arriba, con un flush por tramo (no uno por alien: cada
+// flush tiene un coste fijo en el SPI; no uno por formación: transmitía
+// ~22.000 px aunque quedasen 3 aliens). Y con presupuesto por tick: lo
+// que no cabe queda pendiente (formation_dirty sigue activo) y se hace
+// en los ticks siguientes -- la lógica (posiciones, colisiones) va
+// siempre por delante; la pantalla se pone al día en 1-4 ticks.
+//
+// De ABAJO a ARRIBA: en un paso hacia abajo (10 px, con separación entre
+// filas de solo 6) el alien de arriba invade la zona donde estaba el de
+// debajo; si este ya se ha movido, no se pisan.
 static void draw_formation_if_moved(void) {
-    // prev_formation_x0 == -1 es la señal de "redibujar todo" (recién
-    // inicializada la formación, o venimos de un redibujado de campo)
-    int xmin, ymin, xmax, ymax;
-    formation_bounds(&xmin, &ymin, &xmax, &ymax);
+    if (!formation_dirty) return;
 
-    if (prev_formation_x0 >= 0) {
-        renderer_fill_rect(prev_formation_x0, prev_formation_y0,
-                            prev_formation_x1 - prev_formation_x0,
-                            prev_formation_y1 - prev_formation_y0, COLOR_BLACK);
+    int budget = FORM_BUDGET_PX;
+    int rows_done = 0;
+
+    for (int r = ALIEN_ROWS - 1; r >= 0; r--) {
+        int row_cost = formation_row_cost(r);
+        if (row_cost == 0) continue;
+        if (rows_done > 0 && row_cost > budget) break;   // el resto, en el próximo tick
+        rows_done++;
+
+        bool run = false;                    // hay un tramo abierto sin flushear
+        int  rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+
+        for (int c = 0; c <= ALIEN_COLS; c++) {
+            Alien *a = (c < ALIEN_COLS) ? &aliens[r][c] : NULL;
+
+            if (a && alien_needs_draw(a)) {
+                int x0, y0, x1, y1;
+                alien_union_rect(a, &x0, &y0, &x1, &y1);
+
+                renderer_fill_rect(x0, y0, x1 - x0, y1 - y0, COLOR_BLACK);
+                // Restaurar los bunkers que sigan existiendo bajo la zona
+                // borrada (los que pisan los aliens ya no están en el modelo).
+                bunkers_rect(x0, y0, x1 - x0, y1 - y0, true);
+
+                if (a->alive) {
+                    draw_alien_at(r, c, a->x, a->y, a->anim);
+                    a->dx = a->x; a->dy = a->y; a->danim = a->anim;
+                    a->drawn = true;
+                } else {
+                    a->drawn = false;
+                }
+
+                repaint_movers_in_rect(x0, y0, x1 - x0, y1 - y0);
+
+                if (!run) { rx0 = x0; ry0 = y0; rx1 = x1; ry1 = y1; run = true; }
+                else {
+                    if (x0 < rx0) rx0 = x0;
+                    if (y0 < ry0) ry0 = y0;
+                    if (x1 > rx1) rx1 = x1;
+                    if (y1 > ry1) ry1 = y1;
+                }
+            } else if (run) {
+                // Fin del tramo: un único flush para todos sus aliens.
+                renderer_flush();
+                budget -= (rx1 - rx0) * (ry1 - ry0);
+                run = false;
+            }
+        }
     }
-    if (falive > 0) {
-        for (int r = 0; r < ALIEN_ROWS; r++)
-            for (int c = 0; c < ALIEN_COLS; c++)
-                draw_alien(r, c);
-    }
 
-    prev_formation_x0 = xmin; prev_formation_y0 = ymin;
-    prev_formation_x1 = xmax; prev_formation_y1 = ymax;
-
-    renderer_flush();
+    // ¿Queda algún alien por poner al día en pantalla?
+    formation_dirty = false;
+    for (int r = 0; r < ALIEN_ROWS && !formation_dirty; r++)
+        for (int c = 0; c < ALIEN_COLS; c++)
+            if (alien_needs_draw(&aliens[r][c])) { formation_dirty = true; break; }
 }
 
 static void draw_player_if_moved(void) {
-    if (px == prev_player_x) return;
+    if (px == prev_player_x && !player_dirty) return;
     if (prev_player_x >= 0)
         renderer_fill_rect(prev_player_x - PLAYER_W/2 - 2, PLAYER_Y - 6,
                             PLAYER_W + 4, PLAYER_H + 6, COLOR_BLACK);
     draw_player(px, PLAYER_Y);
     prev_player_x = px;
+    player_dirty = false;
     renderer_flush();
 }
 
@@ -713,8 +950,11 @@ static void erase_player(void) {
 static void draw_bullet_if_changed(void) {
     if (!bullet_active && !prev_bullet_active) return;
 
-    if (prev_bullet_active)
+    if (prev_bullet_active) {
         renderer_fill_rect(prev_bullet_x, prev_bullet_y, BULLET_W, BULLET_H, COLOR_BLACK);
+        bunkers_rect(prev_bullet_x, prev_bullet_y, BULLET_W, BULLET_H, true);
+        if (prev_bullet_y + BULLET_H > PLAYER_Y - 6) player_dirty = true; // rozó el cañón
+    }
     if (bullet_active)
         renderer_fill_rect(bx, by, BULLET_W, BULLET_H, COLOR_YELLOW);
 
@@ -730,8 +970,11 @@ static void draw_bombs_if_changed(void) {
                      (bombs[i].active && (bombs[i].x != prev_bomb_x[i] || bombs[i].y != prev_bomb_y[i]));
         if (!moved) continue;
 
-        if (prev_bomb_active[i])
+        if (prev_bomb_active[i]) {
             renderer_fill_rect(prev_bomb_x[i], prev_bomb_y[i], BOMB_W, BOMB_H, COLOR_BLACK);
+            bunkers_rect(prev_bomb_x[i], prev_bomb_y[i], BOMB_W, BOMB_H, true);
+            if (prev_bomb_y[i] + BOMB_H > PLAYER_Y - 6) player_dirty = true;
+        }
         if (bombs[i].active)
             renderer_fill_rect(bombs[i].x, bombs[i].y, BOMB_W, BOMB_H, COLOR_RED);
 
@@ -746,8 +989,12 @@ static void draw_saucer_if_changed(void) {
     if (saucer.active == prev_saucer_active &&
         (!saucer.active || saucer.x == prev_saucer_x)) return;
 
-    if (prev_saucer_active)
+    if (prev_saucer_active) {
         renderer_fill_rect(prev_saucer_x, SAUCER_Y, SAUCER_W, SAUCER_H, COLOR_BLACK);
+        // Si el platillo cruza la fila superior de aliens, el borrado
+        // les deja un hueco: se repintan solo los aliens que toca.
+        draw_aliens_in_rect(prev_saucer_x, SAUCER_Y, SAUCER_W, SAUCER_H);
+    }
     if (saucer.active)
         draw_saucer(saucer.x, SAUCER_Y);
 
@@ -814,6 +1061,8 @@ static void draw_saucer_points_if_changed(void) {
         renderer_draw_text(x, SAUCER_Y, buf, COLOR_YELLOW, COLOR_BLACK, 1);
     } else {
         renderer_fill_rect(0, SAUCER_Y - 2, TFT_WIDTH, 12, COLOR_BLACK);
+        // la franja borrada puede pisar la fila superior de aliens
+        draw_aliens_in_rect(0, SAUCER_Y - 2, TFT_WIDTH, 12);
     }
     prev_saucer_pts_shown = show;
     renderer_flush();
@@ -822,20 +1071,20 @@ static void draw_saucer_points_if_changed(void) {
 static void draw_playing_frame(void) {
     if (field_needs_redraw) draw_field_static();
 
-    draw_formation_if_moved();
-    draw_bullet_if_changed();
-    draw_bombs_if_changed();
-    draw_saucer_if_changed();
-    draw_saucer_points_if_changed();
+    PROF(P_FORM,   draw_formation_if_moved());
+    PROF(P_BULLET, draw_bullet_if_changed());
+    PROF(P_BOMBS,  draw_bombs_if_changed());
+    PROF(P_SAUCER, draw_saucer_if_changed());
+    PROF(P_SAUCER, draw_saucer_points_if_changed());
 
     if (state == SI_PLAYING) {
-        draw_player_if_moved();
+        PROF(P_PLAYER, draw_player_if_moved());
     } else if (state == SI_PLAYER_DEAD) {
         bool bon = (blink / 20) % 2 == 0;
         if (bon) draw_player_if_moved(); else erase_player();
     }
 
-    draw_hud_if_changed();
+    PROF(P_HUD, draw_hud_if_changed());
 
     bool bon = (blink / 20) % 2 == 0;
 
@@ -1004,7 +1253,7 @@ static void si_tick(void) {
                 bullet_active = true;
                 bx = px - BULLET_W / 2;
                 by = PLAYER_Y - BULLET_H;
-                sound_effect_shoot();
+                sound_effect_laser_big();
             }
         }
 
@@ -1013,7 +1262,7 @@ static void si_tick(void) {
             by -= BULLET_SPD;
             if (by < PLAY_Y) {
                 bullet_active = false;
-            } else if (bullet_hits_bunker(bx, by, BULLET_W, BULLET_H, true)) {
+            } else if (bullet_hits_bunker(bx, by, BULLET_W, BULLET_H, -1)) {
                 bullet_active = false;
             } else {
                 bool hit = false;
@@ -1024,6 +1273,7 @@ static void si_tick(void) {
                         if (bx + BULLET_W > a->x && bx < a->x + ALIEN_W &&
                             by < a->y + ALIEN_H && by + BULLET_H > a->y) {
                             a->alive = false;
+                            formation_dirty = true;
                             score   += ALIEN_PTS[r];
                             falive--;
                             bullet_active = false;
@@ -1035,7 +1285,14 @@ static void si_tick(void) {
         }
 
         // --- Paso de formación ---
-        if (falive > 0 && time_reached_ms(next_formation_step)) {
+        // Solo se da el paso si la pantalla ya está al día con el anterior
+        // (formation_dirty == false): el dibujado va con presupuesto por
+        // tick y puede tardar 1-4 ticks; así el desfase entre lógica y
+        // pantalla es como mucho de UN paso (si no, los rectángulos de
+        // borrado de aliens vecinos se pisarían entre sí). De paso, es el
+        // límite natural de velocidad: la formación no puede ir más
+        // deprisa de lo que la pantalla es capaz de pintarla.
+        if (falive > 0 && !formation_dirty && time_reached_ms(next_formation_step)) {
             formation_step();
         }
 
@@ -1084,7 +1341,7 @@ static void si_tick(void) {
                     bombs[i].active = false;
                     continue;
                 }
-                if (bullet_hits_bunker(bombs[i].x, bombs[i].y, BOMB_W, BOMB_H, true)) {
+                if (bullet_hits_bunker(bombs[i].x, bombs[i].y, BOMB_W, BOMB_H, +1)) {
                     bombs[i].active = false;
                     continue;
                 }
@@ -1246,10 +1503,40 @@ void game_space_invaders_run(game_mode_t mode) {
     const TickType_t period_ticks = pdMS_TO_TICKS(1000 / TARGET_FPS);
     TickType_t last_wake = xTaskGetTickCount();
 
+#if SI_PROFILE
+    uint32_t prof_next_print = now_ms() + 1000;
+    printf("SI_PROFILE: periodo del bucle = %u ticks (%u ms)\n",
+           (unsigned)(period_ticks ? period_ticks : 1),
+           (unsigned)((period_ticks ? period_ticks : 1) * portTICK_PERIOD_MS));
+#endif
+
     while (!g_done) {
+#if SI_PROFILE
+        int64_t work_t0 = esp_timer_get_time();
+#endif
         controls_update();
-        si_tick();
-        sound_update();
+        PROF(P_TICK, si_tick());
+        PROF(P_SOUND, sound_update());
+#if SI_PROFILE
+        {
+            uint32_t w = (uint32_t)(esp_timer_get_time() - work_t0);
+            if (w > prof_max[P_WORK]) prof_max[P_WORK] = w;
+            if (w > (uint32_t)((period_ticks ? period_ticks : 1) * portTICK_PERIOD_MS * 1000)) prof_over++;
+            if (time_reached_ms(prof_next_print)) {
+                prof_next_print = now_ms() + 1000;
+                printf("PROF(us max) saucer=%d | form=%u bul=%u bomb=%u sauc=%u play=%u hud=%u | "
+                       "si_tick(total)=%u sound=%u work=%u | frames_lentos=%u\n",
+                       (int)saucer.active,
+                       (unsigned)prof_max[P_FORM], (unsigned)prof_max[P_BULLET],
+                       (unsigned)prof_max[P_BOMBS], (unsigned)prof_max[P_SAUCER],
+                       (unsigned)prof_max[P_PLAYER], (unsigned)prof_max[P_HUD],
+                       (unsigned)prof_max[P_TICK], (unsigned)prof_max[P_SOUND],
+                       (unsigned)prof_max[P_WORK], (unsigned)prof_over);
+                for (int i = 0; i < P_N; i++) prof_max[i] = 0;
+                prof_over = 0;
+            }
+        }
+#endif
         vTaskDelayUntil(&last_wake, period_ticks ? period_ticks : 1);
     }
 

@@ -3054,4 +3054,4 @@ void sound_stop_tetris_music(void)
 bool sound_tetris_music_is_playing(void)
 {
     return tetris_music_playing;
-}
+}

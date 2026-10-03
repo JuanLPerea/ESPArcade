@@ -7,9 +7,30 @@
 #include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
+#include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+
+/* ===========================================================
+ * SELECCION DE PANEL -- cambia SOLO esta constante:
+ *   TFT_PANEL_ST7789  -> modulo de 2" (GMT020)
+ *   TFT_PANEL_ILI9341 -> modulo de 3.2" (240x320, placa roja)
+ * (tambien se puede pasar como -DTFT_PANEL=... desde CMake)
+ *
+ * El driver ILI9341 NO viene en ESP-IDF, es un componente del
+ * registro: idf.py add-dependency "espressif/esp_lcd_ili9341"
+ * =========================================================== */
+#define TFT_PANEL_ST7789   1
+#define TFT_PANEL_ILI9341  2
+
+#ifndef TFT_PANEL
+#define TFT_PANEL TFT_PANEL_ST7789
+#endif
+
+#if TFT_PANEL == TFT_PANEL_ILI9341
+#include "esp_lcd_ili9341.h"
+#endif
 
 /* ===========================================================
  * st7789.c - Version ESP32 (esp_lcd_panel_st7789 + DMA)
@@ -82,7 +103,34 @@
 #define PIN_RST   22
 
 #define TFT_SPI_HOST SPI2_HOST
-#define TFT_SPI_HZ   (80 * 1000 * 1000)
+
+// Parametros que cambian segun el panel:
+//  - TFT_SPI_HZ:       el ILI9341 no aguanta 80 MHz. Si ves ruido o
+//                      pixeles raros, baja a 20 MHz (cables largos).
+//  - TFT_INVERT_COLORS: ST7789 necesita inversion; ILI9341 normalmente
+//                      no. Si blanco/negro salen al reves, cambialo.
+//  - TFT_RGB_ORDER:    los ILI9341 suelen ser BGR. Si rojo y azul
+//                      salen intercambiados, pon el otro orden.
+//  - TFT_SWAP_BYTES:   el driver ST7789 de esp_lcd intercambia los
+//                      bytes por hardware (data_endian); el de ILI9341
+//                      no, asi que se hace por software al volcar.
+#if TFT_PANEL == TFT_PANEL_ST7789
+  #define TFT_SPI_HZ          (40 * 1000 * 1000)
+  #define TFT_INVERT_COLORS   true
+  #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_RGB
+  #define TFT_SWAP_BYTES      0
+#elif TFT_PANEL == TFT_PANEL_ILI9341
+  #define TFT_SPI_HZ          (10 * 1000 * 1000)
+  #define TFT_INVERT_COLORS   false
+  #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_BGR
+  #define TFT_SWAP_BYTES      1
+#else
+  #error "TFT_PANEL desconocido"
+#endif
+
+// Rotacion inicial (0..3). Si la imagen sale girada o en espejo,
+// prueba los otros valores.
+#define TFT_INITIAL_ROTATION 1
 
 // Resolucion: retrato nativo 240x320, confirmado funcionando en
 // el benchmark de referencia. TFT_WIDTH/TFT_HEIGHT (en st7789.h)
@@ -240,6 +288,16 @@ void st7789_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     (void)x0; (void)y0; (void)x1; (void)y1;
 }
 
+// Copia una fila del framebuffer al buffer de banda, intercambiando
+// los bytes de cada pixel si el panel lo necesita (ILI9341).
+static inline void copy_row_to_band(uint16_t *dst, const uint16_t *src, uint16_t w) {
+#if TFT_SWAP_BYTES
+    for (uint16_t i = 0; i < w; i++) dst[i] = __builtin_bswap16(src[i]);
+#else
+    memcpy(dst, src, (size_t)w * sizeof(uint16_t));
+#endif
+}
+
 // Manda UN rectangulo (ya recortado a pantalla) en bandas de
 // FLUSH_BAND_ROWS filas, con doble buffer: como mucho 2 bandas en
 // vuelo a la vez (una por buffer), solo se espera de verdad cuando
@@ -266,7 +324,7 @@ static void flush_one_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
         uint16_t *buf = s_band_buf[buf_idx];
         for (uint16_t r = 0; r < rows; r++) {
             uint32_t off = fb_index(x0, band_y0 + r);
-            memcpy(&buf[(size_t)r * w], fb_ptr(off), (size_t)w * sizeof(uint16_t));
+            copy_row_to_band(&buf[(size_t)r * w], fb_ptr(off), w);
         }
 
         esp_lcd_panel_draw_bitmap(s_panel, x0, band_y0, x1 + 1, band_y0 + rows, buf);
@@ -484,8 +542,23 @@ uint16_t st7789_text_width(const char *str, uint8_t scale) {
  * transmitirse.
  * --------------------------------------------------------- */
 void st7789_blit(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_t *buf) {
+#if TFT_SWAP_BYTES
+    // El buffer del llamador esta en RGB565 nativo: hay que pasarlo
+    // por el buffer de banda (con los bytes intercambiados) en
+    // trozos, porque no podemos modificar el suyo.
+    if (w == 0 || h == 0 || w > 320) return;
+    uint16_t rows_per = (uint16_t)((320 * FLUSH_BAND_ROWS) / w);
+    for (uint16_t y = 0; y < h; y += rows_per) {
+        uint16_t n = (h - y < rows_per) ? (uint16_t)(h - y) : rows_per;
+        for (uint16_t r = 0; r < n; r++)
+            copy_row_to_band(&s_band_buf[0][(size_t)r * w], buf + (size_t)(y + r) * w, w);
+        esp_lcd_panel_draw_bitmap(s_panel, x0, y0 + y, x0 + w, y0 + y + n, s_band_buf[0]);
+        xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
+    }
+#else
     esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x0 + w, y0 + h, buf);
     xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
+#endif
 }
 
 void st7789_blit_to_buffer(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_t *buf) {
@@ -533,7 +606,7 @@ void st7789_init(void) {
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_SCK,
         .mosi_io_num = PIN_MOSI,
-        .miso_io_num = -1,
+        .miso_io_num = 15,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = 320 * FLUSH_BAND_ROWS * sizeof(uint16_t),
@@ -557,20 +630,33 @@ void st7789_init(void) {
 
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order = TFT_RGB_ORDER,
         .bits_per_pixel = 16,
         .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
         // data_endian NO se especifica a proposito -- igual que en
         // el benchmark de referencia que funciona bien en este
         // mismo panel.
     };
-    esp_lcd_new_panel_st7789(s_io, &panel_config, &s_panel);
+#if TFT_PANEL == TFT_PANEL_ILI9341
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(s_io, &panel_config, &s_panel));
+#else
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(s_io, &panel_config, &s_panel));
+#endif
 
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
-    esp_lcd_panel_invert_color(s_panel, true);
+    uint8_t id[4] = {0};
+
+// DEBUG: leer ID del panel y mostrarlo por consola
+    esp_lcd_panel_io_rx_param(s_io, 0x04, id, 4);   // RDDID
+printf("[lcd] 0x04: %02X %02X %02X %02X\n", id[0], id[1], id[2], id[3]);
+esp_lcd_panel_io_rx_param(s_io, 0xD3, id, 4);   // ID4
+printf("[lcd] 0xD3: %02X %02X %02X %02X\n", id[0], id[1], id[2], id[3]);
+
+
+    esp_lcd_panel_invert_color(s_panel, TFT_INVERT_COLORS);
     esp_lcd_panel_set_gap(s_panel, 0, 0);
-    st7789_set_rotation(1); // apaisada 320x240
+    st7789_set_rotation(TFT_INITIAL_ROTATION);
     esp_lcd_panel_disp_on_off(s_panel, true);
 
     // Framebuffer en FB_CHUNKS trozos (ver comentario en su declaración)

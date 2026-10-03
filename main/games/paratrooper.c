@@ -31,9 +31,18 @@
  *  - Paracaidistas: la suelta de los helicópteros, la entrada de helis por
  *    carril, el modo ataque y las pausas de fin de partida van en ms REALES
  *    (antes en frames, y a más de 60 fps corrían más deprisa de lo que se
- *    veía moverse todo). El ritmo de suelta sube un 10 % por ola superada
- *    (drop_rate_pct(), tope 200 %) y el tope de paracaidistas cayendo a la
- *    vez pasa de 5 (ola 1) a 8 (ola 7+). Ver DROP_*_MS y DROP_WAVE_*.
+ *    veía moverse todo). El ritmo de suelta sube un 9 % por ola superada
+ *    (drop_rate_pct(), tope 180 %) y el tope de paracaidistas cayendo a la
+ *    vez pasa de 4 (ola 1) a 7 (ola 7+). Ver DROP_*_MS y DROP_WAVE_*.
+ *  - Bombas: los aviones las sueltan poco después de entrar en pantalla
+ *    (PLANE_DROP_MIN/RANGE) para que crucen media pantalla en una parábola
+ *    amplia, y vuelve una zona protegida (BOMB_SAFE_R px alrededor del
+ *    cañón) en la que no se pueden destruir.
+ *  - Suelo y soldados: el soldado aterriza cuando sus PIES tocan el suelo (o
+ *    el último apilado), no cuando el enganche del paracaídas llega a la línea
+ *    (se hundía 15 px y saltaba); y la línea del suelo se repone cada vez que
+ *    una caja de borrado la cruza (repaint_ground) y cada GROUND_REFRESH_MS.
+ *    El mensaje inferior va bajo la línea del suelo (escala 1 si no cabe).
  *  - Game Over -> récords: se vacía la entrada tras highscores_enter() y al
  *    cambiar de pantalla, y durante END_SCREEN_LOCK_MS se ignoran botones y
  *    click de salida, para que no salte al título sin verse la pantalla.
@@ -281,21 +290,20 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 // RITMO DE SUELTA, en ms REALES (antes en frames: a más de 60 fps corría
 // más deprisa de lo que se veía moverse el helicóptero).
 // Un helicóptero tarda ~7 s en cruzar la pantalla. En la ola 1 hace una
-// primera comprobación a los 0,7-1,7 s y luego una cada 1,2-2,2 s (~4 por
-// cruce), y cada comprobación suelta con probabilidad 1/DROP_PROB: unos 2
-// paracaidistas por helicóptero.
+// primera comprobación a los 1,0-2,2 s y luego una cada 1,6-2,9 s (~3 por
+// cruce), y cada comprobación suelta con probabilidad 1/DROP_PROB.
 // El ritmo sube un DROP_WAVE_STEP_PCT % por cada ola superada (los tiempos
 // se dividen entre drop_rate_pct()/100) hasta DROP_WAVE_MAX_PCT %.
-#define DROP_FIRST_MIN_MS      700
-#define DROP_FIRST_RANGE_MS    1000
-#define DROP_INTERVAL_MIN_MS   1200
-#define DROP_INTERVAL_RANGE_MS 1000
-#define DROP_WAVE_STEP_PCT     10
-#define DROP_WAVE_MAX_PCT      200
+#define DROP_FIRST_MIN_MS      1000
+#define DROP_FIRST_RANGE_MS    1200
+#define DROP_INTERVAL_MIN_MS   1600
+#define DROP_INTERVAL_RANGE_MS 1300
+#define DROP_WAVE_STEP_PCT     9
+#define DROP_WAVE_MAX_PCT      180
 
-// Tope de paracaidistas cayendo a la vez: 5 en la ola 1, +1 cada 2 olas, máx. 8.
-#define PARAS_AIR_BASE   5
-#define PARAS_AIR_MAX    8
+// Tope de paracaidistas cayendo a la vez: 4 en la ola 1, +1 cada 2 olas, máx. 7.
+#define PARAS_AIR_BASE   4
+#define PARAS_AIR_MAX    7
 
 #define ATTACK_DUR_MS         6000
 #define ATTACK_INTERVAL_MS    20000
@@ -343,6 +351,7 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 
 #define BULLET_SPD   4   // px/tick nominal, ver player_fire()
 #define BOMB_HIT_R   7   // radio de impacto bala->bomba (bala 3 + sprite ~4)
+#define BOMB_SAFE_R  45  // radio alrededor del cañón dentro del cual la bomba NO se puede destruir
 #define PLANE_SPD    2   // px/tick nominal
 
 // Pasada de aviones al terminar la ola: entre 1 y MAX_PLANES aviones (al
@@ -351,6 +360,8 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 // PLANE_MIN_SEP px entre sí para no solaparse, y solo cambian de lado de
 // aparición cuando ya no queda ningún avión en pantalla.
 #define PLANE_MIN_SEP      70
+#define PLANE_DROP_MIN     25   // px dentro de la pantalla (desde el borde de entrada) a los que suelta la bomba...
+#define PLANE_DROP_RANGE   45   // ...más hasta este margen al azar
 #define JET_GAP_MIN_MS     250
 #define JET_GAP_RANGE_MS   2250
 
@@ -797,7 +808,12 @@ static void launch_jet(int dir) {
         // Antes la bomba se soltaba a los 30 frames de vida del avión; si el
         // juego iba más rápido de 60 fps el avión aún no había entrado, la
         // bomba nacía fuera de pantalla y se descartaba al instante.
-        pl->drop_x = PLAY_X + 40 + rnd(PLAY_W - 80);
+        // Se suelta POCO DESPUÉS DE ENTRAR (PLANE_DROP_MIN..+RANGE px dentro de
+        // la pantalla por el lado de entrada) y no en mitad del recorrido:
+        // así la bomba tiene que cruzar casi media pantalla hasta la torreta
+        // y describe una parábola amplia, en vez de caer casi en vertical.
+        int off = PLANE_DROP_MIN + rnd(PLANE_DROP_RANGE);
+        pl->drop_x = (dir==1) ? (PLAY_X + off) : (PLAY_X + PLAY_W - off);
         return;
     }
 }
@@ -856,7 +872,7 @@ static void update_helis(void) {
                  * uno a uno, repartidos en el tiempo, en vez de en racha.
                  */
                 int base_interval = attack_mode
-                    ? (330 + rnd(330))
+                    ? drop_ms(450, 400)   // modo ataque: 450-850 ms en la ola 1 (antes 330-660), y también se acorta con las olas
                     : drop_ms(DROP_INTERVAL_MIN_MS, DROP_INTERVAL_RANGE_MS);
                 h->drop_timer = base_interval;
                 int prob = attack_mode ? DROP_PROB_ATTACK : DROP_PROB;
@@ -889,7 +905,18 @@ static void update_paras(void) {
 
         int side = (FP2PX(p->x) < TURRET_X) ? 0 : 1;
 
-        if (p->chute_shot && FP2PX(p->y) >= GROUND_Y) {
+        // El soldado en el aire se dibuja SOLDIER_H px POR DEBAJO de p->y (p->y
+        // es el enganche del paracaídas). Antes se aterrizaba cuando p->y llegaba
+        // a GROUND_Y, o sea con los pies 15 px por DEBAJO de la línea del suelo:
+        // se veía hundirse en el suelo y luego "saltar" a su sitio. Ahora se
+        // aterriza cuando los PIES tocan el suelo o la cabeza del último soldado
+        // apilado en esa ranura.
+        int fall_x   = FP2PX(p->x);
+        int fall_slot = find_slot(side, fall_x);
+        int land_top = GROUND_Y - ((fall_slot >= 0) ? slot_count[side][fall_slot] : 0) * SOLDIER_H;
+        bool feet_down = (FP2PX(p->y) + SOLDIER_H >= land_top);
+
+        if (p->chute_shot && feet_down) {
             int lx = FP2PX(p->x);
             int kill_s = -1;
             if (p->slot>=0 && slot_count[side][p->slot]>0) {
@@ -899,11 +926,11 @@ static void update_paras(void) {
                     if (slot_count[side][n]>0 && SLOT_X(side,n)==lx) { kill_s=n; break; }
             }
             if (kill_s>=0) kill_slot(side, kill_s);
-            spawn_expl(lx, GROUND_Y, 5, 3, 14);
+            spawn_expl(lx, land_top, 5, 3, 14);
             p->active = false; continue;
         }
 
-        if (!p->chute_shot && FP2PX(p->y) >= GROUND_Y) {
+        if (!p->chute_shot && feet_down) {
             p->y = PX2FP(GROUND_Y);
             p->landed = true; p->side = side;
             p->marching = false; p->climbing = false;
@@ -1224,13 +1251,17 @@ static void check_collisions(void) {
         for (int i=0;i<MAX_BOMBS;i++) {
             if (!bombs[i].active) continue;
             int ox=FP2PX(bombs[i].x), oy=FP2PX(bombs[i].y);
-            // Antes había una "zona de seguridad" de 30 px alrededor de
-            // TURRET_X en la que la bala no podía tocar la bomba. Como la
-            // bomba se dirige a TURRET_X, esos últimos 30 px eran justo
-            // los de su caída final (y si el avión la soltaba cerca, toda
-            // la caída): se veía la bala pasar por encima y no la rompía.
-            // Ahora la bomba es alcanzable en todo su recorrido, con un
-            // radio algo mayor que el sprite (4x5 px) y por barrido.
+            // Zona protegida: una bomba a menos de BOMB_SAFE_R px del cañón ya
+            // no se puede destruir (si no, acertarla en el último momento
+            // es demasiado fácil). La zona es un CÍRCULO alrededor del cañón,
+            // no una columna de 30 px como la versión antigua: aquella cubría
+            // toda la caída si el avión soltaba cerca de la torreta y la bomba
+            // parecía indestructible. Como ahora los aviones sueltan la bomba
+            // cerca del borde de entrada (>= 85 px de la torreta), la bomba
+            // siempre sale fuera de la zona y es alcanzable durante casi todo
+            // su recorrido; solo se protege el tramo final de la aproximación.
+            int sdx = ox - CANNON_OX, sdy = oy - CANNON_OY;
+            if (sdx*sdx + sdy*sdy < BOMB_SAFE_R*BOMB_SAFE_R) continue;
             if (seg_hit(FP2PX(bu->px), FP2PX(bu->py), bx, by, ox, oy, BOMB_HIT_R)) {
                 bu->active = bombs[i].active = false;
                 spawn_expl(ox,oy,6,3,16);
@@ -1471,13 +1502,34 @@ static void mark_paras_dirty(int x, int y, int w, int h) {
     if (x < tx+2*TURRET_BOX_HW && x+w > tx && y < ty+TURRET_BOX_H && y+h > ty) turret_dirty = true;
 }
 
+// La línea del suelo son 2 px (GROUND_Y..GROUND_Y+1) que solo se pintan al
+// empezar el campo (draw_field_static). Casi todas las cajas de borrado
+// (soldado aterrizado, torreta, torre en marcha, mensajes...) la cruzan y, al
+// no volver a pintarla nadie, iban dejando huecos que no se rellenaban nunca:
+// con la torre activa, por ejemplo, desaparecía media línea cada frame.
+static void repaint_ground(int x, int w) {
+    if (x < PLAY_X) { w -= PLAY_X - x; x = PLAY_X; }
+    if (x + w > PLAY_X + PLAY_W) w = PLAY_X + PLAY_W - x;
+    if (w <= 0) return;
+    renderer_fill_rect(x, GROUND_Y, w, 2, COLOR_WHITE);
+}
+
 static void erase_box(int x, int y, int w, int h) {
     if (x<0) { w+=x; x=0; }
     if (y<0) { h+=y; y=0; }
     if (w<=0 || h<=0) return;
     renderer_fill_rect(x, y, w, h, COLOR_BLACK);
+    // Si la caja cruza la línea del suelo, se repone el tramo borrado. Es
+    // dentro de la misma zona sucia, así que no añade coste de SPI.
+    if (y < GROUND_Y + 2 && y + h > GROUND_Y) repaint_ground(x, w);
     mark_paras_dirty(x, y, w, h);
 }
+
+// Repintado periódico de la línea completa (red de seguridad por si algún
+// otro dibujo la pisa). Una vez cada GROUND_REFRESH_MS: es una franja de
+// 320x2 px, coste despreciable.
+#define GROUND_REFRESH_MS 1500
+static int32_t ground_refresh_ms;
 
 // Cuándo se llama a renderer_flush() (cada flush = una transacción SPI con
 // su espera, y el driver solo guarda 8 rectángulos sucios: si se acumulan
@@ -1811,12 +1863,21 @@ static void update_bottom_message(const char *target, int scale) {
      * queda a la misma distancia (2px) del borde inferior del área
      * de juego.
      */
+    // El mensaje va en la franja que queda BAJO la línea del suelo
+    // (GROUND_Y+2 hasta el borde de pantalla, ~14 px). Antes la caja se
+    // calculaba desde PLAY_Y+PLAY_H-2 hacia arriba: con escala 1 empezaba en
+    // GROUND_Y-1 y con escala 2 mucho antes, así que borraba la línea del
+    // suelo (y la base de la torreta) cada vez que cambiaba el mensaje, y el
+    // texto quedaba escrito encima del suelo. Si no cabe, baja a escala 1.
+    int box_y = GROUND_Y + 2;
+    int avail = TFT_HEIGHT - box_y;
+    while (scale > 1 && 8*scale + 4 > avail) scale--;
     int text_h = 8*scale;
     int box_h = text_h + 4;
-    int box_y = PLAY_Y+PLAY_H-2-box_h;
+    if (box_h > avail) box_h = avail;
 
     renderer_fill_rect(0, box_y, TFT_WIDTH, box_h, COLOR_BLACK);
-    if (target[0]) st7789_draw_text(centered_x(target,scale), box_y+2, target, COLOR_WHITE, COLOR_BLACK, scale);
+    if (target[0]) st7789_draw_text(centered_x(target,scale), box_y+(box_h-text_h)/2, target, COLOR_WHITE, COLOR_BLACK, scale);
     strncpy(prev_bottom_msg, target, sizeof(prev_bottom_msg)-1);
     prev_bottom_msg[sizeof(prev_bottom_msg)-1]='\0';
     renderer_flush();
@@ -1849,6 +1910,11 @@ static void draw_playing_frame(void) {
     draw_hud_if_changed();
     draw_static_paras_if_dirty();
     draw_turret_if_dirty();
+    ground_refresh_ms -= g_elapsed_ms;
+    if (ground_refresh_ms <= 0) {
+        ground_refresh_ms = GROUND_REFRESH_MS;
+        repaint_ground(PLAY_X, PLAY_W);
+    }
     pt_flush_group();            // proyectiles + HUD + soldados reparados
 
     bool bon = (blink/20)%2==0;

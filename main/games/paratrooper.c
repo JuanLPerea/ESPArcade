@@ -28,9 +28,15 @@
  *  - Demo: se vacía el acumulador del stick antes de arrancar, para que
  *    un rebote antiguo no la corte en el primer tick.
  * AJUSTES POSTERIORES (ESP32):
- *  - Más paracaidistas: primera comprobación de suelta a los 0,5-1,5 s y
- *    después cada 1-2 s (antes 2-5 s y 2-4 s) -> ~2 por helicóptero en
- *    vez de ~0,5; MAX_PARAS_AIR 5 -> 7.
+ *  - Paracaidistas: la suelta de los helicópteros, la entrada de helis por
+ *    carril, el modo ataque y las pausas de fin de partida van en ms REALES
+ *    (antes en frames, y a más de 60 fps corrían más deprisa de lo que se
+ *    veía moverse todo). El ritmo de suelta sube un 10 % por ola superada
+ *    (drop_rate_pct(), tope 200 %) y el tope de paracaidistas cayendo a la
+ *    vez pasa de 5 (ola 1) a 8 (ola 7+). Ver DROP_*_MS y DROP_WAVE_*.
+ *  - Game Over -> récords: se vacía la entrada tras highscores_enter() y al
+ *    cambiar de pantalla, y durante END_SCREEN_LOCK_MS se ignoran botones y
+ *    click de salida, para que no salte al título sin verse la pantalla.
  *  - Bombas del avión: quitada la zona de seguridad de 30 px junto a la
  *    torreta (impedía romperlas en el último tramo de su caída), radio de
  *    impacto BOMB_HIT_R y colisión bala->bomba por barrido (seg_hit()).
@@ -43,6 +49,17 @@
  *  - Giro del cañón, marcha y escalada de los soldados por tiempo real
  *    (g_dt_scale) en vez de por frame: ya no dependen de los fps. La marcha
  *    pasa de 0,5 a 1 px por tick nominal (MARCH_SPD).
+ *
+ * AVIONES (ESP32):
+ *  - La bomba se suelta al llegar a una posición de pantalla al azar
+ *    (drop_x), no a los 30 frames: con frames cortos el avión aún estaba
+ *    fuera de pantalla y la bomba se descartaba al nacer.
+ *  - Pasada de 1 a 5 aviones al azar, con intervalo variable (250-2500 ms
+ *    reales) entre lanzamientos; pueden ir seguidos por el mismo lado
+ *    (PLANE_MIN_SEP px entre sí) y solo cambian de lado cuando no queda
+ *    ninguno en pantalla. Cada uno suelta su bomba (MAX_BOMBS = 5).
+ *  - Ranuras de aterrizaje: 5 por lado (quitadas las 2 más cercanas a la
+ *    torreta).
  *
  * SE MANTIENE lo específico de la ESP32: DROP_PROB=2 y DROP_PROB_ATTACK=1
  * (más agresivos que los 5 y 3 de la Pico), controles con eje X del
@@ -171,6 +188,7 @@ static inline uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1
 // ---------------------------------------------------------------------------
 static uint32_t last_tick_time_ms;
 static int32_t g_dt_scale = FP;
+static int32_t g_elapsed_ms = 16;   // ms reales del último tick (para temporizadores que no deben depender de los fps)
 
 static void update_dt_scale(void) {
     uint32_t now = now_ms();
@@ -181,6 +199,7 @@ static void update_dt_scale(void) {
     if (elapsed_ms > 50) elapsed_ms = 50; // limita saltos tras una pausa larga (highscores_enter())
 
     g_dt_scale = elapsed_ms * FP / 16;
+    g_elapsed_ms = elapsed_ms;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,15 +249,21 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 #define CANNON_OY    (TURRET_Y - BASE_H - BODY_RY/2)
 
 // ---------------------------------------------------------------------------
-// Ranuras de aterrizaje -- 7 por lado, X fija al aterrizar.
+// Ranuras de aterrizaje -- 5 por lado, X fija al aterrizar.
 // ---------------------------------------------------------------------------
-#define NUM_SLOTS    7
+// Antes había 7 ranuras por lado; las 2 más cercanas a la torreta se han
+// quitado (los paracaidistas caían demasiado pegados a la base). Se conserva
+// el reparto original de 7 (SLOT_TOTAL) para que las 5 que quedan estén
+// exactamente donde estaban las antiguas 2..6.
+#define SLOT_TOTAL   7
+#define SLOT_SKIP    2
+#define NUM_SLOTS    (SLOT_TOTAL - SLOT_SKIP)
 #define SLOT_MARGIN  (BASE_W/2 + 6)
 #define SLOT_EDGE    10
 #define SLOT_SPACE_L (TURRET_X - PLAY_X - SLOT_MARGIN - SLOT_EDGE)
 #define SLOT_SPACE_R (PLAY_X + PLAY_W - TURRET_X - SLOT_MARGIN - SLOT_EDGE)
-#define SLOT_X_L(n)  (TURRET_X - SLOT_MARGIN - ((n) * SLOT_SPACE_L) / (NUM_SLOTS-1))
-#define SLOT_X_R(n)  (TURRET_X + SLOT_MARGIN + ((n) * SLOT_SPACE_R) / (NUM_SLOTS-1))
+#define SLOT_X_L(n)  (TURRET_X - SLOT_MARGIN - (((n)+SLOT_SKIP) * SLOT_SPACE_L) / (SLOT_TOTAL-1))
+#define SLOT_X_R(n)  (TURRET_X + SLOT_MARGIN + (((n)+SLOT_SKIP) * SLOT_SPACE_R) / (SLOT_TOTAL-1))
 #define SLOT_X(s,n)  ((s)==0 ? SLOT_X_L(n) : SLOT_X_R(n))
 #define SLOT_STACK   3
 
@@ -249,23 +274,31 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 #define LANE0_Y       (PLAY_Y + 15)
 #define LANE1_Y       (PLAY_Y + 36)
 #define HELI_SPD      1
-#define HELI_GAP      (TICKS_S * 2)
+#define HELI_GAP_MS   2000   // hueco mínimo entre helicópteros de un mismo carril (+ hasta 1000 ms al azar)
 #define HELI_MIN_SEP  80
 #define DROP_PROB     2   // antes 5 -- 1 de cada 2 comprobaciones sueltan, en vez de 1 de cada 5
 
-// Un helicóptero tarda ~7 s en cruzar la pantalla. Con la primera
-// comprobación a los 2-5 s y las siguientes cada 2-4 s solo llegaba a
-// hacer 1-2 comprobaciones (a un 50%), es decir, ~0,5 paracaidistas por
-// helicóptero. Ahora la primera comprobación llega a los 0,5-1,5 s y
-// las siguientes cada 1-2 s: ~4-5 comprobaciones por cruce, ~2
-// paracaidistas por helicóptero. Sube DROP_INTERVAL_* para suavizarlo.
-#define DROP_FIRST_MIN     (TICKS_S / 2)
-#define DROP_FIRST_RANGE   TICKS_S
-#define DROP_INTERVAL_MIN  TICKS_S
-#define DROP_INTERVAL_RANGE TICKS_S
+// RITMO DE SUELTA, en ms REALES (antes en frames: a más de 60 fps corría
+// más deprisa de lo que se veía moverse el helicóptero).
+// Un helicóptero tarda ~7 s en cruzar la pantalla. En la ola 1 hace una
+// primera comprobación a los 0,7-1,7 s y luego una cada 1,2-2,2 s (~4 por
+// cruce), y cada comprobación suelta con probabilidad 1/DROP_PROB: unos 2
+// paracaidistas por helicóptero.
+// El ritmo sube un DROP_WAVE_STEP_PCT % por cada ola superada (los tiempos
+// se dividen entre drop_rate_pct()/100) hasta DROP_WAVE_MAX_PCT %.
+#define DROP_FIRST_MIN_MS      700
+#define DROP_FIRST_RANGE_MS    1000
+#define DROP_INTERVAL_MIN_MS   1200
+#define DROP_INTERVAL_RANGE_MS 1000
+#define DROP_WAVE_STEP_PCT     10
+#define DROP_WAVE_MAX_PCT      200
 
-#define ATTACK_DUR         (TICKS_S * 6)
-#define ATTACK_INTERVAL    (TICKS_S * 20)
+// Tope de paracaidistas cayendo a la vez: 5 en la ola 1, +1 cada 2 olas, máx. 8.
+#define PARAS_AIR_BASE   5
+#define PARAS_AIR_MAX    8
+
+#define ATTACK_DUR_MS         6000
+#define ATTACK_INTERVAL_MS    20000
 #define DROP_PROB_ATTACK   1   // antes 3 -- en modo ataque, suelta siempre que toca comprobar
 
 // ---------------------------------------------------------------------------
@@ -294,10 +327,10 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 // asteroids.c.
 // ---------------------------------------------------------------------------
 #define MAX_HELIS      8
-#define MAX_PARAS_AIR  7   // antes 5 -- tope de paracaidistas cayendo a la vez (con más sueltas, 5 se llenaba y los helis dejaban de soltar)
 #define MAX_PARAS      24
 #define MAX_BULLETS    6
-#define MAX_BOMBS      2
+#define MAX_BOMBS      5   // una por avión (hasta MAX_PLANES a la vez)
+#define MAX_PLANES     5
 #define MAX_PARTICLES  32
 
 #define PTS_HELI            150
@@ -311,6 +344,15 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 #define BULLET_SPD   4   // px/tick nominal, ver player_fire()
 #define BOMB_HIT_R   7   // radio de impacto bala->bomba (bala 3 + sprite ~4)
 #define PLANE_SPD    2   // px/tick nominal
+
+// Pasada de aviones al terminar la ola: entre 1 y MAX_PLANES aviones (al
+// azar), lanzados con un intervalo variable (JET_GAP_*), en ms REALES.
+// Pueden ir seguidos por el mismo lado como los helicópteros, guardando
+// PLANE_MIN_SEP px entre sí para no solaparse, y solo cambian de lado de
+// aparición cuando ya no queda ningún avión en pantalla.
+#define PLANE_MIN_SEP      70
+#define JET_GAP_MIN_MS     250
+#define JET_GAP_RANGE_MS   2250
 
 #define CHUTE_OPEN_Y_MIN  (PLAY_Y + PLAY_H/5)
 #define CHUTE_OPEN_Y_MAX  (PLAY_Y + PLAY_H*2/3)
@@ -344,7 +386,8 @@ typedef struct { int32_t x, y, vx, vy; int32_t px, py; bool active; } Bullet;   
 typedef struct { int32_t x, y, vx, vy, ay; bool active; } Bomb;
 typedef struct {
     int32_t x, y; int vx; bool active;
-    int bomb_dropped, anim_timer, drop_delay;
+    int bomb_dropped, anim_timer;
+    int drop_x;          // px de pantalla donde suelta su bomba (al azar por avión)
 } Plane;
 typedef struct { int32_t x, y, vx, vy; int life, life_max; bool active; } Particle;
 
@@ -358,7 +401,8 @@ typedef enum {
 static PtState state;
 static int     blink;
 static bool    demo_mode;
-static int     pause_cnt, demo_ticks;
+static int     pause_cnt, demo_ticks;   // ms
+static int32_t input_lock_ms;           // ms durante los que se ignoran botones y click de salida (ver flush_inputs)
 static int     score, wave;
 static bool    g_done;
 
@@ -384,8 +428,11 @@ static bool helis_frozen;
 static int  wave_heli_budget;
 static int  wave_helis_spawned;
 static bool wave_done;
-static int  jet_delay;
+static int32_t jet_delay;     // ms hasta lanzar el primer avión tras despejar la ola
 static bool jet_launched;
+static int  jets_left;        // aviones que faltan por lanzar en esta pasada
+static int  jet_next_dir;     // lado por el que entrará el siguiente (+1 izq->der, -1 der->izq)
+static int32_t jet_gap_ms;    // ms hasta poder lanzar el siguiente
 
 // Modo ataque
 static bool attack_mode;
@@ -399,7 +446,7 @@ static Heli     helis[MAX_HELIS];
 static Para     paras[MAX_PARAS];
 static Bullet   bullets[MAX_BULLETS];
 static Bomb     bombs[MAX_BOMBS];
-static Plane    plane;
+static Plane    planes[MAX_PLANES];
 static Particle particles[MAX_PARTICLES];
 
 // ---------------------------------------------------------------------------
@@ -606,20 +653,20 @@ static void reset_wave(void) {
     for (int i=0;i<MAX_PARAS;i++) if (!paras[i].landed) paras[i].active=false;
     for (int i=0;i<MAX_BULLETS;i++) bullets[i].active=false;
     for (int i=0;i<MAX_BOMBS;i++)   bombs[i].active=false;
-    plane.active=false;
+    for (int i=0;i<MAX_PLANES;i++) planes[i].active=false;
     for (int i=0;i<MAX_PARTICLES;i++) particles[i].active=false;
     for (int s=0;s<2;s++) {
         ground_total[s]=0;
         for (int n=0;n<NUM_SLOTS;n++) slot_count[s][n]=0;
     }
     tower_active=false; helis_frozen=false;
-    wave_done=false; jet_delay=0; jet_launched=false;
+    wave_done=false; jet_delay=0; jet_launched=false; jets_left=0; jet_gap_ms=0;
     attack_mode=false; attack_timer=0;
-    attack_cooldown=ATTACK_INTERVAL;
+    attack_cooldown=ATTACK_INTERVAL_MS;
     wave_heli_budget = 12 + wave*2; if (wave_heli_budget>48) wave_heli_budget=48;
     wave_helis_spawned=0;
-    lane_timer[0]=TICKS_S;
-    lane_timer[1]=TICKS_S*2+rnd(TICKS_S);
+    lane_timer[0]=1000;
+    lane_timer[1]=2000+rnd(1000);
     sound_siren_stop(); // por si el avión seguía sonando
 }
 
@@ -641,6 +688,21 @@ static void game_start(void) {
 // ---------------------------------------------------------------------------
 // Spawn
 // ---------------------------------------------------------------------------
+static int drop_rate_pct(void) {
+    int p = 100 + (wave-1) * DROP_WAVE_STEP_PCT;
+    return p > DROP_WAVE_MAX_PCT ? DROP_WAVE_MAX_PCT : p;
+}
+
+// Tiempo (ms) hasta la siguiente comprobación de suelta, ya escalado por ola.
+static int drop_ms(int base_min, int range) {
+    return (base_min + rnd(range)) * 100 / drop_rate_pct();
+}
+
+static int max_paras_air(void) {
+    int m = PARAS_AIR_BASE + (wave-1)/2;
+    return m > PARAS_AIR_MAX ? PARAS_AIR_MAX : m;
+}
+
 static void spawn_heli(int lane) {
     int dir = (lane==0) ? 1 : -1;
     int lane_y = (lane==0) ? LANE0_Y : LANE1_Y;
@@ -659,7 +721,7 @@ static void spawn_heli(int lane) {
         helis[i].x = PX2FP(entry_x);
         helis[i].y = lane_y;
         helis[i].vx = dir*HELI_SPD;
-        helis[i].drop_timer = DROP_FIRST_MIN + rnd(DROP_FIRST_RANGE);
+        helis[i].drop_timer = drop_ms(DROP_FIRST_MIN_MS, DROP_FIRST_RANGE_MS);
         helis[i].anim_timer = 0;
         helis[i].rotor_frame = 0; helis[i].tail_frame = 0;
         break;
@@ -667,7 +729,7 @@ static void spawn_heli(int lane) {
 }
 
 static void spawn_para_at_slot(int side, int hy) {
-    if (count_paras_air() >= MAX_PARAS_AIR) return;
+    if (count_paras_air() >= max_paras_air()) return;
     int sx = pick_slot_x(side);
     for (int i=0;i<MAX_PARAS;i++) {
         if (paras[i].active) continue;
@@ -709,16 +771,60 @@ static void player_fire(void) {
     }
 }
 
-static void launch_jet(void) {
-    if (plane.active) return;
-    int dir = rnd(2) ? 1 : -1;
-    plane.active = true;
-    plane.vx = dir*PLANE_SPD;
-    plane.x = PX2FP((dir==1) ? (PLAY_X-30) : (PLAY_X+PLAY_W+30));
-    plane.y = PX2FP(PLAY_Y+12+rnd(25));
-    plane.bomb_dropped = 0;
-    plane.anim_timer = plane.drop_delay = 0;
-    sound_siren_start();
+static int planes_active(void) {
+    int n = 0;
+    for (int i=0;i<MAX_PLANES;i++) if (planes[i].active) n++;
+    return n;
+}
+
+static bool bombs_active(void) {
+    for (int i=0;i<MAX_BOMBS;i++) if (bombs[i].active) return true;
+    return false;
+}
+
+static void launch_jet(int dir) {
+    for (int i=0;i<MAX_PLANES;i++) {
+        if (planes[i].active) continue;
+        Plane *pl = &planes[i];
+        if (planes_active() == 0) sound_siren_start();   // la sirena suena mientras haya alguno
+        pl->active = true;
+        pl->vx = dir*PLANE_SPD;
+        pl->x = PX2FP((dir==1) ? (PLAY_X-30) : (PLAY_X+PLAY_W+30));
+        pl->y = PX2FP(PLAY_Y+12+rnd(25));
+        pl->bomb_dropped = 0;
+        pl->anim_timer = 0;
+        // Punto de suelta: por POSICIÓN en pantalla, no por número de frames.
+        // Antes la bomba se soltaba a los 30 frames de vida del avión; si el
+        // juego iba más rápido de 60 fps el avión aún no había entrado, la
+        // bomba nacía fuera de pantalla y se descartaba al instante.
+        pl->drop_x = PLAY_X + 40 + rnd(PLAY_W - 80);
+        return;
+    }
+}
+
+// Planificador de la pasada de aviones. Se llama cada tick mientras quedan
+// aviones por lanzar. Reglas:
+//  - espera jet_gap_ms (aleatorio, en ms reales) desde el último lanzamiento;
+//  - no lanza si algún avión en pantalla va en sentido contrario (para cambiar
+//    de lado hay que esperar a que la pantalla esté libre de aviones);
+//  - no lanza si el último avión del mismo lado aún está a menos de
+//    PLANE_MIN_SEP px de la entrada (no se solapan).
+static void update_jet_schedule(void) {
+    if (jets_left <= 0) return;
+    jet_gap_ms -= g_elapsed_ms;
+    if (jet_gap_ms > 0) return;
+
+    int dir = jet_next_dir;
+    int entry_x = (dir==1) ? (PLAY_X-30) : (PLAY_X+PLAY_W+30);
+    for (int i=0;i<MAX_PLANES;i++) {
+        if (!planes[i].active) continue;
+        if ((planes[i].vx > 0 ? 1 : -1) != dir) return;
+        if (absi(FP2PX(planes[i].x) - entry_x) < PLANE_MIN_SEP) return;
+    }
+    launch_jet(dir);
+    jets_left--;
+    jet_next_dir = rnd(2) ? 1 : -1;
+    jet_gap_ms = JET_GAP_MIN_MS + rnd(JET_GAP_RANGE_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -737,7 +843,8 @@ static void update_helis(void) {
         int hx = FP2PX(h->x);
         if (hx < PLAY_X-60 || hx > PLAY_X+PLAY_W+60) { h->active=false; continue; }
         if (!tower_active && !wave_done && cannon_alive) {
-            if (--h->drop_timer <= 0) {
+            h->drop_timer -= g_elapsed_ms;
+            if (h->drop_timer <= 0) {
                 /*
                  * Antes, en modo ataque DROP_PROB_ATTACK=1 hacía que CADA
                  * helicóptero soltara un paracaidista con un 100% de
@@ -749,8 +856,8 @@ static void update_helis(void) {
                  * uno a uno, repartidos en el tiempo, en vez de en racha.
                  */
                 int base_interval = attack_mode
-                    ? (TICKS_S/3 + rnd(TICKS_S/3))
-                    : (DROP_INTERVAL_MIN + rnd(DROP_INTERVAL_RANGE));
+                    ? (330 + rnd(330))
+                    : drop_ms(DROP_INTERVAL_MIN_MS, DROP_INTERVAL_RANGE_MS);
                 h->drop_timer = base_interval;
                 int prob = attack_mode ? DROP_PROB_ATTACK : DROP_PROB;
                 if (rnd(prob) == 0) {
@@ -933,7 +1040,6 @@ static void update_tower(void) {
 // ---------------------------------------------------------------------------
 // Update avión / bombas / balas
 // ---------------------------------------------------------------------------
-#define BOMB_DROP_DELAY  30
 
 /*
  * Ticks (nominales) que le quedan a la bomba hasta llegar a la
@@ -964,36 +1070,44 @@ static int bomb_ticks_to_ground(int32_t y, int32_t vy, int32_t ay) {
     return 500;
 }
 
-static void update_plane(void) {
-    if (!plane.active) return;
-    plane.anim_timer++; if (plane.anim_timer>=3) plane.anim_timer=0;
-    plane.x += (int32_t)plane.vx * g_dt_scale;
+static void update_planes(void) {
+    for (int pi=0; pi<MAX_PLANES; pi++) {
+        Plane *pl = &planes[pi];
+        if (!pl->active) continue;
+        pl->anim_timer++; if (pl->anim_timer>=3) pl->anim_timer=0;
+        pl->x += (int32_t)pl->vx * g_dt_scale;
 
-    if (plane.bomb_dropped == 0) {
-        if (++plane.drop_delay >= BOMB_DROP_DELAY) {
-            plane.bomb_dropped = 1;
-            for (int bi=0;bi<MAX_BOMBS;bi++) {
-                if (bombs[bi].active) continue;
-                int32_t bx = plane.x;
-                int32_t by = plane.y + PX2FP(6);
-                /*
-                 * Caída lenta a propósito (antes tardaba ~1.8s en tocar
-                 * el suelo, sin apenas margen para dispararle; ahora
-                 * tarda ~3s) para que dé tiempo real a acertarla.
-                 */
-                int32_t vy0 = 24, ay = 3;
-                int tof = bomb_ticks_to_ground(by, vy0, ay);
-                int32_t vx = (PX2FP(TURRET_X) - bx) / tof;
-                bombs[bi].active=true;
-                bombs[bi].x=bx; bombs[bi].y=by;
-                bombs[bi].vx=vx; bombs[bi].vy=vy0; bombs[bi].ay=ay;
-                sound_play_tone(220, 60);
-                break;
+        int px = FP2PX(pl->x);
+        if (pl->bomb_dropped == 0) {
+            bool reached = (pl->vx > 0) ? (px >= pl->drop_x) : (px <= pl->drop_x);
+            if (reached) {
+                for (int bi=0;bi<MAX_BOMBS;bi++) {
+                    if (bombs[bi].active) continue;
+                    pl->bomb_dropped = 1;
+                    int32_t bx = pl->x;
+                    int32_t by = pl->y + PX2FP(6);
+                    /*
+                     * Caída lenta a propósito (antes tardaba ~1.8s en tocar
+                     * el suelo, sin apenas margen para dispararle; ahora
+                     * tarda ~3s) para que dé tiempo real a acertarla.
+                     */
+                    int32_t vy0 = 24, ay = 3;
+                    int tof = bomb_ticks_to_ground(by, vy0, ay);
+                    int32_t vx = (PX2FP(TURRET_X) - bx) / tof;
+                    bombs[bi].active=true;
+                    bombs[bi].x=bx; bombs[bi].y=by;
+                    bombs[bi].vx=vx; bombs[bi].vy=vy0; bombs[bi].ay=ay;
+                    sound_play_tone(220, 60);
+                    break;
+                }
+                // Si no había hueco de bomba libre, reintenta en el siguiente tick.
             }
         }
+        if (px<PLAY_X-50 || px>PLAY_X+PLAY_W+50) {
+            pl->active=false;
+            if (planes_active() == 0) sound_siren_stop();
+        }
     }
-    int px = FP2PX(plane.x);
-    if (px<PLAY_X-50 || px>PLAY_X+PLAY_W+50) { plane.active=false; sound_siren_stop(); }
 }
 
 static void update_bombs(void) {
@@ -1094,11 +1208,15 @@ static void check_collisions(void) {
         }
         if (!bu->active) continue;
 
-        if (plane.active) {
-            if (chit(bx,by,3,FP2PX(plane.x),FP2PX(plane.y),9)) {
-                bu->active = plane.active = false;
-                spawn_expl(FP2PX(plane.x),FP2PX(plane.y),14,5,26);
-                score += PTS_PLANE; sound_effect_explosion(); sound_siren_stop();
+        for (int pi=0; pi<MAX_PLANES; pi++) {
+            Plane *pl = &planes[pi];
+            if (!pl->active) continue;
+            if (chit(bx,by,3,FP2PX(pl->x),FP2PX(pl->y),9)) {
+                bu->active = pl->active = false;
+                spawn_expl(FP2PX(pl->x),FP2PX(pl->y),14,5,26);
+                score += PTS_PLANE; sound_effect_explosion();
+                if (planes_active() == 0) sound_siren_stop();
+                break;
             }
         }
         if (!bu->active) continue;
@@ -1256,9 +1374,9 @@ static void draw_para(const Para *p, uint16_t color) {
     draw_soldier_at(px, py+SOLDIER_H, false, color);
 }
 
-static void draw_plane_sprite(uint16_t color) {
-    if (!plane.active) return;
-    int x=FP2PX(plane.x), y=FP2PX(plane.y), d=(plane.vx>0)?1:-1;
+static void draw_plane_sprite(const Plane *pl, uint16_t color) {
+    if (!pl->active) return;
+    int x=FP2PX(pl->x), y=FP2PX(pl->y), d=(pl->vx>0)?1:-1;
     renderer_fill_rect(x-11, y-1, 22, 2, color);
     line(x+d*11, y, x+d*16, y-1, color);
     line(x+d*11, y, x+d*16, y+1, color);
@@ -1284,7 +1402,7 @@ static PrevPos prev_heli[MAX_HELIS];
 static PrevPos prev_para[MAX_PARAS];
 static bool    prev_para_landed[MAX_PARAS]; // tamaño de caja usado en el último borrado de cada para
 static PrevPos prev_bomb[MAX_BOMBS];
-static PrevPos prev_plane_pos = { .active=false };
+static PrevPos prev_plane_pos[MAX_PLANES];
 static PrevPos prev_turret = { .active=false };
 static bool    prev_tower_region_active = false;
 static bool    field_needs_redraw = true;
@@ -1392,7 +1510,7 @@ static void reset_render_trace(void) {
     for (int i=0;i<MAX_HELIS;i++) prev_heli[i].active=false;
     for (int i=0;i<MAX_PARAS;i++) { prev_para[i].active=false; prev_para_landed[i]=false; para_dirty[i]=false; }
     for (int i=0;i<MAX_BOMBS;i++) prev_bomb[i].active=false;
-    prev_plane_pos.active=false;
+    for (int i=0;i<MAX_PLANES;i++) prev_plane_pos[i].active=false;
     prev_turret.active=false;
     turret_dirty=false; prev_turret_angle=-1000; prev_turret_vis=false;
     prev_tower_region_active=false;
@@ -1563,6 +1681,25 @@ static void draw_tower_region(void) {
     pt_flush();
 }
 
+// La bomba nace pegada al vientre del avión y su caja de borrado le comía
+// parte del ala/cola durante los primeros frames. Tras pintar las bombas se
+// repinta (sin borrar) el sprite de los aviones que tengan una bomba encima.
+static void redraw_planes_over_bombs(void) {
+    for (int i=0;i<MAX_PLANES;i++) {
+        const Plane *pl = &planes[i];
+        if (!pl->active) continue;
+        int x=FP2PX(pl->x), y=FP2PX(pl->y);
+        for (int j=0;j<MAX_BOMBS;j++) {
+            if (!bombs[j].active) continue;
+            if (absi(FP2PX(bombs[j].x)-x) < PLANE_BOX_HW+BOMB_BOX_R &&
+                absi(FP2PX(bombs[j].y)-y) < PLANE_BOX_HH+BOMB_BOX_R) {
+                draw_plane_sprite(pl, COLOR_JET);
+                break;
+            }
+        }
+    }
+}
+
 static void draw_bombs_if_moved(void) {
     for (int i=0;i<MAX_BOMBS;i++) {
         const Bomb *b = &bombs[i];
@@ -1578,15 +1715,18 @@ static void draw_bombs_if_moved(void) {
 }
 
 static void draw_plane_if_moved(void) {
-    bool show = plane.active;
-    if (!show && !prev_plane_pos.active) return;
-    int x=FP2PX(plane.x), y=FP2PX(plane.y);
-    if (prev_plane_pos.active)
-        erase_box(prev_plane_pos.x-PLANE_BOX_HW, prev_plane_pos.y-PLANE_BOX_HH,
-                  2*PLANE_BOX_HW, 2*PLANE_BOX_HH);
-    if (show) draw_plane_sprite(COLOR_JET);
-    prev_plane_pos.x=x; prev_plane_pos.y=y; prev_plane_pos.active=show;
-    pt_flush();
+    for (int i=0;i<MAX_PLANES;i++) {
+        const Plane *pl = &planes[i];
+        bool show = pl->active;
+        if (!show && !prev_plane_pos[i].active) continue;
+        int x=FP2PX(pl->x), y=FP2PX(pl->y);
+        if (prev_plane_pos[i].active)
+            erase_box(prev_plane_pos[i].x-PLANE_BOX_HW, prev_plane_pos[i].y-PLANE_BOX_HH,
+                      2*PLANE_BOX_HW, 2*PLANE_BOX_HH);
+        if (show) draw_plane_sprite(pl, COLOR_JET);
+        prev_plane_pos[i].x=x; prev_plane_pos[i].y=y; prev_plane_pos[i].active=show;
+        pt_flush();
+    }
 }
 
 static int prev_bullet_x[MAX_BULLETS], prev_bullet_y[MAX_BULLETS];
@@ -1703,6 +1843,7 @@ static void draw_playing_frame(void) {
     pt_flush_group();            // cielo: helicópteros + avión
 
     draw_bombs_if_moved();
+    redraw_planes_over_bombs();
     draw_bullets_if_moved();
     draw_particles_if_moved();
     draw_hud_if_changed();
@@ -1882,6 +2023,30 @@ static void demo_ai(void) {
 // ---------------------------------------------------------------------------
 // Tick principal
 // ---------------------------------------------------------------------------
+/*
+ * Vacía la entrada pendiente. highscores_enter() es bloqueante y se maneja
+ * con los mismos botones/click que el juego: lo que quedaba SIN CONSUMIR
+ * (un "pulsado" en cola, el click del stick con el que se confirman las
+ * iniciales...) lo leía pt_tick() justo después y saltaba GAME OVER ->
+ * RÉCORDS -> salir al título sin dejar ver nada. Solo se usan los índices
+ * de entrada que ya usa este juego.
+ */
+static void flush_inputs(void) {
+    for (int k=0; k<2; k++) {
+        controls_update();
+        (void)controls_button_pressed(BTN_IDX_J1_A);
+        (void)controls_button_pressed(BTN_IDX_J1_B);
+        (void)controls_button_pressed(BTN_IDX_J1_SW);
+        (void)controls_button_pressed(BTN_IDX_J2_SW);
+        (void)controls_get_raw_delta(0);
+        (void)controls_get_raw_delta_x(0);
+    }
+    cannon_enc_acc = 0; cannon_rot_dir = 0; cannon_rot_acc = 0;
+}
+
+// Pantalla de fin: vaciar entrada y no aceptar botones durante este tiempo.
+#define END_SCREEN_LOCK_MS 1200
+
 static void pt_tick(void) {
     blink++;
     update_dt_scale();
@@ -1890,7 +2055,8 @@ static void pt_tick(void) {
         bool any = controls_menu_select()
                 || controls_get_raw_delta_x(0) != 0
                 || controls_button_down(BTN_IDX_J1_B);
-        if (any || ++demo_ticks >= TICKS_S*30) {
+        demo_ticks += g_elapsed_ms;
+        if (any || demo_ticks >= 30000) {
             g_done = true;
             return;
         }
@@ -1898,13 +2064,16 @@ static void pt_tick(void) {
         // Click de cualquiera de los dos joysticks (índice 4/5, ver
         // BTN_IDX_J1_SW/J2_SW más arriba) sale al menú en cualquier
         // momento -- equivalente a "SW1: salir" del original.
-        if (controls_button_pressed(BTN_IDX_J1_SW) || controls_button_pressed(BTN_IDX_J2_SW)) {
+        // (se lee siempre, aunque la entrada esté bloqueada, para consumirlo)
+        bool sw_click = controls_button_pressed(BTN_IDX_J1_SW) || controls_button_pressed(BTN_IDX_J2_SW);
+        if (sw_click && input_lock_ms <= 0) {
             g_done = true;
             return;
         }
     }
 
     bool btn = controls_button_pressed(BTN_IDX_J1_A) || controls_button_pressed(BTN_IDX_J1_B);
+    if (input_lock_ms > 0) { input_lock_ms -= g_elapsed_ms; btn = false; }
 
     switch (state) {
 
@@ -1944,8 +2113,9 @@ static void pt_tick(void) {
 
         if (state==PT_PLAYING && !tower_active) {
             for (int lane=0;lane<2;lane++) {
-                if (--lane_timer[lane] <= 0) {
-                    lane_timer[lane] = HELI_GAP + rnd(TICKS_S);
+                lane_timer[lane] -= g_elapsed_ms;
+                if (lane_timer[lane] <= 0) {
+                    lane_timer[lane] = HELI_GAP_MS + rnd(1000);
                     if (wave_helis_spawned < wave_heli_budget) {
                         spawn_heli(lane);
                         wave_helis_spawned++;
@@ -1957,7 +2127,8 @@ static void pt_tick(void) {
         update_helis();
         update_paras();
         update_tower();
-        update_plane();
+        update_jet_schedule();
+        update_planes();
         update_bombs();
         update_bullets();
         upd_particles();
@@ -1965,21 +2136,23 @@ static void pt_tick(void) {
 
         if (state==PT_PLAYING && cannon_alive) {
             if (attack_mode) {
-                if (--attack_timer<=0) {
+                attack_timer -= g_elapsed_ms;
+                if (attack_timer<=0) {
                     attack_mode=false;
-                    attack_cooldown=ATTACK_INTERVAL+rnd(TICKS_S*10);
+                    attack_cooldown=ATTACK_INTERVAL_MS+rnd(10000);
                 }
             } else {
-                if (--attack_cooldown<=0) {
+                attack_cooldown -= g_elapsed_ms;
+                if (attack_cooldown<=0) {
                     attack_mode=true;
-                    attack_timer=ATTACK_DUR;
+                    attack_timer=ATTACK_DUR_MS;
                 }
             }
         }
 
         if (!cannon_alive) {
             for (int i=0;i<MAX_HELIS;i++) helis[i].active=false;
-            state=PT_DEAD; pause_cnt=TICKS_S*3;
+            state=PT_DEAD; pause_cnt=3000;
             sound_stop_paratrooper_music(); // por si el jingle de inicio seguía sonando
             draw_playing_frame();
             break;
@@ -1988,18 +2161,21 @@ static void pt_tick(void) {
         if (state==PT_PLAYING) {
             if (!wave_done && !tower_active && wave_clear()) {
                 wave_done = true;
-                jet_delay = TICKS_S*2;
+                jet_delay = 2000;   // ms
             }
             if (wave_done && !jet_launched) {
-                if (--jet_delay <= 0) {
-                    launch_jet();
+                jet_delay -= g_elapsed_ms;
+                if (jet_delay <= 0) {
+                    jets_left    = 1 + rnd(MAX_PLANES);      // 1..MAX_PLANES aviones
+                    jet_next_dir = rnd(2) ? 1 : -1;
+                    jet_gap_ms   = 0;
                     jet_launched = true;
                     state = PT_JET_PASS;
                 }
             }
         }
         if (state==PT_JET_PASS) {
-            if (!plane.active && !bombs[0].active && !bombs[1].active) {
+            if (jets_left <= 0 && planes_active() == 0 && !bombs_active()) {
                 wave++; score += PTS_WAVE_BONUS;
                 reset_wave();
                 for (int i=0;i<MAX_PARAS;i++) {
@@ -2022,13 +2198,17 @@ static void pt_tick(void) {
 
     case PT_DEAD:
         upd_particles();
-        if (--pause_cnt <= 0) {
+        pause_cnt -= g_elapsed_ms;
+        if (pause_cnt <= 0) {
             sound_siren_stop();
             sound_effect_game_over();
             draw_playing_frame();
             if (!demo_mode && highscores_is_top(PT_GAME_ID, (uint32_t)score)) {
                 highscores_enter(PT_GAME_ID, (uint32_t)score); // bloqueante
             }
+            flush_inputs();
+            input_lock_ms = END_SCREEN_LOCK_MS;
+            last_tick_time_ms = now_ms();   // que el tiempo en highscores_enter() no cuente como un tick
             pause_cnt = 0;
             state = PT_GAMEOVER;
             draw_gameover_screen();
@@ -2040,10 +2220,12 @@ static void pt_tick(void) {
     case PT_GAMEOVER: {
         bool bon = (blink/20)%2==0;
         update_bottom_message(bon ? "PULSA PARA CONTINUAR" : "", 1);
-        pause_cnt++;
+        pause_cnt += g_elapsed_ms;
         if (demo_mode) {
-            if (pause_cnt > TICKS_S*2) g_done = true;
-        } else if (btn || pause_cnt > TICKS_S*8) {
+            if (pause_cnt > 2000) g_done = true;
+        } else if (btn || pause_cnt > 8000) {
+            flush_inputs();
+            input_lock_ms = END_SCREEN_LOCK_MS;
             pause_cnt = 0;
             state = PT_SCORES;
             draw_scores_screen();
@@ -2052,7 +2234,8 @@ static void pt_tick(void) {
     }
 
     case PT_SCORES:
-        if (btn || ++pause_cnt > TICKS_S*8) g_done = true;
+        pause_cnt += g_elapsed_ms;
+        if (btn || pause_cnt > 8000) g_done = true;
         break;
     }
 }
@@ -2073,6 +2256,7 @@ void game_paratrooper_run(game_mode_t mode) {
     demo_ticks = 0;
     blink = 0;
     pause_cnt = 0;
+    input_lock_ms = 0;
     fire_held = false;
     g_done = false;
     cannon_enc_acc = 0; cannon_rot_dir = 0;
@@ -2084,7 +2268,7 @@ void game_paratrooper_run(game_mode_t mode) {
     memset(paras, 0, sizeof(paras));
     memset(bullets, 0, sizeof(bullets));
     memset(bombs, 0, sizeof(bombs));
-    memset(&plane, 0, sizeof(plane));
+    memset(planes, 0, sizeof(planes));
     memset(particles, 0, sizeof(particles));
 
     last_tick_time_ms = now_ms();
@@ -2124,5 +2308,6 @@ void game_paratrooper_run(game_mode_t mode) {
 
     sound_siren_stop();
     sound_stop_paratrooper_music(); // por si se sale a mitad del jingle de inicio
+    flush_inputs();                 // que el menú no reciba lo que quedó sin leer aquí
     highscores_flush();
 }

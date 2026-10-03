@@ -1066,7 +1066,7 @@ static void ll_tick(void) {
             // Cooldown de sonido: máx una llamada cada ~12 ticks nominales,
             // igual que el original, para no saturar el canal de efectos
             // con el botón mantenido.
-            if ((exhaust_anim%12)==0) sound_effect_move();
+            if ((exhaust_anim%12)==0) sound_effect_thrust();
         } else { engine_on = false; engine_thrust = 0; }
 
         ship_vx = ll_clamp(ship_vx, -MAX_VX, MAX_VX);
@@ -1131,6 +1131,7 @@ static void ll_tick(void) {
                 pause_ticks = 0;
                 state = LL_SCORES;
                 draw_scores_screen();
+                sound_effect_game_over();
             }
         }
         break;

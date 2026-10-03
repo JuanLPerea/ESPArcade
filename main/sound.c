@@ -2177,7 +2177,7 @@ void sound_effect_move(void)
  * "has perdido la bola/punto", más corta y repetible muchas veces
  * por partida).
  *
- * CORREGIDO: mismo apagado automático.
+ * Game over: melodía grave y dramática de 4 notas.
  */
 void sound_effect_game_over(void)
 {
@@ -2185,9 +2185,12 @@ void sound_effect_game_over(void)
         sound_init();
     }
 
-    channel3_play_short(180, CHANNEL3_VOLUME, WAVE_SAW, 400);
-}
+    // Frecuencias: Re4 -> Do#4 -> Do4 -> Si3 (grave)
+    static const uint16_t freqs[4]     = { 294, 277, 262, 247 };
+    static const uint16_t durations[4] = { 120, 120, 120, 600 };
 
+    channel3_seq_start(freqs, durations, 4, CHANNEL3_VOLUME, WAVE_SAW);
+}
 
 /*
  * Éxito puntual (p.ej. subida de nivel) -- una sola nota alegre,

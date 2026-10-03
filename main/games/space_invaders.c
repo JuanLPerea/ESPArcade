@@ -96,6 +96,10 @@
 // evita que el bucle corra sin descanso.
 #define TARGET_FPS 60
 
+// Máximo de ticks de lógica que se recuperan de una vez cuando el
+// dibujado va lento (ver bucle principal). 8 ticks = 80 ms de retraso.
+#define SI_MAX_CATCHUP 8
+
 // Tiempo real en ms desde el arranque -- sustituye a
 // absolute_time_t/get_absolute_time() del SDK de Pico (mismo patrón
 // que asteroids.c/scramble.c).
@@ -207,6 +211,11 @@ static const int ALIEN_PTS[ALIEN_ROWS] = { 4, 3, 3, 1 };
 #define SAUCER_H         7
 #define SAUCER_Y        (PLAY_Y + 22)
 #define SAUCER_SPD       1
+// El platillo se mueve SAUCER_SPD px por tick de lógica, pero solo se
+// redibuja (borrar + dibujar + flush) cuando se ha desplazado al menos
+// esto: un flush por cada píxel era un coste enorme para un objeto
+// pequeño y rápido.
+#define SAUCER_DRAW_STEP 2
 #define SAUCER_MIN_PTS  50
 #define SAUCER_MAX_PTS 300
 
@@ -301,6 +310,11 @@ static int     demo_fire_cnt;
 static int     demo_ticks;
 
 static bool    g_done;
+
+// Si es false, draw_playing_frame() no hace nada: se usa para ejecutar
+// varios ticks de lógica seguidos (recuperar retraso) y dibujar solo tras
+// el último. Ver el bucle principal.
+static bool    si_render = true;
 
 static int clamp(int v, int lo, int hi) { return v<lo?lo:v>hi?hi:v; }
 
@@ -988,6 +1002,10 @@ static void draw_bombs_if_changed(void) {
 static void draw_saucer_if_changed(void) {
     if (saucer.active == prev_saucer_active &&
         (!saucer.active || saucer.x == prev_saucer_x)) return;
+    if (saucer.active && prev_saucer_active) {
+        int moved = saucer.x - prev_saucer_x;
+        if ((moved < 0 ? -moved : moved) < SAUCER_DRAW_STEP) return;   // aún no merece un flush
+    }
 
     if (prev_saucer_active) {
         renderer_fill_rect(prev_saucer_x, SAUCER_Y, SAUCER_W, SAUCER_H, COLOR_BLACK);
@@ -1069,6 +1087,7 @@ static void draw_saucer_points_if_changed(void) {
 }
 
 static void draw_playing_frame(void) {
+    if (!si_render) return;   // tick de recuperación: solo lógica, sin dibujar
     if (field_needs_redraw) draw_field_static();
 
     PROF(P_FORM,   draw_formation_if_moved());
@@ -1379,7 +1398,8 @@ static void si_tick(void) {
         if (state == SI_GAME_OVER) {
             clear_input_buffer();
             sound_effect_game_over();
-            draw_playing_frame(); // último frame antes de cambiar de pantalla
+            si_render = true;     // el último frame antes de cambiar de pantalla se dibuja siempre
+            draw_playing_frame();
             draw_over_screen();
         } else {
             draw_playing_frame();
@@ -1500,14 +1520,25 @@ void game_space_invaders_run(game_mode_t mode) {
 
     // Bucle a ritmo fijo con vTaskDelayUntil() -- ver nota de cabecera
     // del archivo y el mismo patrón en asteroids.c/scramble.c.
+    //
+    // Lógica y dibujado van DESACOPLADOS: la lógica avanza en pasos fijos
+    // de tiempo real (step_us). Si un frame tarda más de lo previsto
+    // porque el dibujado (SPI) es lento, en la siguiente vuelta se
+    // ejecutan los ticks de lógica atrasados -- solo el último dibuja --
+    // en vez de dejar que todo el juego (disparos, nave, bombas, sonido)
+    // vaya a cámara lenta. Con dibujado lento se ven menos FPS, pero la
+    // velocidad del juego es siempre la misma.
     const TickType_t period_ticks = pdMS_TO_TICKS(1000 / TARGET_FPS);
+    const TickType_t period = period_ticks ? period_ticks : 1;
+    const int64_t    step_us = (int64_t)period * portTICK_PERIOD_MS * 1000;
     TickType_t last_wake = xTaskGetTickCount();
+    int64_t    next_logic_us = esp_timer_get_time();
 
 #if SI_PROFILE
     uint32_t prof_next_print = now_ms() + 1000;
+    int      prof_due_max = 0;
     printf("SI_PROFILE: periodo del bucle = %u ticks (%u ms)\n",
-           (unsigned)(period_ticks ? period_ticks : 1),
-           (unsigned)((period_ticks ? period_ticks : 1) * portTICK_PERIOD_MS));
+           (unsigned)period, (unsigned)(period * portTICK_PERIOD_MS));
 #endif
 
     while (!g_done) {
@@ -1515,29 +1546,48 @@ void game_space_invaders_run(game_mode_t mode) {
         int64_t work_t0 = esp_timer_get_time();
 #endif
         controls_update();
-        PROF(P_TICK, si_tick());
+
+        // Ticks de lógica que tocan ya (tolerancia de step/4 por el jitter
+        // de despertar de vTaskDelayUntil).
+        int64_t now_us = esp_timer_get_time();
+        int due = 0;
+        while (due < SI_MAX_CATCHUP && now_us + step_us / 4 >= next_logic_us) {
+            next_logic_us += step_us;
+            due++;
+        }
+        // Retraso excesivo (> SI_MAX_CATCHUP ticks): no acumular más, el
+        // juego irá más lento antes que entrar en una espiral de recuperación.
+        if (due == SI_MAX_CATCHUP && now_us > next_logic_us) next_logic_us = now_us;
+
+        for (int k = 0; k < due && !g_done; k++) {
+            si_render = (k == due - 1);
+            PROF(P_TICK, si_tick());
+        }
+        si_render = true;
         PROF(P_SOUND, sound_update());
 #if SI_PROFILE
         {
             uint32_t w = (uint32_t)(esp_timer_get_time() - work_t0);
             if (w > prof_max[P_WORK]) prof_max[P_WORK] = w;
-            if (w > (uint32_t)((period_ticks ? period_ticks : 1) * portTICK_PERIOD_MS * 1000)) prof_over++;
+            if (w > (uint32_t)step_us) prof_over++;
+            if (due > prof_due_max) prof_due_max = due;
             if (time_reached_ms(prof_next_print)) {
                 prof_next_print = now_ms() + 1000;
                 printf("PROF(us max) saucer=%d | form=%u bul=%u bomb=%u sauc=%u play=%u hud=%u | "
-                       "si_tick(total)=%u sound=%u work=%u | frames_lentos=%u\n",
+                       "si_tick(total)=%u sound=%u work=%u | vueltas_lentas=%u ticks_por_vuelta_max=%d\n",
                        (int)saucer.active,
                        (unsigned)prof_max[P_FORM], (unsigned)prof_max[P_BULLET],
                        (unsigned)prof_max[P_BOMBS], (unsigned)prof_max[P_SAUCER],
                        (unsigned)prof_max[P_PLAYER], (unsigned)prof_max[P_HUD],
                        (unsigned)prof_max[P_TICK], (unsigned)prof_max[P_SOUND],
-                       (unsigned)prof_max[P_WORK], (unsigned)prof_over);
+                       (unsigned)prof_max[P_WORK], (unsigned)prof_over, prof_due_max);
                 for (int i = 0; i < P_N; i++) prof_max[i] = 0;
                 prof_over = 0;
+                prof_due_max = 0;
             }
         }
 #endif
-        vTaskDelayUntil(&last_wake, period_ticks ? period_ticks : 1);
+        vTaskDelayUntil(&last_wake, period);
     }
 
     highscores_flush();

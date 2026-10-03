@@ -115,7 +115,7 @@
 //                      bytes por hardware (data_endian); el de ILI9341
 //                      no, asi que se hace por software al volcar.
 #if TFT_PANEL == TFT_PANEL_ST7789
-  #define TFT_SPI_HZ          (40 * 1000 * 1000)
+  #define TFT_SPI_HZ          (80 * 1000 * 1000)
   #define TFT_INVERT_COLORS   true
   #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_RGB
   #define TFT_SWAP_BYTES      0
@@ -150,11 +150,19 @@ static esp_lcd_panel_io_handle_t s_io;
 // terminado.
 static SemaphoreHandle_t s_color_done_sem;
 
+// IMPORTANTE: hay que ceder la CPU DESDE AQUI (portYIELD_FROM_ISR) y no
+// fiarse del valor de retorno: el driver SPI de esp_lcd llama a este
+// callback desde su propia ISR y NO usa lo que devuelve. Sin el yield,
+// la tarea que espera en xSemaphoreTake() queda lista pero no se
+// planifica hasta el SIGUIENTE TICK de FreeRTOS (10 ms con HZ=100): cada
+// flush que no terminaba antes de bloquearse costaba 10, 20, 30 ms...
+// aunque la DMA solo tardase 1-2 ms en terminar de verdad.
 static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
                                            esp_lcd_panel_io_event_data_t *edata,
                                            void *user_ctx) {
     BaseType_t high_task_wakeup = pdFALSE;
     xSemaphoreGiveFromISR(s_color_done_sem, &high_task_wakeup);
+    portYIELD_FROM_ISR(high_task_wakeup);
     return high_task_wakeup == pdTRUE;
 }
 

@@ -656,11 +656,10 @@ void st7789_init(void) {
     uint8_t id[4] = {0};
 
 // DEBUG: leer ID del panel y mostrarlo por consola
-    esp_lcd_panel_io_rx_param(s_io, 0x04, id, 4);   // RDDID
-printf("[lcd] 0x04: %02X %02X %02X %02X\n", id[0], id[1], id[2], id[3]);
-esp_lcd_panel_io_rx_param(s_io, 0xD3, id, 4);   // ID4
-printf("[lcd] 0xD3: %02X %02X %02X %02X\n", id[0], id[1], id[2], id[3]);
-
+//   esp_lcd_panel_io_rx_param(s_io, 0x04, id, 4);   // RDDID
+//printf("[lcd] 0x04: %02X %02X %02X %02X\n", id[0], id[1], id[2], id[3]);
+//esp_lcd_panel_io_rx_param(s_io, 0xD3, id, 4);   // ID4
+//printf("[lcd] 0xD3: %02X %02X %02X %02X\n", id[0], id[1], id[2], id[3]);
 
     esp_lcd_panel_invert_color(s_panel, TFT_INVERT_COLORS);
     esp_lcd_panel_set_gap(s_panel, 0, 0);

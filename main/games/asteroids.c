@@ -960,7 +960,10 @@ static void level_init(void) {
             case 2: ax=PX2FP(PLAY_X);              ay=PX2FP(PLAY_Y+rnd(PLAY_H)); break;
             default:ax=PX2FP(PLAY_X+PLAY_W);       ay=PX2FP(PLAY_Y+rnd(PLAY_H)); break;
         }
-        spawn_ast(SZ_HUGE, ax, ay);
+        // CÓDIGO MODIFICADO (Solo Gigante, Grande o Mediano):
+        AstSz initial_sizes[3] = { SZ_HUGE, SZ_LARGE, SZ_MED };
+        AstSz random_sz = initial_sizes[rnd(3)];
+        spawn_ast(random_sz, ax, ay);
     }
     field_needs_redraw = true;
 }
@@ -984,7 +987,7 @@ static void fire(int owner) {
         b->x = PX2FP(bx); b->y = PX2FP(by);
         b->vx = s->vx + BULLET_SPD * SINV(s->angle) / FP;
         b->vy = s->vy - BULLET_SPD * COSV(s->angle) / FP;
-        sound_effect_shoot();
+        sound_effect_laser();
         return;
     }
 }
@@ -1002,7 +1005,7 @@ static bool hyperdrive(int p) {
     s->y = PX2FP(PLAY_Y + R_LARGE + rnd(PLAY_H - 2*R_LARGE));
     s->vx = s->vy = 0;
     s->inv_ticks = RESPAWN_INV / 2;
-    sound_effect_select();
+    sound_effect_teleport();
     return false;
 }
 
@@ -1137,7 +1140,7 @@ static bool collisions(void) {
                 saucer.active=false;
                 next_saucer_spawn_ms = now_ms() + 1000 * (12 + rand() % 13);
                 sound_siren_stop();
-                sound_effect_success();
+                sound_effect_hit();
                 ships[b->owner].score += SAUCER_PTS;
             }
         }
@@ -1394,7 +1397,7 @@ static void as_tick(void) {
         }
 
         if (count_asts() == 0 && !died) {
-            sound_effect_success();
+            sound_effect_victory();
             pause_ticks = TICKS_S * 3;
             state = AS_LEVEL_CLEAR;
         }

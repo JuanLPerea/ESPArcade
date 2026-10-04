@@ -48,6 +48,13 @@
  *  - HUD: los borrados de puntuación/nivel ya no pisan los bordes de los
  *    tableros (HUD_CLEAR_X/W) y GAME OVER es un cuadro dentro de cada
  *    tablero en vez de una barra negra de lado a lado.
+ *  - Controles de partida (ambos jugadores): stick hacia abajo = caída
+ *    rápida (antes el botón B); B gira al revés que A; el movimiento lateral
+ *    necesita MOVE_STEP de recorrido por columna y repite suave al mantener
+ *    (MOVE_FIRST_REPEAT_MS / MOVE_REPEAT_MS).
+ *  - Selector de nivel de salida (1..5) en el menú: arranca con la velocidad
+ *    de START_LEVEL_IDX[nivel-1]; el HUD y el multiplicador de puntos usan
+ *    el nivel mostrado (nivel de salida + líneas/10).
  *  - Líneas: al completar 1-3 líneas suena sound_effect_coin() y con 4
  *    sound_effect_powerup(); el jugador que las hace hace una pausa de
  *    LINE_CLEAR_MS (500 ms) con las filas parpadeando en blanco antes de
@@ -285,6 +292,31 @@ static const int LEVEL_MS[20] = {
 #define SOFT_DROP_MS   50
 #define LOCK_DELAY_MS 400
 
+// Nivel de salida elegible en el menú (1..5) -> índice en LEVEL_MS con el que
+// empieza la partida. Cada nivel de salida arranca más rápido: 768, 608, 448,
+// 288 y 128 ms por fila. Cambia estos números para suavizar o endurecer.
+#define START_LEVELS 5
+static const int START_LEVEL_IDX[START_LEVELS] = { 0, 2, 4, 6, 8 };
+
+// Entrada del stick en partida (por jugador):
+//  - Movimiento lateral: hace falta acumular MOVE_STEP de movimiento para
+//    mover UNA columna (antes 4 y sin límite de ritmo: con el stick inclinado
+//    se movía varias columnas por tick). Si se mantiene inclinado, repite: la
+//    primera repetición a los MOVE_FIRST_REPEAT_MS y las siguientes cada
+//    MOVE_REPEAT_MS. Soltar el stick MOVE_IDLE_RELEASE_MS rearma el siguiente
+//    movimiento al instante, así que los toques sueltos siguen siendo ágiles.
+//  - Bajar la pieza rápido: stick hacia abajo (eje Y, valor positivo = abajo,
+//    cambia STICK_DOWN_SIGN a -1 si en tu stick es al revés). Cuenta cuando el
+//    movimiento hacia abajo supera DOWN_MIN_DELTA y al de los lados, y se
+//    mantiene DOWN_HOLD_MS tras el último movimiento para no parpadear.
+#define MOVE_STEP              6
+#define MOVE_FIRST_REPEAT_MS   200
+#define MOVE_REPEAT_MS         90
+#define MOVE_IDLE_RELEASE_MS   50
+#define DOWN_MIN_DELTA         1
+#define DOWN_HOLD_MS           120
+#define STICK_DOWN_SIGN        1
+
 // Pausa al completar líneas: durante LINE_CLEAR_MS el jugador que las ha
 // hecho no recibe entrada ni gravedad y las filas completas parpadean en
 // blanco (LINE_FLASH_MS por fase); después se quitan y sale la siguiente
@@ -301,12 +333,17 @@ typedef struct {
     int      piece, rotation, px, py;
     int      next_piece;
     uint32_t score;
-    int      lines, level;
+    int      lines, level;   // level = índice de velocidad en LEVEL_MS
+    int      start_sel;      // nivel de salida elegido en el menú (1..5)
+    int      shown_level;    // nivel que se muestra en el HUD y multiplica la puntuación
     bool     active;       // false = este jugador ya perdio (tablero lleno)
-    bool     fast_drop;    // BTN_B mantenido
+    bool     fast_drop;    // stick hacia abajo mantenido (o la IA en demo)
     bool     locking;      // la pieza esta tocando algo debajo, contando el retardo de bloqueo
     int      fall_accum_ms, lock_accum_ms;
-    int      move_accum;   // acumulador del eje X crudo (4 = una columna)
+    int      move_accum;   // acumulador del eje X crudo (MOVE_STEP = una columna)
+    int      move_cooldown_ms, move_idle_ms;
+    bool     move_repeating;
+    int      down_hold_ms; // tiempo que le queda a la caída rápida tras el último "abajo"
     int      clearing_ms;  // > 0: pausa de línea completada (la pieza ya está fijada, las filas aún no se han quitado)
     uint32_t clear_mask;   // filas del tablero (bit = fila) que se están limpiando
 
@@ -340,11 +377,13 @@ static bool menu_repeating;        // ya se ha hecho un cambio manteniendo el st
 //    MENU_FIRST_REPEAT_MS y los siguientes cada MENU_REPEAT_MS.
 //  - Soltar el stick MENU_IDLE_RELEASE_MS rearma el siguiente movimiento al
 //    instante, así que pulsaciones sueltas seguidas siguen siendo ágiles.
+#define MENU_ITEMS             4
 #define MENU_STEP              4
 #define MENU_FIRST_REPEAT_MS   450
 #define MENU_REPEAT_MS         300
 #define MENU_IDLE_RELEASE_MS   90
-static int  menu_sel = 0;          // 0=1 JUGADOR, 1=2 JUGADORES, 2=MUSICA ON/OFF
+static int  menu_sel = 0;          // 0=1 JUGADOR, 1=2 JUGADORES, 2=NIVEL 1..5, 3=MUSICA ON/OFF
+static int  start_level = 1;       // nivel de salida elegido (1..5)
 static bool music_enabled = true;  // solo afecta a la musica DURANTE la partida
 static int  pause_ticks;
 static int  demo_ticks;
@@ -411,8 +450,10 @@ static int score_for_lines(int lines, int level) {
 }
 
 static void update_level(PlayerState *p) {
-    p->level = p->lines / 10;
+    int gained = p->lines / 10;
+    p->level = START_LEVEL_IDX[p->start_sel - 1] + gained;
     if (p->level > 19) p->level = 19;
+    p->shown_level = p->start_sel + gained;
 }
 
 // Fija la pieza activa en el tablero (sin quitar líneas).
@@ -468,7 +509,7 @@ static void lock_and_spawn(PlayerState *p) {
     if (mask) {
         int lines = __builtin_popcount(mask);
         p->lines += lines;
-        p->score += (uint32_t)score_for_lines(lines, p->level);
+        p->score += (uint32_t)score_for_lines(lines, p->shown_level - 1);   // multiplicador = nivel mostrado
         update_level(p);
         // Efecto: 4 líneas ("tetris") = powerup; 1-3 líneas = coin.
         if (lines >= 4) sound_effect_powerup();
@@ -482,7 +523,7 @@ static void lock_and_spawn(PlayerState *p) {
         p->fall_accum_ms = p->lock_accum_ms = 0;
         return;
     }
-    sound_effect_select();
+    sound_effect_jump();
     spawn_or_die(p);
 }
 
@@ -496,18 +537,19 @@ static void finish_line_clear(PlayerState *p) {
 static bool try_move(PlayerState *p, int dx) {
     if (!piece_fits(p, p->piece, p->rotation, p->px + dx, p->py)) return false;
     p->px += dx;
-    sound_effect_move();
+    sound_effect_bounce();
     return true;
 }
 
-static void try_rotate(PlayerState *p) {
-    int nr = (p->rotation + 1) & 3;
+// dir = +1 sentido de las agujas del reloj (botón A), +3 (= -1) al revés (botón B).
+static void try_rotate(PlayerState *p, int dir) {
+    int nr = (p->rotation + dir) & 3;
     for (int k = 0; k < NUM_KICKS; k++) {
         if (piece_fits(p, p->piece, nr, p->px + KICK_X[k], p->py + KICK_Y[k])) {
             p->rotation = nr;
             p->px += KICK_X[k];
             p->py += KICK_Y[k];
-            sound_effect_move();
+            sound_effect_bounce();
             return;
         }
     }
@@ -568,7 +610,7 @@ static void ai_tick(PlayerState *p, int idx) {
 // ---------------------------------------------------------------------------
 // Entrada humana
 // ---------------------------------------------------------------------------
-static void handle_player_input(PlayerState *p, int idx) {
+static void handle_player_input(PlayerState *p, int idx, int elapsed_ms) {
     if (!p->active) return;
 
     int btn_a  = idx == 0 ? BTN_IDX_J1_A    : BTN_IDX_J2_A;
@@ -579,20 +621,60 @@ static void handle_player_input(PlayerState *p, int idx) {
     // para que no se acumule y se aplique de golpe al acabar la pausa).
     if (p->clearing_ms > 0) {
         (void)controls_get_raw_delta_x(idx);
+        (void)controls_get_raw_delta(idx);
         (void)controls_button_pressed(btn_a);
+        (void)controls_button_pressed(btn_b);
         (void)controls_button_pressed(enc_sw);
         p->move_accum = 0;
+        p->move_cooldown_ms = p->move_idle_ms = 0;
+        p->move_repeating = false;
+        p->down_hold_ms = 0;
         p->fast_drop  = false;
         return;
     }
 
-    int d = controls_get_raw_delta_x(idx);
-    p->move_accum += d;
-    while (p->move_accum >= 4) { p->move_accum -= 4; try_move(p, +1); }
-    while (p->move_accum <= -4) { p->move_accum += 4; try_move(p, -1); }
+    int dx = controls_get_raw_delta_x(idx);
+    int dy = STICK_DOWN_SIGN * controls_get_raw_delta(idx);   // > 0 = stick hacia abajo
 
-    if (controls_button_pressed(btn_a)) try_rotate(p);
-    p->fast_drop = controls_button_down(btn_b);
+    // --- Caída rápida: stick hacia abajo (domina sobre el movimiento lateral) ---
+    bool down = (dy >= DOWN_MIN_DELTA) && (dy >= (dx < 0 ? -dx : dx));
+    if (down) {
+        p->down_hold_ms = DOWN_HOLD_MS;
+        dx = 0;                      // un "abajo" con algo de deriva lateral no mueve la pieza
+    } else if (p->down_hold_ms > 0) {
+        p->down_hold_ms -= elapsed_ms;
+    }
+    p->fast_drop = p->down_hold_ms > 0;
+
+    // --- Movimiento lateral: un paso por movimiento, con repetición suave ---
+    if (p->move_cooldown_ms > 0) p->move_cooldown_ms -= elapsed_ms;
+    if (dx == 0) {
+        p->move_idle_ms += elapsed_ms;
+        if (p->move_idle_ms >= MOVE_IDLE_RELEASE_MS) {
+            p->move_cooldown_ms = 0;
+            p->move_repeating   = false;
+            p->move_accum       = 0;
+        }
+    } else {
+        p->move_idle_ms = 0;
+        if (p->move_accum != 0 && ((dx > 0) != (p->move_accum > 0))) p->move_accum = 0;
+        if (p->move_cooldown_ms <= 0) {
+            p->move_accum += dx;
+            int dir = 0;
+            if (p->move_accum >= MOVE_STEP)       dir = +1;
+            else if (p->move_accum <= -MOVE_STEP) dir = -1;
+            if (dir) {
+                try_move(p, dir);
+                p->move_accum = 0;
+                p->move_cooldown_ms = p->move_repeating ? MOVE_REPEAT_MS : MOVE_FIRST_REPEAT_MS;
+                p->move_repeating = true;
+            }
+        }
+    }
+
+    // --- Botones: A gira en un sentido, B en el contrario ---
+    if (controls_button_pressed(btn_a)) try_rotate(p, +1);
+    if (controls_button_pressed(btn_b)) try_rotate(p, 3);
     if (controls_button_pressed(enc_sw)) hard_drop(p);
 }
 
@@ -791,12 +873,12 @@ static void draw_hud_if_changed(int idx) {
         prev_score_hud[idx] = (int)p->score;
         changed = true;
     }
-    if (p->level != prev_level_hud[idx] || p->active != prev_active_hud[idx]) {
+    if (p->shown_level != prev_level_hud[idx] || p->active != prev_active_hud[idx]) {
         renderer_fill_rect(HUD_CLEAR_X, hy + HUD_LEVEL_OFF, HUD_CLEAR_W, HUD_LEVEL_H, COLOR_BLACK);
-        if (p->active) snprintf(buf, sizeof(buf), "NIV %d", p->level);
+        if (p->active) snprintf(buf, sizeof(buf), "NIV %d", p->shown_level);
         else            snprintf(buf, sizeof(buf), "FIN");
         renderer_draw_text(centered_x(buf, 1), hy + HUD_LEVEL_OFF, buf, COLOR_WHITE, COLOR_BLACK, 1);
-        prev_level_hud[idx] = p->level;
+        prev_level_hud[idx] = p->shown_level;
         changed = true;
     }
     prev_active_hud[idx] = p->active;
@@ -888,19 +970,26 @@ static void draw_select_screen(void) {
     renderer_clear(COLOR_BLACK);
 
     renderer_draw_text(centered_x("TETRIS", 3), PLAY_Y + 8, "TETRIS", COLOR_CYAN, COLOR_BLACK, 3);
-    draw_menu_deco(PLAY_Y + 40);
+    draw_menu_deco(PLAY_Y + 38);
 
+    char level_label[24];
+    snprintf(level_label, sizeof(level_label), "NIVEL: %d", start_level);
     char music_label[24];
     snprintf(music_label, sizeof(music_label), "MUSICA: %s", music_enabled ? "ON" : "OFF");
 
-    draw_menu_item("1 JUGADOR",    PLAY_Y + 70,  menu_sel == 0);
-    draw_menu_item("2 JUGADORES",  PLAY_Y + 96,  menu_sel == 1);
-    draw_menu_item(music_label,    PLAY_Y + 122, menu_sel == 2);
+    draw_menu_item("1 JUGADOR",    PLAY_Y + 62,  menu_sel == 0);
+    draw_menu_item("2 JUGADORES",  PLAY_Y + 86,  menu_sel == 1);
+    draw_menu_item(level_label,    PLAY_Y + 110, menu_sel == 2);
+    draw_menu_item(music_label,    PLAY_Y + 134, menu_sel == 3);
 
-    renderer_draw_text(centered_x("GIRA PARA ELEGIR - PULSA PARA CONFIRMAR", 1), PLAY_Y+150,
-                        "GIRA PARA ELEGIR - PULSA PARA CONFIRMAR", COLOR_WHITE, COLOR_BLACK, 1);
-    renderer_draw_text(centered_x("STICK=MOVER  A=ROTAR  B=CAIDA  CLIC STICK=CAIDA RAPIDA", 1), PLAY_Y+165,
-                        "STICK=MOVER  A=ROTAR  B=CAIDA  CLIC STICK=CAIDA RAPIDA", COLOR_WHITE, COLOR_BLACK, 1);
+    static const char *help[] = {
+        "STICK ARRIBA/ABAJO ELIGE - PULSA CONFIRMA",
+        "JUEGO: STICK IZQ/DER MUEVE, ABAJO BAJA RAPIDO",
+        "A GIRA   B GIRA AL REVES   CLIC STICK=CAIDA",
+    };
+    for (int i = 0; i < 3; i++)
+        renderer_draw_text(centered_x(help[i], 1), PLAY_Y + 164 + i * 12, help[i], COLOR_WHITE, COLOR_BLACK, 1);
+
     prev_center_msg[0] = '\0';
     prev_bottom_msg[0] = '\0';
     renderer_flush();
@@ -920,12 +1009,17 @@ static void player_reset(PlayerState *p) {
     memset(p->visual_prev, -1, sizeof(p->visual_prev));
     p->score = 0;
     p->lines = 0;
-    p->level = 0;
+    p->start_sel = demo ? 1 : start_level;
+    p->level = START_LEVEL_IDX[p->start_sel - 1];
+    p->shown_level = p->start_sel;
     p->active = true;
     p->fast_drop = false;
     p->locking = false;
     p->fall_accum_ms = p->lock_accum_ms = 0;
     p->move_accum = 0;
+    p->move_cooldown_ms = p->move_idle_ms = 0;
+    p->move_repeating = false;
+    p->down_hold_ms = 0;
     p->clearing_ms = 0;
     p->clear_mask  = 0;
     p->next_piece = random_piece();
@@ -978,7 +1072,7 @@ static void tt_tick(void) {
     blink++;
 
     if (demo) {
-        bool any = controls_menu_select() || controls_get_raw_delta_x(0) != 0;
+        bool any = controls_menu_select() || controls_get_raw_delta_x(0) != 0 || controls_get_raw_delta(0) != 0;
         if (any || ++demo_ticks >= TICKS_S * 40) {
             g_done = true;
             return;
@@ -994,7 +1088,8 @@ static void tt_tick(void) {
     switch (state) {
 
     case TT_SELECT: {
-        int d = controls_get_raw_delta_x(0);
+        // Eje Y: positivo = hacia abajo = siguiente opción de la lista.
+        int d = controls_get_raw_delta(0);
         if (menu_cooldown_ms > 0) menu_cooldown_ms -= elapsed_ms;
 
         if (d == 0) {
@@ -1016,7 +1111,7 @@ static void tt_tick(void) {
                 if (menu_enc_acc >= MENU_STEP)       dir = +1;
                 else if (menu_enc_acc <= -MENU_STEP) dir = -1;
                 if (dir) {
-                    menu_sel = (menu_sel + (dir > 0 ? 1 : 2)) % 3;
+                    menu_sel = (menu_sel + (dir > 0 ? 1 : MENU_ITEMS - 1)) % MENU_ITEMS;
                     menu_enc_acc = 0;
                     menu_cooldown_ms = menu_repeating ? MENU_REPEAT_MS : MENU_FIRST_REPEAT_MS;
                     menu_repeating = true;
@@ -1027,6 +1122,11 @@ static void tt_tick(void) {
         }
         if (controls_menu_select()) {
             if (menu_sel == 2) {
+                // No inicia partida: pasa al siguiente nivel de salida (1..5, vuelve a 1).
+                start_level = start_level % START_LEVELS + 1;
+                sound_effect_select();
+                draw_select_screen();
+            } else if (menu_sel == 3) {
                 // No inicia partida: solo alterna la musica in-game y redibuja.
                 music_enabled = !music_enabled;
                 sound_effect_select();
@@ -1058,7 +1158,7 @@ static void tt_tick(void) {
             }
             for (int p = 0; p < num_players; p++) {
                 if (p == 1 && p2_joined_now) continue;
-                handle_player_input(&pl[p], p);
+                handle_player_input(&pl[p], p, elapsed_ms);
             }
         }
         for (int p = 0; p < num_players; p++) player_gravity_tick(&pl[p], elapsed_ms);

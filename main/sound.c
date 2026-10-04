@@ -83,7 +83,7 @@
  */
 #define MENU_MUSIC_CH1_VOLUME   130   // antes CHANNEL1_VOLUME (110) -- más alto
 #define MENU_MUSIC_CH2_VOLUME   100   // antes CHANNEL2_VOLUME (80)  -- más alto
-#define TETRIS_MUSIC_CH1_VOLUME  90   // antes CHANNEL1_VOLUME (110) -- más bajo
+#define TETRIS_MUSIC_CH1_VOLUME  50   // antes CHANNEL1_VOLUME (110) -- más bajo
 #define TETRIS_MUSIC_CH2_VOLUME  55   // antes CHANNEL2_VOLUME (80)  -- más bajo
 
 
@@ -1982,7 +1982,7 @@ void sound_update(void)
                 &channel2,
                 tetris_music_ch2_freq[tetris_music_ch2_index],
                 TETRIS_MUSIC_CH2_VOLUME,
-                WAVE_SQUARE
+                WAVE_TRIANGLE
             );
             tetris_music_ch2_next =
                 timeout_ms(tetris_music_ch2_dur[tetris_music_ch2_index]);
@@ -2199,15 +2199,22 @@ void sound_effect_game_over(void)
  *
  * CORREGIDO: mismo apagado automático.
  */
+/*
+ * Éxito puntual (p.ej. subida de nivel / objetivo completado):
+ * Arpegio ascendente brillante y alegre de 3 notas (Do5 -> Mi5 -> Sol5).
+ */
 void sound_effect_success(void)
 {
     if (!sound_initialized) {
         sound_init();
     }
 
-    channel3_play_short(1047, CHANNEL3_VOLUME, WAVE_TRIANGLE, 150);
-}
+    // Tríada mayor ascendente (C5 - E5 - G5)
+    static const uint16_t freqs[3]     = { 523, 659, 784 };
+    static const uint16_t durations[3] = {  70,  70, 120 };
 
+    channel3_seq_start(freqs, durations, 3, CHANNEL3_VOLUME, WAVE_SQUARE);
+}
 
 /*
  * Pierdes la bola / el punto: 4 notas descendentes, cortas.
@@ -3029,7 +3036,7 @@ void sound_start_tetris_music(void)
     tetris_music_ch2_index = 0;
 
     configure_channel(&channel1, tetris_music_ch1_freq[0], TETRIS_MUSIC_CH1_VOLUME, WAVE_TRIANGLE);
-    configure_channel(&channel2, tetris_music_ch2_freq[0], TETRIS_MUSIC_CH2_VOLUME, WAVE_SQUARE);
+    configure_channel(&channel2, tetris_music_ch2_freq[0], TETRIS_MUSIC_CH2_VOLUME, WAVE_TRIANGLE);
 
     tetris_music_ch1_next = timeout_ms(tetris_music_ch1_dur[0]);
     tetris_music_ch2_next = timeout_ms(tetris_music_ch2_dur[0]);

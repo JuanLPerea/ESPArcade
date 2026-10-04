@@ -42,6 +42,21 @@
  *    la posicion anterior de la pieza activa.
  *  - Bucle propio: game_tetris_run(mode), igual que
  *    game_asteroids_run(mode).
+ *  - Bloques con relieve (draw_block): separación negra de 1 px, borde
+ *    claro arriba/izquierda, oscuro abajo/derecha y brillo; también en la
+ *    siguiente pieza y la decoración del menú.
+ *  - HUD: los borrados de puntuación/nivel ya no pisan los bordes de los
+ *    tableros (HUD_CLEAR_X/W) y GAME OVER es un cuadro dentro de cada
+ *    tablero en vez de una barra negra de lado a lado.
+ *  - Líneas: al completar 1-3 líneas suena sound_effect_coin() y con 4
+ *    sound_effect_powerup(); el jugador que las hace hace una pausa de
+ *    LINE_CLEAR_MS (500 ms) con las filas parpadeando en blanco antes de
+ *    que se quiten y salga la siguiente pieza.
+ *  - Pantalla de selección: el stick cambia de opción con umbral
+ *    MENU_STEP, un cambio por movimiento y repetición suave si se
+ *    mantiene inclinado (MENU_FIRST_REPEAT_MS / MENU_REPEAT_MS).
+ *  - J2 a mitad de partida: su tablero arranca vacío (se salta su entrada en
+ *    el tick en que se une, para que el click no dispare su hard drop).
  *
  * PORT A ESP32 -- igual que el resto de juegos ya portados: nada de
  * Pico SDK (pico/stdlib.h, absolute_time_t, sleep_ms, time_us_32),
@@ -176,6 +191,14 @@ static inline uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1
 
 #define BOTTOM_MSG_Y       (BOARD_Y + BOARD_H + 6)   // debajo de los tableros
 
+// Zona LIBRE de la columna central: CENTER_X coincide con la columna del borde
+// derecho del tablero de J1 (y CENTER_X+CENTER_W-1 con el borde izquierdo del
+// de J2). Los borrados del HUD empezaban en CENTER_X con ancho CENTER_W y se
+// comían 1 px de borde en cada actualización de puntuación o nivel; ahora
+// se quedan dentro de HUD_CLEAR_X..+HUD_CLEAR_W, con 2 px de margen.
+#define HUD_CLEAR_X        (CENTER_X + 2)
+#define HUD_CLEAR_W        (CENTER_W - 4)
+
 // ---------------------------------------------------------------------------
 // Piezas Tetrimino (SRS), wall kicks simplificados -- igual que el original
 // ---------------------------------------------------------------------------
@@ -204,6 +227,51 @@ static const uint16_t PIECE_COLORS[NUM_PIECES] = {
     COLOR_RED, COLOR_BLUE, COLOR_WHITE
 };
 
+// Variantes clara/oscura de cada color para el bisel de los bloques. Se
+// calculan una vez (init_piece_tints) a partir de PIECE_COLORS.
+static uint16_t PIECE_HI[NUM_PIECES];
+static uint16_t PIECE_LO[NUM_PIECES];
+
+static uint16_t tint_light(uint16_t c) {
+    int r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+    r += (31 - r) * 6 / 10;  g += (63 - g) * 6 / 10;  b += (31 - b) * 6 / 10;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static uint16_t tint_dark(uint16_t c) {
+    int r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+    r = r * 5 / 10;  g = g * 5 / 10;  b = b * 5 / 10;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static void init_piece_tints(void) {
+    for (int i = 0; i < NUM_PIECES; i++) {
+        PIECE_HI[i] = tint_light(PIECE_COLORS[i]);
+        PIECE_LO[i] = tint_dark(PIECE_COLORS[i]);
+    }
+}
+
+/*
+ * Un bloque con relieve en una celda de size x size px: 1 px de separación
+ * negra a la derecha y abajo (para que las piezas no se vean como una masa
+ * sólida), borde superior/izquierdo claro, inferior/derecho oscuro y, en
+ * celdas de 10 px o más, un brillo de 2x2 en la esquina. Pinta TODA la celda,
+ * así que sirve también para sustituir lo que hubiera antes.
+ */
+static void draw_block(int x, int y, int size, int piece) {
+    int s = size - 1;                       // lado del cuerpo (sin la separación)
+    uint16_t base = PIECE_COLORS[piece], hi = PIECE_HI[piece], lo = PIECE_LO[piece];
+
+    renderer_fill_rect(x, y, s, s, base);
+    renderer_fill_rect(x,       y + s - 1, s, 1, lo);      // borde inferior
+    renderer_fill_rect(x + s-1, y,         1, s, lo);      // borde derecho
+    renderer_fill_rect(x,       y,         s, 1, hi);      // borde superior (pisa la esquina)
+    renderer_fill_rect(x,       y,         1, s, hi);      // borde izquierdo
+    if (size >= 10) renderer_fill_rect(x + 2, y + 2, 2, 2, hi);   // brillo
+    renderer_fill_rect(x + s, y, 1, size, COLOR_BLACK);     // separación derecha
+    renderer_fill_rect(x, y + s, s, 1, COLOR_BLACK);        // separación inferior
+}
+
 static const int KICK_X[] = { 0,  1, -1,  2, -2 };
 static const int KICK_Y[] = { 0,  0,  0, -1, -1 };
 #define NUM_KICKS 5
@@ -216,6 +284,14 @@ static const int LEVEL_MS[20] = {
 };
 #define SOFT_DROP_MS   50
 #define LOCK_DELAY_MS 400
+
+// Pausa al completar líneas: durante LINE_CLEAR_MS el jugador que las ha
+// hecho no recibe entrada ni gravedad y las filas completas parpadean en
+// blanco (LINE_FLASH_MS por fase); después se quitan y sale la siguiente
+// pieza. Solo se detiene ESE jugador: en 2 jugadores el otro sigue jugando.
+#define LINE_CLEAR_MS  500
+#define LINE_FLASH_MS  100
+#define FLASH_CELL       8   // valor "visual" especial: celda en fase blanca del parpadeo
 
 // ---------------------------------------------------------------------------
 // Estado por jugador
@@ -231,6 +307,8 @@ typedef struct {
     bool     locking;      // la pieza esta tocando algo debajo, contando el retardo de bloqueo
     int      fall_accum_ms, lock_accum_ms;
     int      move_accum;   // acumulador del eje X crudo (4 = una columna)
+    int      clearing_ms;  // > 0: pausa de línea completada (la pieza ya está fijada, las filas aún no se han quitado)
+    uint32_t clear_mask;   // filas del tablero (bit = fila) que se están limpiando
 
     // Rastro de render: ultimo tablero (con pieza incluida) dibujado,
     // para redibujar solo las celdas que han cambiado.
@@ -248,6 +326,24 @@ static TtSt state;
 
 static int  blink;
 static int  menu_enc_acc;
+static int  menu_cooldown_ms;      // tiempo que falta para aceptar otro cambio de opción
+static int  menu_idle_ms;          // tiempo con el stick en reposo
+static bool menu_repeating;        // ya se ha hecho un cambio manteniendo el stick
+
+// Sensibilidad del stick en la pantalla de selección:
+//  - MENU_STEP: movimiento acumulado necesario para cambiar de opción (en la
+//    versión anterior era 2 y SIN límite de ritmo: con el stick inclinado
+//    cambiaba de opción prácticamente en cada frame y el cursor daba vueltas
+//    sin control). Mismo orden de magnitud que el umbral de una columna en
+//    partida (move_accum >= 4).
+//  - Si se mantiene el stick inclinado, repite: el primer repetido tras
+//    MENU_FIRST_REPEAT_MS y los siguientes cada MENU_REPEAT_MS.
+//  - Soltar el stick MENU_IDLE_RELEASE_MS rearma el siguiente movimiento al
+//    instante, así que pulsaciones sueltas seguidas siguen siendo ágiles.
+#define MENU_STEP              4
+#define MENU_FIRST_REPEAT_MS   450
+#define MENU_REPEAT_MS         300
+#define MENU_IDLE_RELEASE_MS   90
 static int  menu_sel = 0;          // 0=1 JUGADOR, 1=2 JUGADORES, 2=MUSICA ON/OFF
 static bool music_enabled = true;  // solo afecta a la musica DURANTE la partida
 static int  pause_ticks;
@@ -319,9 +415,8 @@ static void update_level(PlayerState *p) {
     if (p->level > 19) p->level = 19;
 }
 
-// Fija la pieza activa en el tablero y limpia lineas completas.
-// Devuelve el numero de lineas eliminadas.
-static int lock_piece(PlayerState *p) {
+// Fija la pieza activa en el tablero (sin quitar líneas).
+static void lock_piece_cells(PlayerState *p) {
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) {
             if (!piece_cell(p->piece, p->rotation, r, c)) continue;
@@ -329,6 +424,21 @@ static int lock_piece(PlayerState *p) {
             if (br < 0 || br >= BOARD_ROWS) continue;
             p->board[br][bc] = (int8_t)(p->piece + 1);
         }
+}
+
+// Máscara de filas completas (bit r = fila r del tablero).
+static uint32_t full_rows_mask(const PlayerState *p) {
+    uint32_t mask = 0;
+    for (int r = 0; r < BOARD_ROWS; r++) {
+        bool full = true;
+        for (int c = 0; c < BOARD_COLS; c++) if (!p->board[r][c]) { full = false; break; }
+        if (full) mask |= (1u << r);
+    }
+    return mask;
+}
+
+// Quita del tablero todas las filas completas. Devuelve cuántas.
+static int clear_full_lines(PlayerState *p) {
     int lines = 0;
     for (int r = BOARD_ROWS - 1; r >= 0; r--) {
         bool full = true;
@@ -344,21 +454,43 @@ static int lock_piece(PlayerState *p) {
     return lines;
 }
 
-static void lock_and_spawn(PlayerState *p) {
-    int lines = lock_piece(p);
-    if (lines > 0) {
-        p->lines += lines;
-        p->score += (uint32_t)score_for_lines(lines, p->level);
-        update_level(p);
-        if (lines >= 4) sound_effect_victory();
-        else             sound_effect_success();
-    } else {
-        sound_effect_select();
-    }
+// Saca la siguiente pieza; si no cabe, este jugador ha perdido.
+static void spawn_or_die(PlayerState *p) {
     spawn_piece(p);
     if (!piece_fits(p, p->piece, p->rotation, p->px, p->py)) {
         p->active = false;
     }
+}
+
+static void lock_and_spawn(PlayerState *p) {
+    lock_piece_cells(p);
+    uint32_t mask = full_rows_mask(p);
+    if (mask) {
+        int lines = __builtin_popcount(mask);
+        p->lines += lines;
+        p->score += (uint32_t)score_for_lines(lines, p->level);
+        update_level(p);
+        // Efecto: 4 líneas ("tetris") = powerup; 1-3 líneas = coin.
+        if (lines >= 4) sound_effect_powerup();
+        else            sound_effect_coin();
+        // Pausa: las filas se quitan y sale la siguiente pieza al acabar
+        // (finish_line_clear, llamado desde player_gravity_tick).
+        p->clearing_ms = LINE_CLEAR_MS;
+        p->clear_mask  = mask;
+        p->locking     = false;
+        p->fast_drop   = false;
+        p->fall_accum_ms = p->lock_accum_ms = 0;
+        return;
+    }
+    sound_effect_select();
+    spawn_or_die(p);
+}
+
+static void finish_line_clear(PlayerState *p) {
+    clear_full_lines(p);
+    p->clearing_ms = 0;
+    p->clear_mask  = 0;
+    spawn_or_die(p);
 }
 
 static bool try_move(PlayerState *p, int dx) {
@@ -393,7 +525,7 @@ static void hard_drop(PlayerState *p) {
 // piece_fits() de este archivo.
 // ---------------------------------------------------------------------------
 static void ai_tick(PlayerState *p, int idx) {
-    if (!p->active) return;
+    if (!p->active || p->clearing_ms > 0) return;
     demo_ai_timer[idx]++;
     if (demo_ai_timer[idx] < 6) return;
     demo_ai_timer[idx] = 0;
@@ -443,6 +575,17 @@ static void handle_player_input(PlayerState *p, int idx) {
     int btn_b  = idx == 0 ? BTN_IDX_J1_B    : BTN_IDX_J2_B;
     int enc_sw = idx == 0 ? BTN_IDX_J1_SW : BTN_IDX_J2_SW;
 
+    // En la pausa de línea completada se descarta la entrada (se lee igualmente
+    // para que no se acumule y se aplique de golpe al acabar la pausa).
+    if (p->clearing_ms > 0) {
+        (void)controls_get_raw_delta_x(idx);
+        (void)controls_button_pressed(btn_a);
+        (void)controls_button_pressed(enc_sw);
+        p->move_accum = 0;
+        p->fast_drop  = false;
+        return;
+    }
+
     int d = controls_get_raw_delta_x(idx);
     p->move_accum += d;
     while (p->move_accum >= 4) { p->move_accum -= 4; try_move(p, +1); }
@@ -461,6 +604,12 @@ static void handle_player_input(PlayerState *p, int idx) {
 // ---------------------------------------------------------------------------
 static void player_gravity_tick(PlayerState *p, int elapsed_ms) {
     if (!p->active) return;
+
+    if (p->clearing_ms > 0) {
+        p->clearing_ms -= elapsed_ms;
+        if (p->clearing_ms <= 0) finish_line_clear(p);
+        return;
+    }
 
     bool can_fall = piece_fits(p, p->piece, p->rotation, p->px, p->py + 1);
     if (can_fall) {
@@ -520,8 +669,8 @@ static void draw_field_static(void) {
 
     // Columna central: titulo + separadores.
     renderer_draw_text(centered_x("TETRIS", 2), TITLE_Y, "TETRIS", COLOR_CYAN, COLOR_BLACK, 2);
-    renderer_fill_rect(CENTER_X, HUD1_Y - 4, CENTER_W, 1, COLOR_WHITE);
-    renderer_fill_rect(CENTER_X, HUD1_Y + HUD_BLOCK_H + 2, CENTER_W, 1, COLOR_WHITE);
+    renderer_fill_rect(CENTER_X + 4, HUD1_Y - 4, CENTER_W - 8, 1, COLOR_WHITE);
+    renderer_fill_rect(CENTER_X + 4, HUD1_Y + HUD_BLOCK_H + 2, CENTER_W - 8, 1, COLOR_WHITE);
 
     // Etiquetas fijas de cada jugador (no cambian durante la partida).
     renderer_draw_text(centered_x("J1", 2), HUD1_Y + HUD_TAG_OFF, "J1", COLOR_P0, COLOR_BLACK, 2);
@@ -544,16 +693,24 @@ static void draw_field_static(void) {
     renderer_flush();
 }
 
-// Redibuja solo las celdas del tablero (fijas + pieza activa) que han
-// cambiado desde el ultimo fotograma -- evita tener que rastrear a
-// mano la posicion anterior de la pieza.
-static void draw_board_if_changed(PlayerState *p, int idx) {
-    int bx = board_x[idx];
-    int8_t visual[VISIBLE_ROWS][BOARD_COLS];
-
+// Imagen "ideal" del tablero visible: celdas fijas + pieza activa, y durante
+// la pausa de línea completada las filas completas parpadeando en blanco.
+static void build_visual(const PlayerState *p, int8_t visual[VISIBLE_ROWS][BOARD_COLS]) {
     for (int r = 0; r < VISIBLE_ROWS; r++)
         for (int c = 0; c < BOARD_COLS; c++)
             visual[r][c] = p->board[r + HIDDEN_ROWS][c];
+
+    if (p->clearing_ms > 0) {
+        int elapsed = LINE_CLEAR_MS - p->clearing_ms;
+        bool flash = ((elapsed / LINE_FLASH_MS) % 2) == 0;
+        if (flash) {
+            for (int r = 0; r < VISIBLE_ROWS; r++) {
+                if (!(p->clear_mask & (1u << (r + HIDDEN_ROWS)))) continue;
+                for (int c = 0; c < BOARD_COLS; c++) visual[r][c] = FLASH_CELL;
+            }
+        }
+        return;   // la pieza ya está fijada: no se dibuja otra vez encima
+    }
 
     if (p->active) {
         for (int r = 0; r < 4; r++)
@@ -564,14 +721,31 @@ static void draw_board_if_changed(PlayerState *p, int idx) {
                 visual[br][bc] = (int8_t)(p->piece + 1);
             }
     }
+}
+
+// Celda en la fase blanca del parpadeo de línea completada.
+static void draw_flash_block(int x, int y, int size) {
+    renderer_fill_rect(x, y, size - 1, size - 1, COLOR_WHITE);
+    renderer_fill_rect(x + size - 1, y, 1, size, COLOR_BLACK);
+    renderer_fill_rect(x, y + size - 1, size - 1, 1, COLOR_BLACK);
+}
+
+// Redibuja solo las celdas del tablero (fijas + pieza activa) que han
+// cambiado desde el ultimo fotograma -- evita tener que rastrear a
+// mano la posicion anterior de la pieza.
+static void draw_board_if_changed(PlayerState *p, int idx) {
+    int bx = board_x[idx];
+    int8_t visual[VISIBLE_ROWS][BOARD_COLS];
+    build_visual(p, visual);
 
     bool changed = false;
     for (int r = 0; r < VISIBLE_ROWS; r++) {
         for (int c = 0; c < BOARD_COLS; c++) {
             if (visual[r][c] == p->visual_prev[r][c]) continue;
             int sx = bx + c * CELL_SIZE, sy = BOARD_Y + r * CELL_SIZE;
-            uint16_t color = visual[r][c] ? PIECE_COLORS[visual[r][c]-1] : COLOR_BLACK;
-            renderer_fill_rect(sx, sy, CELL_SIZE, CELL_SIZE, color);
+            if (visual[r][c] == FLASH_CELL) draw_flash_block(sx, sy, CELL_SIZE);
+            else if (visual[r][c])          draw_block(sx, sy, CELL_SIZE, visual[r][c] - 1);
+            else                            renderer_fill_rect(sx, sy, CELL_SIZE, CELL_SIZE, COLOR_BLACK);
             p->visual_prev[r][c] = visual[r][c];
             changed = true;
         }
@@ -580,12 +754,13 @@ static void draw_board_if_changed(PlayerState *p, int idx) {
 }
 
 static void draw_next_preview(int piece, int box_x, int box_y) {
+    // El recuadro ya se ha borrado a negro: solo se pintan las celdas de la pieza.
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
-            renderer_fill_rect(box_x + NEXT_BOX_PAD + c*NEXT_SUBCELL,
-                                box_y + NEXT_BOX_PAD + r*NEXT_SUBCELL,
-                                NEXT_SUBCELL, NEXT_SUBCELL,
-                                piece_cell(piece, 0, r, c) ? PIECE_COLORS[piece] : COLOR_BLACK);
+            if (piece_cell(piece, 0, r, c))
+                draw_block(box_x + NEXT_BOX_PAD + c*NEXT_SUBCELL,
+                           box_y + NEXT_BOX_PAD + r*NEXT_SUBCELL,
+                           NEXT_SUBCELL, piece);
 }
 
 // HUD de un jugador, dibujado en la columna central (no en su tablero):
@@ -610,14 +785,14 @@ static void draw_hud_if_changed(int idx) {
         changed = true;
     }
     if ((int)p->score != prev_score_hud[idx] || p->active != prev_active_hud[idx]) {
-        renderer_fill_rect(CENTER_X, hy + HUD_SCORE_OFF, CENTER_W, HUD_SCORE_H, COLOR_BLACK);
+        renderer_fill_rect(HUD_CLEAR_X, hy + HUD_SCORE_OFF, HUD_CLEAR_W, HUD_SCORE_H, COLOR_BLACK);
         snprintf(buf, sizeof(buf), "%u", (unsigned int)p->score);
         renderer_draw_text(centered_x(buf, 2), hy + HUD_SCORE_OFF, buf, color, COLOR_BLACK, 2);
         prev_score_hud[idx] = (int)p->score;
         changed = true;
     }
     if (p->level != prev_level_hud[idx] || p->active != prev_active_hud[idx]) {
-        renderer_fill_rect(CENTER_X, hy + HUD_LEVEL_OFF, CENTER_W, HUD_LEVEL_H, COLOR_BLACK);
+        renderer_fill_rect(HUD_CLEAR_X, hy + HUD_LEVEL_OFF, HUD_CLEAR_W, HUD_LEVEL_H, COLOR_BLACK);
         if (p->active) snprintf(buf, sizeof(buf), "NIV %d", p->level);
         else            snprintf(buf, sizeof(buf), "FIN");
         renderer_draw_text(centered_x(buf, 1), hy + HUD_LEVEL_OFF, buf, COLOR_WHITE, COLOR_BLACK, 1);
@@ -628,11 +803,29 @@ static void draw_hud_if_changed(int idx) {
     if (changed) renderer_flush();
 }
 
+// Mensaje central. Antes era una barra negra de 32 px de alto de lado a lado
+// de la pantalla con el texto en escala 3: borraba la franja central de los
+// DOS tableros (con sus bordes) y la columna del HUD (recuadro de siguiente
+// pieza, marcadores...). Ahora, con target no vacío, se dibuja un cuadro
+// pequeño con borde DENTRO de cada tablero en juego ("GAME" / "OVER") y no se
+// toca nada más. Con target vacío no hace nada (el mensaje solo se muestra al
+// terminar la partida y la pantalla se limpia entera al salir).
 static void update_center_message(const char *target, uint16_t color, int scale) {
+    (void)scale;
     if (strcmp(target, prev_center_msg) == 0) return;
-    renderer_fill_rect(0, BOARD_Y+BOARD_H/2-16, TFT_WIDTH, 32, COLOR_BLACK);
     if (target[0]) {
-        renderer_draw_text(centered_x(target, scale), BOARD_Y+BOARD_H/2-10, target, color, COLOR_BLACK, scale);
+        static const char *line1 = "GAME";
+        static const char *line2 = "OVER";
+        const int box_w = BOARD_W - 20, box_h = 50;
+        for (int p = 0; p < num_players; p++) {
+            int bx = board_x[p];
+            int x = bx + (BOARD_W - box_w) / 2;
+            int y = BOARD_Y + BOARD_H / 2 - box_h / 2;
+            renderer_fill_rect(x,     y,     box_w,     box_h,     color);
+            renderer_fill_rect(x + 1, y + 1, box_w - 2, box_h - 2, COLOR_BLACK);
+            draw_text_centered_in(bx, BOARD_W, y + 8,  line1, color, 2);
+            draw_text_centered_in(bx, BOARD_W, y + 27, line2, color, 2);
+        }
     }
     strncpy(prev_center_msg, target, sizeof(prev_center_msg) - 1);
     prev_center_msg[sizeof(prev_center_msg) - 1] = '\0';
@@ -677,7 +870,7 @@ static void draw_menu_deco(int y) {
     int total_w = NUM_PIECES * block + (NUM_PIECES - 1) * gap;
     int x = (SCREEN_W - total_w) / 2;
     for (int i = 0; i < NUM_PIECES; i++) {
-        renderer_fill_rect(x + i * (block + gap), y, block, block, PIECE_COLORS[i]);
+        draw_block(x + i * (block + gap), y, block, i);
     }
 }
 
@@ -733,6 +926,8 @@ static void player_reset(PlayerState *p) {
     p->locking = false;
     p->fall_accum_ms = p->lock_accum_ms = 0;
     p->move_accum = 0;
+    p->clearing_ms = 0;
+    p->clear_mask  = 0;
     p->next_piece = random_piece();
     spawn_piece(p);
 }
@@ -800,10 +995,35 @@ static void tt_tick(void) {
 
     case TT_SELECT: {
         int d = controls_get_raw_delta_x(0);
-        if (d) {
-            menu_enc_acc += d;
-            if (menu_enc_acc >= 2)  { menu_sel = (menu_sel + 1) % 3; menu_enc_acc = 0; sound_effect_move(); draw_select_screen(); }
-            if (menu_enc_acc <= -2) { menu_sel = (menu_sel + 2) % 3; menu_enc_acc = 0; sound_effect_move(); draw_select_screen(); }
+        if (menu_cooldown_ms > 0) menu_cooldown_ms -= elapsed_ms;
+
+        if (d == 0) {
+            // Stick en reposo: tras MENU_IDLE_RELEASE_MS se rearma el movimiento.
+            menu_idle_ms += elapsed_ms;
+            if (menu_idle_ms >= MENU_IDLE_RELEASE_MS) {
+                menu_cooldown_ms = 0;
+                menu_repeating   = false;
+                menu_enc_acc     = 0;
+            }
+        } else {
+            menu_idle_ms = 0;
+            // Cambio de sentido: se descarta lo acumulado en el otro.
+            if (menu_enc_acc != 0 && ((d > 0) != (menu_enc_acc > 0))) menu_enc_acc = 0;
+            // Durante la espera entre cambios no se acumula nada.
+            if (menu_cooldown_ms <= 0) {
+                menu_enc_acc += d;
+                int dir = 0;
+                if (menu_enc_acc >= MENU_STEP)       dir = +1;
+                else if (menu_enc_acc <= -MENU_STEP) dir = -1;
+                if (dir) {
+                    menu_sel = (menu_sel + (dir > 0 ? 1 : 2)) % 3;
+                    menu_enc_acc = 0;
+                    menu_cooldown_ms = menu_repeating ? MENU_REPEAT_MS : MENU_FIRST_REPEAT_MS;
+                    menu_repeating = true;
+                    sound_effect_move();
+                    draw_select_screen();
+                }
+            }
         }
         if (controls_menu_select()) {
             if (menu_sel == 2) {
@@ -826,10 +1046,20 @@ static void tt_tick(void) {
         if (demo) {
             for (int p = 0; p < num_players; p++) ai_tick(&pl[p], p);
         } else {
+            // El mismo click que une a J2 es su botón de caída instantánea. Si
+            // controls_button_pressed() mantiene el flanco durante todo el
+            // tick (no lo consume al leerlo), handle_player_input() lo volvía
+            // a ver y hacía un hard_drop inmediato: J2 aparecía con una pieza
+            // ya colocada en el fondo. Se salta la entrada de J2 en este tick.
+            bool p2_joined_now = false;
             if (num_players == 1 && controls_button_pressed(BTN_IDX_J2_SW)) {
                 activate_player2_midgame();
+                p2_joined_now = true;
             }
-            for (int p = 0; p < num_players; p++) handle_player_input(&pl[p], p);
+            for (int p = 0; p < num_players; p++) {
+                if (p == 1 && p2_joined_now) continue;
+                handle_player_input(&pl[p], p);
+            }
         }
         for (int p = 0; p < num_players; p++) player_gravity_tick(&pl[p], elapsed_ms);
 
@@ -854,6 +1084,7 @@ static void tt_tick(void) {
     }
 
     case TT_GAME_OVER:
+        draw_playing_frame();   // mantiene el parpadeo del mensaje inferior
         if (++pause_ticks > TICKS_S) {
             if (controls_menu_select() || pause_ticks > TICKS_S*8) {
                 pause_ticks = 0;
@@ -875,6 +1106,7 @@ static void tt_tick(void) {
 // ---------------------------------------------------------------------------
 void game_tetris_run(game_mode_t mode) {
     srand((unsigned)esp_timer_get_time());
+    init_piece_tints();
 
     demo = (mode == GAME_MODE_DEMO);
     num_players = (mode == GAME_MODE_2P) ? 2 : 1;
@@ -882,6 +1114,7 @@ void game_tetris_run(game_mode_t mode) {
     blink = 0;
     demo_ticks = 0;
     menu_enc_acc = 0;
+    menu_cooldown_ms = 0; menu_idle_ms = 0; menu_repeating = false;
     g_done = false;
     last_tick_time_ms = now_ms();
 

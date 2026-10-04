@@ -519,8 +519,14 @@ static void serve_reset(void) {
     snd_cooldown = 0;
     bullets_clear();
 
-    prev_ball_x = -1;
-    prev_pad_x  = -1;
+    // OJO: aqui NO se ponen prev_ball_x / prev_pad_x a -1. Ese valor
+    // significa "no hay nada dibujado, no borres", y no es cierto: al
+    // perder una bola el campo NO se redibuja, asi que la pala y la bola
+    // anteriores siguen en pantalla. Con -1, draw_paddle_if_moved() y
+    // draw_ball_if_moved() no las borraban y quedaban como restos en cuanto
+    // la pala se movia en BRK_SERVE (en modo DIRECTO salta al instante a
+    // donde este el stick). Cuando si hay que empezar de cero
+    // (level_start -> field_needs_redraw) ya lo hace draw_field_static().
 }
 
 static bool field_needs_redraw = true;
@@ -567,9 +573,37 @@ static void draw_bricks_full(void) {
         }
 }
 
+// Tras borrar con negro un rectangulo, repinta lo ESTATICO que hubiera
+// debajo y que el borrado se ha llevado por delante: los bordes superior e
+// inferior del campo (la bola, las balas y los powerups los cruzan) y los
+// ladrillos que sigan vivos (los powerups caen atravesando la zona de
+// ladrillos). Sin esto quedaban huecos en la linea blanca de abajo y
+// ladrillos "borrados" en pantalla que seguian existiendo.
+static void restore_static_in_rect(int x, int y, int w, int h) {
+    int top = PLAY_Y, bot = PLAY_Y + PLAY_H - 1;
+    int x0 = (x < PLAY_X) ? PLAY_X : x;
+    int x1 = (x + w > PLAY_X + PLAY_W) ? PLAY_X + PLAY_W : x + w;
+    if (x1 > x0) {
+        if (y <= top && y + h > top) renderer_fill_rect(x0, top, x1 - x0, 1, COLOR_WHITE);
+        if (y <= bot && y + h > bot) renderer_fill_rect(x0, bot, x1 - x0, 1, COLOR_WHITE);
+    }
+    if (y + h <= BRICK_Y0 || y >= BRICK_Y0 + BRICK_ROWS * BRICK_H) return;   // fuera de la zona de ladrillos
+    for (int r = 0; r < BRICK_ROWS; r++)
+        for (int c = 0; c < BRICK_COLS; c++) {
+            if (bricks[r][c] == 0) continue;
+            int bx, by, bw, bh;
+            brick_rect(r, c, &bx, &by, &bw, &bh);
+            if (bx >= x + w || bx + bw <= x || by >= y + h || by + bh <= y) continue;
+            renderer_fill_rect(bx, by, bw, bh, BRICK_COLOR_BY_TYPE[bricks[r][c]]);
+        }
+}
+
 static void draw_ball_if_moved(void) {
     if (ball_x == prev_ball_x && ball_y == prev_ball_y) return;
-    if (prev_ball_x >= 0) renderer_fill_rect(prev_ball_x, prev_ball_y, BALL_SZ, BALL_SZ, COLOR_BLACK);
+    if (prev_ball_x >= 0) {
+        renderer_fill_rect(prev_ball_x, prev_ball_y, BALL_SZ, BALL_SZ, COLOR_BLACK);
+        restore_static_in_rect(prev_ball_x, prev_ball_y, BALL_SZ, BALL_SZ);
+    }
     renderer_fill_rect(ball_x, ball_y, BALL_SZ, BALL_SZ, ball_magnet ? COLOR_MAGENTA : COLOR_WHITE);
     prev_ball_x = ball_x; prev_ball_y = ball_y;
     renderer_flush();
@@ -605,7 +639,10 @@ static void draw_bullets_if_moved(void) {
     for (int i=0;i<MAX_BULLETS;i++) {
         bool show = bullets[i].active;
         if (!show && !prev_bullet_active[i]) continue;
-        if (prev_bullet_active[i]) renderer_fill_rect(prev_bullet_x[i], prev_bullet_y[i], 2, 6, COLOR_BLACK);
+        if (prev_bullet_active[i]) {
+            renderer_fill_rect(prev_bullet_x[i], prev_bullet_y[i], 2, 6, COLOR_BLACK);
+            restore_static_in_rect(prev_bullet_x[i], prev_bullet_y[i], 2, 6);
+        }
         if (show) renderer_fill_rect(bullets[i].x, bullets[i].y, 2, 6, COLOR_YELLOW);
         prev_bullet_x[i]=bullets[i].x; prev_bullet_y[i]=bullets[i].y; prev_bullet_active[i]=show;
         any=true;
@@ -618,7 +655,10 @@ static void draw_powerups_if_moved(void) {
     for (int i=0;i<MAX_POWERUPS;i++) {
         bool show = powerups[i].active;
         if (!show && !prev_pu_active[i]) continue;
-        if (prev_pu_active[i]) renderer_fill_rect(prev_pu_x[i], prev_pu_y[i], PU_W, PU_H, COLOR_BLACK);
+        if (prev_pu_active[i]) {
+            renderer_fill_rect(prev_pu_x[i], prev_pu_y[i], PU_W, PU_H, COLOR_BLACK);
+            restore_static_in_rect(prev_pu_x[i], prev_pu_y[i], PU_W, PU_H);
+        }
         if (show) {
             renderer_fill_rect(powerups[i].x, powerups[i].y, PU_W, PU_H, COLOR_BLUE);
             renderer_draw_text(powerups[i].x+PU_W/2-3, powerups[i].y+PU_H/2-4, pu_labels[powerups[i].type], COLOR_WHITE, COLOR_BLUE, 1);

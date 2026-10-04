@@ -605,7 +605,15 @@ static void game_start(void) {
 //   Pata der:    ( 7,0)  -> ( 12,11)   pie: ( 12,11)->( 9,11)
 //   Llama motor: (-3,7)->(0,7+len)  y  (3,7)->(0,7+len)
 // ---------------------------------------------------------------------------
-#define SHIP_BBOX_R 17
+// Radio de la caja que se BORRA alrededor de la posicion anterior de la nave.
+// Tiene que cubrir TODO lo que draw_ship_at() puede pintar, a cualquier
+// angulo y con la llama visible: medido, la nave llega de -18 a +19 px
+// respecto al centro (la llama sale a 7+11 = 18 px del centro y line()
+// pinta bloques de 2x2, asi que el trazo se extiende 1 px mas a la
+// derecha/abajo). Con 17 la caja cubria solo [-17,+16] y al girar la nave
+// quedaban pixeles sin borrar (rastros) en los extremos. La caja cubre
+// [-R, R-1]; con 21 -> [-21,+20], un pixel de margen.
+#define SHIP_BBOX_R 21
 
 /*
  * scale: 1 en el juego (tamaño normal). La pantalla de inicio usa un

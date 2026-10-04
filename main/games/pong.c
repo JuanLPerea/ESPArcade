@@ -159,7 +159,15 @@ static int   player_level;
 static int   levelup_timer;
 static int   paddle_h;
 static bool  g_done;
-static int   menu_enc_acc = 0;
+// Selector de 1/2 jugadores con el joystick: un cambio por "empujon".
+// El joystick analogico devuelve un valor distinto de cero MIENTRAS esta
+// inclinado (no es un evento puntual como en un encoder), asi que hay que
+// detectar el flanco: el cambio se "arma" cuando el stick vuelve al centro.
+#define MENU_REARM_S    0.12f   // tiempo con el stick en el centro para volver a armar
+#define MENU_MIN_GAP_S  0.30f   // tiempo minimo entre dos cambios, pase lo que pase
+static bool  menu_armed    = false;
+static float menu_center_t = 0.0f;
+static float menu_gap_t    = 0.0f;
 
 static int prev_ball_x = -1, prev_ball_y = -1;
 static int prev_p1_y = -1, prev_p2_y = -1;
@@ -677,12 +685,20 @@ static void pong_tick(float dt) {
         menu_anim_tick(dt);
 
         int d = controls_get_raw_delta(0);
-         if (d) {
-            two_p = !two_p;
-            menu_enc_acc += d;
-            if (menu_enc_acc >= 2)  { two_p = !two_p; menu_enc_acc = 0; draw_select_screen(); }
-            if (menu_enc_acc <= -2) { two_p = !two_p; menu_enc_acc = 0; draw_select_screen(); }
-         }
+        if (menu_gap_t > 0.0f) menu_gap_t -= dt;
+        if (d == 0) {
+            // stick en el centro: tras un instante se vuelve a armar el cambio
+            menu_center_t += dt;
+            if (menu_center_t >= MENU_REARM_S) menu_armed = true;
+        } else {
+            menu_center_t = 0.0f;
+            if (menu_armed && menu_gap_t <= 0.0f) {
+                two_p = !two_p;                 // con 2 opciones, arriba y abajo alternan
+                menu_armed = false;             // no vuelve a cambiar hasta soltar el stick
+                menu_gap_t = MENU_MIN_GAP_S;
+                draw_select_screen();
+            }
+        }
 
         if (controls_menu_select()) {
             p1.score = p2.score = 0;
@@ -831,6 +847,7 @@ void game_pong_run(game_mode_t mode) {
         state = S_PLAYING;
     } else {
         state = S_SELECT;
+        menu_armed = false; menu_center_t = 0.0f; menu_gap_t = 0.0f;   // no heredar un stick ya inclinado
         draw_select_screen();
         sound_start_menu_music();
     }

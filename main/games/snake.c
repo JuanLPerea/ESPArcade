@@ -27,15 +27,11 @@
  *    escribe la celda nueva -- sin desplazar el resto del array como
  *    haria un array-lista clasico.
  *
- *  - GIRO RELATIVO con el eje X del stick (una inclinacion = 90
- *    grados, horario o antihorario), no direcciones absolutas
- *    (WASD/flechas del prototipo): no hacen falta 4 direcciones
- *    absolutas -- en
- *    este juego solo es valido girar a izquierda/derecha respecto al
- *    rumbo actual (un giro de 180 grados en dos pasos equivale a
- *    chocar contra el propio cuello, asi que ni falta hace impedirlo
- *    por software: el sistema de colision ya lo resuelve solo, igual
- *    que en el prototipo).
+ *  - CONTROL ABSOLUTO con el stick (arriba/abajo/izquierda/derecha =
+ *    direccion de la serpiente), como las flechas/WASD del prototipo,
+ *    pero solo se admiten giros de 90 grados respecto al ultimo
+ *    movimiento: el sentido contrario (180) se ignora, porque seria
+ *    meterse de cabeza contra el propio cuello. Ver handle_turn_input().
  *
  *  - IMPULSO ("boost") con el boton A del jugador mantenido: acelera el ritmo de
  *    movimiento de AMBAS serpientes mientras lo mantenga pulsado
@@ -55,15 +51,36 @@
  *    mismo nivel de heuristica que el resto de demo_ai() del
  *    proyecto.
  *
- *  - SUBIDA DE NIVEL corregida: el prototipo comprueba
- *    "puntuacion_combinada % (500*nivel) === 0", que puede no
- *    disparar NUNCA a partir del segundo nivel si los incrementos no
- *    caen justo en un multiplo exacto (los residuos posibles no
- *    siempre incluyen el 0 -- se puede comprobar con nivel=2:
- *    incrementos de 200 partiendo de 500 nunca vuelven a tocar un
- *    multiplo de 1000). Aqui se usa un UMBRAL acumulado
- *    (next_level_score, con >=) que siempre dispara tarde o
- *    temprano, sin ese riesgo.
+ *  - SUBIDA DE NIVEL por FRUTAS (rediseñada): el prototipo comprobaba
+ *    "puntuacion_combinada % (500*nivel) === 0", que podia no disparar
+ *    nunca; la primera version del port uso un umbral de puntos
+ *    (5000 en el nivel 1, +1000*nivel despues), que hacia el nivel 1
+ *    cinco veces mas largo que los demas (50 frutas frente a 10) y
+ *    dejaba que la IA subiera el nivel por ti. Ahora cada nivel
+ *    exige FOODS_PER_LEVEL (10) frutas DEL HUMANO (la roja cuenta
+ *    SPECIAL_FOOD_PROGRESS = 3); el progreso se ve como una barra de
+ *    10 casillas en el centro del HUD, y al empezar cada ronda el
+ *    mensaje dice cuantas faltan.
+ *
+ *  - REGLAS DE LA PARTIDA:
+ *      * Subir de nivel: mas rapido (-10 ms/paso, 180 -> 90 ms), otro
+ *        diseño de tablero (6 diseños en ciclo + obstaculos sueltos
+ *        que crecen con el nivel) y la longitud de las serpientes se
+ *        CONSERVA (hasta CARRY_MAX_GROWTH): reaparecen cortas y
+ *        recuperan esos segmentos en los primeros pasos.
+ *      * Zona de aparicion segura: sin paredes en el pasillo de salida
+ *        de cada serpiente; ademas, cualquier hueco que quedase
+ *        aislado se rellena (fill_pockets), asi que toda fruta es
+ *        alcanzable.
+ *      * 1 jugador: la IA NO gasta vidas y su muerte NO termina la
+ *        ronda -- reaparece a los AI_RESPAWN_MS en la esquina libre
+ *        mas lejana. Solo termina la ronda si mueres tu.
+ *      * 2 jugadores: ganar una ronda da ROUND_WIN_BONUS_MUL*nivel
+ *        puntos; la partida termina cuando uno se queda sin vidas y
+ *        el otro la gana (si ambos a la vez, el de mas puntos).
+ *      * Impulso (A mantenido): mas velocidad Y las frutas valen x2.
+ *      * Vida extra cada EXTRA_LIFE_EVERY puntos (maximo MAX_LIVES).
+ *      * Entrada: buffer de 2 giros para encadenar un giro en U.
  *
  *  - Titulo mostrado en pantalla: "SNAKE" (no "TRON SNAKE" -- se
  *    evita el nombre de la franquicia; la estetica neon si se
@@ -80,14 +97,14 @@
  *    sleep_ms(8). El paso de movimiento ya va por tiempo real
  *    (move_timer_ms), asi que esto solo evita que el bucle corra sin
  *    descanso.
- *  - CONTROL -- cambio de eje real: el giro usaba
- *    controls_get_raw_delta(player), que en ESP32 es el eje Y del
- *    stick; girar izquierda/derecha es un movimiento horizontal, asi
- *    que se usa controls_get_raw_delta_x(player). Igual para el
- *    selector 1P/2P del menu y la deteccion de actividad en demo. El
- *    umbral enc_acc (4 = un giro) no cambia: si el giro se siente
- *    demasiado sensible o duro con el stick, es lo primero a tocar
- *    (busca "enc_acc[player] >= 4" en handle_turn_input()).
+ *  - CONTROL ABSOLUTO: cada direccion del stick (arriba / abajo /
+ *    izquierda / derecha) es una direccion de la serpiente. Solo se
+ *    permiten giros de 90 grados respecto al ultimo movimiento; pedir
+ *    el sentido contrario (180) se ignora -- ver handle_turn_input()
+ *    (eje X = controls_get_raw_delta_x, eje Y = controls_get_raw_delta;
+ *    derecha y abajo son valores positivos). La deteccion de actividad
+ *    en demo mira los dos ejes. El selector 1P/2P del menu usa el eje Y
+ *    (arriba = 1P, abajo = 2P), un cambio por empujon -- ver SN_MENU_*.
  *  - Botones: BTN_x_A -> indices 0 (J1_A) y 2 (J2_A), definidos como
  *    BTN_IDX_J1_A/BTN_IDX_J2_A mas abajo (controls.h no define
  *    nombres).
@@ -212,6 +229,8 @@ typedef struct {
     int32_t score;
     int     lives;       // 0 = eliminada para el resto de la partida (no vuelve a aparecer en begin_round())
     int     pending_growth;   // segmentos que quedan por crecer -- ver comida especial mas abajo
+    int     q2dx, q2dy;       // SEGUNDO giro en cola (buffer de 2 giros, solo humanos) -- ver queue_turn()
+    bool    q2valid;
 } Snake;
 
 static Snake snakes[2];
@@ -227,6 +246,7 @@ static void reset_snake(Snake *s, int x, int y, int dx, int dy) {
     s->dx = dx; s->dy = dy; s->qdx = dx; s->qdy = dy;
     s->alive = true;
     s->pending_growth = 0;
+    s->q2valid = false;
 }
 
 static void snake_step(Snake *s, int nx, int ny, bool grow) {
@@ -236,13 +256,6 @@ static void snake_step(Snake *s, int nx, int ny, bool grow) {
     // si no crece, el segmento de cola anterior queda simplemente
     // fuera de [0,len) -- no hace falta tocarlo en el array, solo en
     // pantalla (ver do_move_step: erase_cell de la cola vieja).
-}
-
-static void turn_relative(Snake *s, int dir) {
-    int dx = s->qdx, dy = s->qdy;
-    if (dir > 0) { s->qdx = -dy; s->qdy = dx; }   // horario
-    else         { s->qdx =  dy; s->qdy = -dx; }  // antihorario
-    sound_effect_select();
 }
 
 // ---------------------------------------------------------------------------
@@ -267,16 +280,137 @@ static Food food;
 typedef struct { int x, y; bool active; int32_t life_ms; } SpecialFood;
 static SpecialFood sfood;
 
+// ---------------------------------------------------------------------------
+// Zona de aparicion segura: ninguna pared en la "autopista" de cada
+// serpiente al empezar la ronda (3 celdas por detras = el cuerpo, 6 por
+// delante y 1 a cada lado). Antes solo se protegia el centro y podia salir
+// una pared justo delante de la cabeza, sin tiempo de reaccion.
+// ---------------------------------------------------------------------------
+#define SPAWN_SAFE_BEHIND 3
+#define SPAWN_SAFE_AHEAD  6
+#define SPAWN_SAFE_SIDE   1
+
+static bool near_spawn(int x, int y) {
+    for (int s = 0; s < 2; s++) {
+        const Snake *sn = &snakes[s];
+        if (!sn->alive) continue;
+        int fx = x - seg_x(sn, 0), fy = y - seg_y(sn, 0);
+        int along  = fx * sn->dx + fy * sn->dy;
+        int across = absi(fx * sn->dy - fy * sn->dx);
+        if (along >= -SPAWN_SAFE_BEHIND && along <= SPAWN_SAFE_AHEAD && across <= SPAWN_SAFE_SIDE) return true;
+    }
+    return false;
+}
+
+static void put_wall(int x, int y) {
+    if (x < 1 || x > COLS-2 || y < 1 || y > ARENA_ROWS-2) return;
+    if (near_spawn(x, y)) return;
+    wall[y][x] = true;
+}
+
+static void wall_rect(int x0, int y0, int x1, int y1) {
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++)
+            put_wall(x, y);
+}
+
+// ---------------------------------------------------------------------------
+// Diseños de tablero: en vez de celdas sueltas al azar, cada nivel usa una
+// estructura (y encima se anaden unos pocos obstaculos aleatorios que crecen
+// con el nivel). Se alternan en ciclo de 6; el 0 es el tablero abierto.
+// Todas dejan huecos para que se pueda rodear, y fill_pockets() garantiza
+// que cualquier zona que hubiera quedado aislada se rellena de pared.
+// ---------------------------------------------------------------------------
+#define N_LAYOUTS 6
+
+static void layout_pattern(int id) {
+    switch (id) {
+    case 1:   // PILARES: cuatro bloques de 2x2 y uno central de 3x3
+        wall_rect(11, 6, 12, 7);   wall_rect(26, 6, 27, 7);
+        wall_rect(11, 19, 12, 20); wall_rect(26, 19, 27, 20);
+        wall_rect(18, 12, 20, 14);
+        break;
+    case 2:   // CRUZ: barras vertical y horizontal con hueco central
+        wall_rect(19, 3, 19, 9);  wall_rect(19, 17, 19, 23);
+        wall_rect(3, 13, 13, 13); wall_rect(25, 13, 35, 13);
+        break;
+    case 3:   // CAJAS: dos habitaciones con una sola puerta
+        wall_rect(10, 6, 16, 6);  wall_rect(10, 10, 16, 10);
+        wall_rect(10, 6, 10, 10); wall_rect(16, 6, 16, 10);
+        wall[10][13] = false;
+        wall_rect(22, 16, 28, 16); wall_rect(22, 20, 28, 20);
+        wall_rect(22, 16, 22, 20); wall_rect(28, 16, 28, 20);
+        wall[16][25] = false;
+        break;
+    case 4:   // SLALOM: tres barras que obligan a zigzaguear
+        wall_rect(3, 7, 30, 7);
+        wall_rect(8, 13, 35, 13);
+        wall_rect(3, 19, 30, 19);
+        break;
+    case 5:   // ESQUINAS: una L en cada esquina y una cruz pequena en el centro
+        for (int i = 0; i < 4; i++) {
+            int x0 = (i & 1) ? COLS-4 : 3,       y0 = (i & 2) ? ARENA_ROWS-4 : 3;
+            int sx = (i & 1) ? -1 : 1,           sy = (i & 2) ? -1 : 1;
+            for (int k = 0; k <= 6; k++) { put_wall(x0 + sx*k, y0); put_wall(x0, y0 + sy*k); }
+        }
+        for (int k = -2; k <= 2; k++) { put_wall(19 + k, 13); put_wall(19, 13 + k); }
+        break;
+    default:  // 0 = abierto
+        break;
+    }
+}
+
+// Rellena de pared toda zona libre que no este conectada con la principal
+// (la mayor, o las que contengan la cabeza de una serpiente viva): asi nunca
+// puede aparecer comida en un hueco inalcanzable.
+static void fill_pockets(void) {
+    static uint8_t  comp[ARENA_ROWS][COLS];
+    static uint16_t queue[ARENA_ROWS * COLS];
+    uint16_t size[256]; bool keep[256];
+    memset(comp, 0, sizeof(comp));
+    memset(size, 0, sizeof(size)); memset(keep, 0, sizeof(keep));
+    int ncomp = 0, largest = 0;
+    for (int y = 1; y < ARENA_ROWS-1; y++)
+        for (int x = 1; x < COLS-1; x++) {
+            if (wall[y][x] || comp[y][x] || ncomp >= 255) continue;
+            int id = ++ncomp, qh = 0, qt = 0;
+            comp[y][x] = (uint8_t)id; queue[qt++] = (uint16_t)(y * COLS + x);
+            while (qh < qt) {
+                int cx = queue[qh] % COLS, cy = queue[qh] / COLS; qh++;
+                size[id]++;
+                static const int8_t D[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
+                for (int d = 0; d < 4; d++) {
+                    int nx = cx + D[d][0], ny = cy + D[d][1];
+                    if (nx < 1 || nx > COLS-2 || ny < 1 || ny > ARENA_ROWS-2) continue;
+                    if (wall[ny][nx] || comp[ny][nx]) continue;
+                    comp[ny][nx] = (uint8_t)id; queue[qt++] = (uint16_t)(ny * COLS + nx);
+                }
+            }
+            if (largest == 0 || size[id] > size[largest]) largest = id;
+        }
+    if (largest) keep[largest] = true;
+    for (int s = 0; s < 2; s++) {
+        if (!snakes[s].alive) continue;
+        int hx = seg_x(&snakes[s], 0), hy = seg_y(&snakes[s], 0);
+        if (comp[hy][hx]) keep[comp[hy][hx]] = true;
+    }
+    for (int y = 1; y < ARENA_ROWS-1; y++)
+        for (int x = 1; x < COLS-1; x++)
+            if (!wall[y][x] && !keep[comp[y][x]]) wall[y][x] = true;   // comp==0 (sin etiquetar) tambien se rellena
+}
+
 static void make_arena(int level) {
     memset(wall, 0, sizeof(wall));
     for (int c = 0; c < COLS; c++) { wall[0][c] = true; wall[ARENA_ROWS-1][c] = true; }
     for (int r = 0; r < ARENA_ROWS; r++) { wall[r][0] = true; wall[r][COLS-1] = true; }
-    int n = clampi(10 + (level-1)*4, 10, 42);
-    for (int i = 0; i < n; i++) {
+    layout_pattern((level - 1) % N_LAYOUTS);
+    int extra = clampi(6 + (level - 1) * 2, 6, 26);   // obstaculos sueltos encima del diseño
+    for (int i = 0; i < extra; i++) {
         int x = 3 + rnd(COLS-6), y = 3 + rnd(ARENA_ROWS-6);
-        if (absi(x-19) < 7 && absi(y-13) < 5) continue;   // deja libre la zona central de salida
-        wall[y][x] = true;
+        if (absi(x-19) < 4 && absi(y-13) < 3) continue;   // centro despejado
+        put_wall(x, y);
     }
+    fill_pockets();
 }
 
 static bool cell_occupied_by_snake(int x, int y) {
@@ -400,10 +534,51 @@ static bool    demo = false;
 static bool    g_done = false;
 static int     blink = 0;
 static int     winner = 0;      // 0 = doble choque, 1/2 = gana ese jugador
-static int32_t next_level_score;
-static int32_t enc_acc[2];
+
+// ---------------------------------------------------------------------------
+// Reglas de progresion (ver cabecera del archivo)
+// ---------------------------------------------------------------------------
+#define FOODS_PER_LEVEL        10     // frutas del humano para subir de nivel
+#define SPECIAL_FOOD_PROGRESS  3      // la fruta roja cuenta como 3 para el nivel
+#define ROUND_WIN_BONUS_MUL    300    // 2 jugadores: puntos = 300 * nivel al ganar una ronda
+#define EXTRA_LIFE_EVERY       10000  // vida extra cada tantos puntos de un humano
+#define MAX_LIVES              5
+#define CARRY_MAX_GROWTH       40     // al subir de nivel se conserva hasta esta longitud extra
+#define AI_RESPAWN_MS          3000   // contra la IA: tiempo que tarda en reaparecer
+
+static int      level_foods = 0;        // frutas comidas en el nivel actual
+static int32_t  next_life_at[2];
+static bool     boost_now[2];           // el humano mantiene A: sus frutas valen el doble
+static bool     ai_waiting = false;     // la IA esta muerta, esperando reaparecer (solo 1 jugador)
+static uint32_t ai_respawn_at;
+static int      match_winner = 0;       // 2 jugadores: 1/2 = ganador de la partida, 0 = empate
+
+// Contra la IA (1 jugador, no demo): la serpiente 1 es la IA. Su muerte NO
+// termina la ronda ni le quita vidas: reaparece sola. Solo termina la ronda
+// si muere el humano.
+static bool solo_vs_ai(void) { return !demo && n_players == 1; }
+
+// Entrada con buffer de 2 giros (ver queue_turn): ultimo candidato visto y
+// cuantos ticks seguidos lleva.
+#define SN_TURN_DEBOUNCE_TICKS 2
+static int8_t  in_cand_dx[2], in_cand_dy[2];
+static uint8_t in_cand_ticks[2];
 static bool    turn_locked[2];   // true = ya se aplico un giro este intervalo de movimiento (ver ai_turn/handle_turn_input)
-static int     menu_enc_acc = 0;
+// Selector 1P/2P de la pantalla de inicio: EJE Y del stick, un cambio por
+// "empujon". El joystick analogico devuelve un valor distinto de cero
+// MIENTRAS esta inclinado (no es un evento puntual como en un encoder), asi
+// que el cambio solo se "arma" cuando el stick vuelve al centro; ademas hay
+// un tiempo minimo entre cambios por si rebota al soltarlo.
+//   arriba -> "1 JUGADOR (VS IA)" (la opcion de arriba en pantalla)
+//   abajo  -> "2 JUGADORES"       (la opcion de abajo)
+// Si en tu stick resulta al reves, pon SN_MENU_DOWN_IS_POSITIVE a 0.
+#define SN_MENU_DOWN_IS_POSITIVE 1
+#define SN_MENU_REARM_MS         120   // stick en el centro este tiempo -> se rearma
+#define SN_MENU_MIN_GAP_MS       300   // minimo entre dos cambios
+static bool     menu_armed        = false;
+static bool     menu_centered     = false;
+static uint32_t menu_center_since = 0;
+static uint32_t menu_gap_until    = 0;
 static int32_t move_timer_ms;
 static uint32_t pause_until;
 static uint32_t game_over_deadline;
@@ -518,27 +693,34 @@ static void clear_messages(void) {
 // franja dedicada de 16px, redibujo incremental solo si cambia.
 // ---------------------------------------------------------------------------
 static int32_t prev_hud_p1 = -1, prev_hud_p2 = -1;
-static int prev_hud_level = -1;
+static int prev_hud_level = -1, prev_hud_foods = -1;
 static int prev_hud_lives1 = -1, prev_hud_lives2 = -1;
 
 static void draw_hud_if_changed(bool force) {
-    char buf[20];
+    char buf[40];
     bool changed = false;
+    // P1 a la izquierda y P2 a la derecha: 124 px cada uno (caben puntuaciones
+    // de hasta 7 cifras), dejando 60 px centrales para nivel + progreso.
     if (snakes[0].score != prev_hud_p1 || snakes[0].lives != prev_hud_lives1 || force) {
-        renderer_fill_rect(PLAY_X+1, PLAY_Y+1, 130, 14, COLOR_BLACK);
+        renderer_fill_rect(PLAY_X+1, PLAY_Y+1, 124, 14, COLOR_BLACK);
         snprintf(buf, sizeof(buf), "%05ld x%d", (long)snakes[0].score, snakes[0].lives);
         renderer_draw_text(PLAY_X+3, PLAY_Y+3, buf, COLOR_P1, COLOR_BLACK, 2);
         prev_hud_p1 = snakes[0].score; prev_hud_lives1 = snakes[0].lives; changed = true;
     }
-    if (level != prev_hud_level || force) {
+    if (level != prev_hud_level || level_foods != prev_hud_foods || force) {
         renderer_fill_rect(CX-30, PLAY_Y+1, 60, 14, COLOR_BLACK);
-        snprintf(buf, sizeof(buf), "L%d", level);
-        renderer_draw_text(centered_x(buf, 2), PLAY_Y+3, buf, COLOR_WHITE, COLOR_BLACK, 2);
-        prev_hud_level = level; changed = true;
+        snprintf(buf, sizeof(buf), "NIVEL %d", level);
+        renderer_draw_text(centered_x(buf, 1), PLAY_Y+2, buf, COLOR_WHITE, COLOR_BLACK, 1);
+        // Barra de progreso: una casilla por fruta que hace falta comer.
+        int bx = CX - (FOODS_PER_LEVEL * 6 - 1) / 2;
+        for (int i = 0; i < FOODS_PER_LEVEL; i++)
+            renderer_fill_rect(bx + i * 6, PLAY_Y + 10, 5, 4, i < level_foods ? COLOR_GREEN : 0x2104);
+        prev_hud_level = level; prev_hud_foods = level_foods; changed = true;
     }
     if (snakes[1].score != prev_hud_p2 || snakes[1].lives != prev_hud_lives2 || force) {
-        renderer_fill_rect(PLAY_X+PLAY_W-131, PLAY_Y+1, 130, 14, COLOR_BLACK);
-        snprintf(buf, sizeof(buf), "%05ld x%d", (long)snakes[1].score, snakes[1].lives);
+        renderer_fill_rect(PLAY_X+PLAY_W-125, PLAY_Y+1, 124, 14, COLOR_BLACK);
+        if (solo_vs_ai()) snprintf(buf, sizeof(buf), "%05ld IA", (long)snakes[1].score);   // la IA no gasta vidas
+        else              snprintf(buf, sizeof(buf), "%05ld x%d", (long)snakes[1].score, snakes[1].lives);
         int tx = PLAY_X+PLAY_W-3-(int)st7789_text_width(buf, 2);
         renderer_draw_text(tx, PLAY_Y+3, buf, COLOR_P2, COLOR_BLACK, 2);
         prev_hud_p2 = snakes[1].score; prev_hud_lives2 = snakes[1].lives; changed = true;
@@ -549,7 +731,17 @@ static void draw_hud_if_changed(bool force) {
 // ---------------------------------------------------------------------------
 // Ronda -- arranca/reinicia el tablero conservando puntuaciones.
 // ---------------------------------------------------------------------------
-static void begin_round(void) {
+static void begin_round(bool carry_length) {
+    // Al subir de nivel se conserva la longitud (hasta CARRY_MAX_GROWTH): la
+    // serpiente reaparece corta y recupera esos segmentos en los primeros
+    // pasos (pending_growth), asi cada segmento es siempre una celda por la
+    // que ha pasado de verdad. Tras morir, en cambio, se empieza de cero.
+    int grow[2] = { 0, 0 };
+    if (carry_length)
+        for (int i = 0; i < 2; i++)
+            if (snakes[i].alive && snakes[i].lives > 0)
+                grow[i] = clampi(snakes[i].len - 3 + snakes[i].pending_growth, 0, CARRY_MAX_GROWTH);
+
     // Solo reaparece quien le queden vidas -- si una serpiente ya
     // esta eliminada, se queda fuera del tablero el resto de la
     // partida (ver crash_snake) y la otra puede seguir jugando sola.
@@ -557,23 +749,33 @@ static void begin_round(void) {
     else                     snakes[0].alive = false;
     if (snakes[1].lives > 0) reset_snake(&snakes[1], COLS-8, ARENA_ROWS-9, 0, -1);
     else                     snakes[1].alive = false;
+    for (int i = 0; i < 2; i++) if (snakes[i].alive) snakes[i].pending_growth = grow[i];
+    ai_waiting = false;
+    in_cand_ticks[0] = in_cand_ticks[1] = 0;
     make_arena(level);
     spawn_food();
     sfood.active = false;   // la comida especial no persiste entre rondas
     for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
     draw_arena_static();
-    prev_hud_p1 = prev_hud_p2 = -1; prev_hud_level = -1; prev_hud_lives1 = prev_hud_lives2 = -1;
+    prev_hud_p1 = prev_hud_p2 = -1; prev_hud_level = -1; prev_hud_lives1 = prev_hud_lives2 = -1; prev_hud_foods = -1;
     draw_hud_if_changed(true);
-    char l1[24];
+    char l1[40], l2[40];
+    int left = clampi(FOODS_PER_LEVEL - level_foods, 1, FOODS_PER_LEVEL);   // acotado: el compilador sabe que son 1-2 cifras
     snprintf(l1, sizeof(l1), "NIVEL %d", level);
+    if (left == 1) snprintf(l2, sizeof(l2), "FALTA 1 FRUTA");
+    else           snprintf(l2, sizeof(l2), "FALTAN %d FRUTAS", left);
     prev_msg1[0] = '\0'; prev_msg2[0] = '\0';   // el clear de arriba se llevo cualquier mensaje anterior
-    update_messages(l1, COLOR_YELLOW, 2, "PREPARADOS", COLOR_WHITE, 1);
+    update_messages(l1, COLOR_YELLOW, 2, l2, COLOR_WHITE, 1);
     pause_until = make_timeout_ms(1400);
 }
 
 static void game_reset_full(void) {
     level = 1;
-    next_level_score = 5000;
+    level_foods = 0;
+    next_life_at[0] = next_life_at[1] = EXTRA_LIFE_EVERY;
+    boost_now[0] = boost_now[1] = false;
+    ai_waiting = false;
+    match_winner = 0;
     snakes[0].score = 0; snakes[1].score = 0;
     snakes[0].human = !demo;
     snakes[1].human = !demo && (n_players == 2);
@@ -583,7 +785,6 @@ static void game_reset_full(void) {
     snakes[0].lives = demo ? 99 : 3;
     snakes[1].lives = demo ? 99 : 3;
     winner = 0;
-    enc_acc[0] = enc_acc[1] = 0;
     turn_locked[0] = turn_locked[1] = false;
 }
 
@@ -594,14 +795,12 @@ static void game_reset_full(void) {
 // acerca a la comida, con un poco de aleatoriedad para que no sea
 // perfectamente robotica.
 //
-// turn_locked limita a UN giro por intervalo de movimiento (tanto
-// para la IA como para el jugador humano, ver handle_turn_input):
-// sin este limite, girar el encoder con cierta rapidez podia meter
-// 2 "detents" antes del siguiente paso, sumando dos giros de 90
-// grados -- un giro de 180 grados de golpe, es decir, la serpiente
-// se mete de cabeza contra su propio cuello. Eso se sentia como un
-// choque "falso", ya que el jugador solo habia pretendido girar una
-// vez. Se desbloquea en do_move_step() al confirmarse cada paso.
+// turn_locked limita a UN giro por intervalo de movimiento para la IA:
+// sin este limite, dos giros de 90 grados antes del siguiente paso
+// sumarian un giro de 180 -- la serpiente se meteria de cabeza contra
+// su propio cuello. Se desbloquea en do_move_step() al confirmarse cada
+// paso. (El jugador humano no lo necesita: handle_turn_input() valida
+// cada direccion contra el ultimo rumbo realmente movido.)
 // ---------------------------------------------------------------------------
 static void ai_turn(int idx) {
     Snake *s = &snakes[idx];
@@ -623,24 +822,161 @@ static void ai_turn(int idx) {
     if (best != 0) turn_locked[idx] = true;   // best==0 es "seguir recto", no consume el giro disponible
 }
 
+// ---------------------------------------------------------------------------
+// CONTROL ABSOLUTO: cada direccion del stick (arriba / abajo / izquierda /
+// derecha) es una direccion de la serpiente, en vez de girar a izquierda o
+// derecha respecto a su rumbo.
+//
+// Solo se admiten giros de 90 grados: la direccion pedida se compara con
+// el ULTIMO RUMBO REALMENTE MOVIDO (sn->dx, sn->dy):
+//   - perpendicular (producto escalar 0)  -> giro de 90, se pone en cola
+//   - la misma    (producto escalar +1)   -> se pone en cola igualmente, lo
+//     que permite "cancelar" un giro pedido por error antes del siguiente paso
+//   - la contraria (producto escalar -1)  -> 180 grados: se IGNORA
+// Como se valida contra el rumbo ya aplicado y no contra el que esta en
+// cola, da igual cuantas veces cambie de idea el jugador dentro de un mismo
+// intervalo de movimiento: el rumbo que se aplique en el siguiente paso es
+// siempre el mismo o perpendicular al ultimo movimiento, asi que es
+// imposible invertir el sentido sobre el propio cuerpo (por eso aqui ya no
+// hace falta turn_locked, que solo usa la IA).
+//
+// Ejes (coordenadas de pantalla): X derecha > 0 / izquierda < 0;
+// Y abajo > 0 / arriba < 0. Si el stick esta inclinado en diagonal manda el
+// eje con mas inclinacion; si hay empate exacto, no se hace nada.
+// SN_STICK_MIN: inclinacion minima para contar como direccion (si el stick
+// en reposo diera un valor pequeno y la serpiente girase sola, subelo a 2).
+// ---------------------------------------------------------------------------
+#define SN_STICK_MIN 1
+// Si en tu stick una direccion sale invertida, pon la constante del eje
+// correspondiente a 0 (no hace falta tocar nada mas).
+#define SN_STICK_X_RIGHT_IS_POSITIVE 1
+#define SN_STICK_Y_DOWN_IS_POSITIVE  1
+
+// Pone en cola la direccion (ddx,ddy) pedida por el jugador, con BUFFER DE 2
+// GIROS. Sea H el ultimo rumbo realmente movido y P1/P2 los giros ya en cola:
+//   - sin giros en cola:  perpendicular a H -> P1; la misma -> nada; la
+//     contraria (180) -> se ignora.
+//   - con P1 en cola:     la misma que P1 -> nada; H -> cancela el giro;
+//     la opuesta a P1 -> cambia de idea (sustituye P1); la contraria a H
+//     (que es perpendicular a P1) -> se encadena como P2 (giro en U en dos pasos).
+//   - con P1 y P2:        la opuesta a P2 la sustituye; el resto, cola llena.
+// Cada cambio de rumbo que llega a aplicarse es siempre de 90 grados.
+static void queue_turn(Snake *s, int ddx, int ddy) {
+    bool has1 = (s->qdx != s->dx || s->qdy != s->dy);
+    if (!has1) {
+        if (ddx == s->dx && ddy == s->dy) return;
+        if (ddx * s->dx + ddy * s->dy != 0) return;        // 180 grados: se ignora
+        s->qdx = ddx; s->qdy = ddy;
+        sound_effect_select();
+        return;
+    }
+    if (!s->q2valid) {
+        if (ddx == s->qdx && ddy == s->qdy) return;
+        if (ddx == s->dx && ddy == s->dy) { s->qdx = s->dx; s->qdy = s->dy; return; }   // cancela el giro
+        if (ddx == -s->qdx && ddy == -s->qdy) { s->qdx = ddx; s->qdy = ddy; sound_effect_select(); return; }
+        s->q2dx = ddx; s->q2dy = ddy; s->q2valid = true;   // (ddx,ddy) == -H, perpendicular a P1
+        sound_effect_select();
+        return;
+    }
+    if (ddx == s->q2dx && ddy == s->q2dy) return;
+    if (ddx == -s->q2dx && ddy == -s->q2dy) { s->q2dx = ddx; s->q2dy = ddy; sound_effect_select(); }
+}
+
 static void handle_turn_input(int player) {
     Snake *s = &snakes[player];
     if (!s->alive || !s->human) return;
-    int d = controls_get_raw_delta_x(player);   // se consume SIEMPRE (aunque el giro este bloqueado), para no acumular un remanente que dispare un giro de mas al desbloquear
-    if (turn_locked[player]) return;
-    if (!d) return;
-    enc_acc[player] += d;
-    if (enc_acc[player] >= 4)       { turn_relative(s, +1); turn_locked[player] = true; enc_acc[player] = 0; }
-    else if (enc_acc[player] <= -4) { turn_relative(s, -1); turn_locked[player] = true; enc_acc[player] = 0; }
+    // Se leen SIEMPRE los dos ejes (aunque luego no se use el valor), para no
+    // acumular un remanente que dispare un giro de mas mas tarde.
+    int ax = controls_get_raw_delta_x(player);
+    int ay = controls_get_raw_delta(player);
+    if (!SN_STICK_X_RIGHT_IS_POSITIVE) ax = -ax;
+    if (!SN_STICK_Y_DOWN_IS_POSITIVE)  ay = -ay;
+    int mx = ax < 0 ? -ax : ax;
+    int my = ay < 0 ? -ay : ay;
+
+    int ddx = 0, ddy = 0;
+    if      (mx >= SN_STICK_MIN && mx > my) ddx = (ax > 0) ? 1 : -1;   // domina el eje horizontal
+    else if (my >= SN_STICK_MIN && my > mx) ddy = (ay > 0) ? 1 : -1;   // domina el vertical
+    else { in_cand_ticks[player] = 0; return; }                         // stick en el centro, o diagonal exacta
+
+    // Filtro: la direccion debe mantenerse SN_TURN_DEBOUNCE_TICKS ticks
+    // seguidos; asi un barrido rapido del stick por direcciones intermedias
+    // no encola giros que el jugador no queria.
+    if (ddx == in_cand_dx[player] && ddy == in_cand_dy[player]) {
+        if (in_cand_ticks[player] < 255) in_cand_ticks[player]++;
+    } else {
+        in_cand_dx[player] = (int8_t)ddx; in_cand_dy[player] = (int8_t)ddy; in_cand_ticks[player] = 1;
+    }
+    if (in_cand_ticks[player] < SN_TURN_DEBOUNCE_TICKS) return;
+    queue_turn(s, ddx, ddy);
 }
 
 static void crash_snake(int idx, int hx, int hy) {
     Snake *sn = &snakes[idx];
     if (!sn->alive) return;   // evita partirculas dobles si ya se marco por otra via este mismo paso
     sn->alive = false;
-    if (sn->lives > 0) sn->lives--;
+    if (sn->lives > 0 && !(idx == 1 && solo_vs_ai())) sn->lives--;   // la IA contra un humano no gasta vidas
     uint16_t cols[3] = { idx == 0 ? COLOR_P1 : COLOR_P2, COLOR_WHITE, COLOR_YELLOW };
     spawn_burst(cell_x(hx)+CELL/2, cell_y(hy)+CELL/2, 16, cols, 3);
+}
+
+// Vida extra cada EXTRA_LIFE_EVERY puntos de un jugador humano (maximo
+// MAX_LIVES). El aviso es el sonido y el contador de vidas del HUD.
+static void check_extra_life(int s) {
+    Snake *sn = &snakes[s];
+    if (!sn->human || demo) return;
+    while (sn->score >= next_life_at[s]) {
+        next_life_at[s] += EXTRA_LIFE_EVERY;
+        if (sn->lives < MAX_LIVES) { sn->lives++; sound_effect_extra_life(); }
+    }
+}
+
+// Contra la IA: la IA acaba de morir y la ronda sigue. Se borra su cuerpo del
+// tablero y se programa su reaparicion.
+static void ai_down(void) {
+    Snake *ai = &snakes[1];
+    for (int i = 0; i < ai->len; i++) erase_cell(seg_x(ai, i), seg_y(ai, i));
+    ai_waiting = true;
+    ai_respawn_at = make_timeout_ms(AI_RESPAWN_MS);
+}
+
+// ¿Esta libre la "autopista" de una posible aparicion (2 celdas por detras
+// y SPAWN_SAFE_AHEAD por delante)? Sin paredes, serpientes ni fruta encima.
+static bool spawn_corridor_free(int x, int y, int dx, int dy) {
+    for (int k = -2; k <= SPAWN_SAFE_AHEAD; k++) {
+        int cx = x + dx * k, cy = y + dy * k;
+        if (cx < 1 || cx > COLS-2 || cy < 1 || cy > ARENA_ROWS-2) return false;
+        if (wall[cy][cx]) return false;
+        if (cell_occupied_by_snake(cx, cy)) return false;
+        if (food.active && food.x == cx && food.y == cy) return false;
+        if (sfood.active && sfood.x == cx && sfood.y == cy) return false;
+    }
+    return true;
+}
+
+// La IA reaparece en la esquina libre mas alejada del humano; si ninguna
+// esta libre todavia, lo vuelve a intentar medio segundo despues.
+static void try_respawn_ai(void) {
+    static const int RS[4][4] = {
+        { COLS-8, ARENA_ROWS-9, 0, -1 }, { 7, ARENA_ROWS-9, 0, -1 },
+        { COLS-8, 8, 0, 1 },             { 7, 8, 0, 1 },
+    };
+    int hx = seg_x(&snakes[0], 0), hy = seg_y(&snakes[0], 0);
+    int best = -1, best_dist = -1;
+    for (int i = 0; i < 4; i++) {
+        int dist = absi(hx - RS[i][0]) + absi(hy - RS[i][1]);
+        if (dist < 12) continue;                                   // demasiado cerca del humano
+        if (!spawn_corridor_free(RS[i][0], RS[i][1], RS[i][2], RS[i][3])) continue;
+        if (dist > best_dist) { best_dist = dist; best = i; }
+    }
+    if (best < 0) { ai_respawn_at = make_timeout_ms(500); return; }
+    Snake *ai = &snakes[1];
+    reset_snake(ai, RS[best][0], RS[best][1], RS[best][2], RS[best][3]);
+    turn_locked[1] = false;
+    ai_waiting = false;
+    for (int i = 0; i < ai->len; i++)
+        draw_cell(seg_x(ai, i), seg_y(ai, i), i == 0 ? COLOR_HEAD : COLOR_P2);
+    renderer_flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -653,10 +989,14 @@ static void crash_snake(int idx, int hx, int hy) {
 // el prototipo, que se salta por completo si alguna ya esta muerta.
 // ---------------------------------------------------------------------------
 static void do_move_step(void) {
+    bool ai_was_alive = snakes[1].alive;
     for (int s = 0; s < 2; s++) {
         Snake *sn = &snakes[s];
         if (!sn->alive) continue;
         sn->dx = sn->qdx; sn->dy = sn->qdy;
+        if (sn->q2valid) {                       // el 2o giro del buffer pasa a ser el siguiente
+            sn->qdx = sn->q2dx; sn->qdy = sn->q2dy; sn->q2valid = false;
+        }
         turn_locked[s] = false;   // el giro de este intervalo ya se ha consumido -- desbloquea para el siguiente
         int hx = seg_x(sn, 0), hy = seg_y(sn, 0);
         int nx = hx + sn->dx, ny = hy + sn->dy;
@@ -666,9 +1006,12 @@ static void do_move_step(void) {
             continue;
         }
 
+        int mult = boost_now[s] ? 2 : 1;           // con el impulso pulsado, las frutas valen el doble
+        bool counts = demo || sn->human;           // la fruta de la IA no hace subir de nivel
         if (food.active && nx == food.x && ny == food.y) {
             sn->pending_growth += 1;
-            sn->score += 100 * level;
+            sn->score += 100 * level * mult;
+            if (counts) level_foods += 1;
             sound_effect_coin();
             uint16_t fcols[2] = { COLOR_FOOD, COLOR_WHITE };
             spawn_burst(cell_x(nx)+CELL/2, cell_y(ny)+CELL/2, 8, fcols, 2);
@@ -680,14 +1023,17 @@ static void do_move_step(void) {
                 spawn_special_food();
                 if (sfood.active) draw_cell(sfood.x, sfood.y, COLOR_SFOOD);
             }
+            check_extra_life(s);
         }
         if (sfood.active && nx == sfood.x && ny == sfood.y) {
             sn->pending_growth += SPECIAL_FOOD_GROWTH;
-            sn->score += SPECIAL_FOOD_SCORE_MUL * level;
+            sn->score += SPECIAL_FOOD_SCORE_MUL * level * mult;
+            if (counts) level_foods += SPECIAL_FOOD_PROGRESS;
             sound_effect_coin();
             uint16_t scols[3] = { COLOR_SFOOD, COLOR_WHITE, COLOR_YELLOW };
             spawn_burst(cell_x(nx)+CELL/2, cell_y(ny)+CELL/2, 14, scols, 3);
             sfood.active = false;
+            check_extra_life(s);
         }
 
         bool grow = false;
@@ -722,25 +1068,52 @@ static void do_move_step(void) {
     renderer_flush();
 
     bool dead0 = !snakes[0].alive, dead1 = !snakes[1].alive;
-    if (dead0 || dead1) {
-        winner = (dead0 && dead1) ? 0 : (dead0 ? 2 : 1);
+    bool solo = solo_vs_ai();
+    bool both_now = ai_was_alive && dead0 && dead1;
+
+    // Contra la IA: si solo ha muerto ella, la ronda continua.
+    if (solo && ai_was_alive && dead1 && !dead0) {
+        ai_down();
         sound_effect_explosion();
-        if (winner == 0) update_messages("DOBLE CHOQUE", COLOR_RED, 2, "SIGUIENTE RONDA...", COLOR_WHITE, 1);
-        else {
-            char l1[24]; snprintf(l1, sizeof(l1), "GANA JUGADOR %d", winner);
-            update_messages(l1, winner == 1 ? COLOR_P1 : COLOR_P2, 2, "SIGUIENTE RONDA...", COLOR_WHITE, 1);
+    }
+
+    bool round_over = solo ? dead0 : (dead0 || dead1);
+    if (round_over) {
+        sound_effect_explosion();
+        char l1[40], l2[48];
+        uint16_t c1 = COLOR_RED;
+        snprintf(l2, sizeof(l2), "SIGUIENTE RONDA...");
+        if (solo) {
+            winner = snakes[1].alive ? 2 : 0;
+            if (winner == 2)     { snprintf(l1, sizeof(l1), "GANA LA IA"); c1 = COLOR_P2; }
+            else if (both_now)   snprintf(l1, sizeof(l1), "DOBLE CHOQUE");
+            else                 snprintf(l1, sizeof(l1), "HAS CHOCADO");
+        } else {
+            winner = (dead0 && dead1) ? 0 : (dead0 ? 2 : 1);
+            if (winner == 0) snprintf(l1, sizeof(l1), "DOBLE CHOQUE");
+            else {
+                snprintf(l1, sizeof(l1), "GANA JUGADOR %d", winner);
+                c1 = (winner == 1) ? COLOR_P1 : COLOR_P2;
+                if (!demo) {   // 2 jugadores: ganar la ronda da puntos
+                    int32_t bonus = (int32_t)ROUND_WIN_BONUS_MUL * level;
+                    snakes[winner-1].score += bonus;
+                    check_extra_life(winner - 1);
+                    draw_hud_if_changed(false);
+                    snprintf(l2, sizeof(l2), "+%ld PUNTOS - SIGUIENTE RONDA", (long)bonus);
+                }
+            }
         }
+        update_messages(l1, c1, 2, l2, COLOR_WHITE, 1);
         pause_until = make_timeout_ms(1600);
         state = SN_ROUND_OVER;
         return;
     }
 
-    int32_t combined = snakes[0].score + snakes[1].score;
-    if (combined >= next_level_score) {
+    if (level_foods >= FOODS_PER_LEVEL) {
         level++;
-        next_level_score += 1000L * level;
+        level_foods -= FOODS_PER_LEVEL;
         sound_effect_teleport();
-        begin_round();
+        begin_round(true);        // conserva la longitud de las serpientes vivas
         state = SN_ROUND_START;
     }
 }
@@ -752,11 +1125,11 @@ static void draw_ready_screen(void) {
     renderer_clear(COLOR_BLACK);
     renderer_draw_text(centered_x("SNAKE", 4), 10, "SNAKE", COLOR_CYAN, COLOR_BLACK, 4);
 
-    const char *l1 = "STICK: IZQUIERDA/DERECHA";
-    const char *l2 = "MANTEN A: IMPULSO";
+    const char *l1 = "STICK: ELIGE DIRECCION";
+    const char *l2 = "A: IMPULSO = x2 PUNTOS";
     renderer_draw_text(centered_x(l1, 2), 60, l1, COLOR_WHITE, COLOR_BLACK, 2);
     renderer_draw_text(centered_x(l2, 2), 82, l2, COLOR_WHITE, COLOR_BLACK, 2);
-    const char *l2b = "3 VIDAS POR JUGADOR";
+    const char *l2b = "3 VIDAS - COME 10 FRUTAS PARA SUBIR DE NIVEL";
     renderer_draw_text(centered_x(l2b, 1), 102, l2b, COLOR_GREEN, COLOR_BLACK, 1);
 
     // Vista previa de las dos serpientes (decorativa)
@@ -775,7 +1148,7 @@ static void draw_ready_screen(void) {
     renderer_draw_text(centered_x(s1, 2), 144, s1, COLOR_WHITE, COLOR_BLACK, 2);
     renderer_draw_text(centered_x(s2, 2), 166, s2, COLOR_WHITE, COLOR_BLACK, 2);
 
-    const char *l3 = "STICK PARA CAMBIAR MODO";
+    const char *l3 = "STICK ARRIBA/ABAJO PARA CAMBIAR MODO";
     const char *l4 = "PULSA PARA JUGAR";
     renderer_draw_text(centered_x(l3, 1), 190, l3, COLOR_GREEN, COLOR_BLACK, 1);
     renderer_draw_text(centered_x(l4, 2), 204, l4, COLOR_YELLOW, COLOR_BLACK, 2);
@@ -792,21 +1165,25 @@ static void draw_scores_screen(void) {
 // ---------------------------------------------------------------------------
 // Maquina de estados
 // ---------------------------------------------------------------------------
-// La partida termina cuando TODOS los jugadores humanos se han
-// quedado sin vidas (0 en demo no cuenta -- devuelve false si no hay
-// ningun humano, así que el demo nunca termina por esta vía). Si un
-// humano aun tiene vidas mientras el otro puesto (humano o IA) ya se
-// quedo sin ellas, la partida sigue -- ese puesto simplemente no
-// vuelve a aparecer en begin_round().
-static bool humans_out(void) {
-    bool any_human = false;
-    for (int i = 0; i < 2; i++) {
-        if (snakes[i].human) {
-            any_human = true;
-            if (snakes[i].lives > 0) return false;
-        }
-    }
-    return any_human;
+// FIN DE PARTIDA (se comprueba al acabar cada ronda):
+//   - 1 jugador (contra la IA): cuando el humano se queda sin vidas.
+//   - 2 jugadores: cuando CUALQUIERA de los dos se queda sin vidas -- el
+//     otro gana la partida (antes seguia jugando solo hasta perder las suyas).
+//   - demo: nunca (se corta por tiempo o pulsacion, ver sn_tick).
+static bool match_over(void) {
+    if (demo) return false;
+    if (n_players == 2) return snakes[0].lives == 0 || snakes[1].lives == 0;
+    return snakes[0].lives == 0;
+}
+
+// Ganador de la partida a 2 jugadores: quien conserva vidas; si ambos se
+// quedaron a 0 en la misma ronda, el de mayor puntuacion (0 = empate).
+static int compute_match_winner(void) {
+    if (snakes[0].lives > 0 && snakes[1].lives == 0) return 1;
+    if (snakes[1].lives > 0 && snakes[0].lives == 0) return 2;
+    if (snakes[0].score > snakes[1].score) return 1;
+    if (snakes[1].score > snakes[0].score) return 2;
+    return 0;
 }
 
 static void sn_tick(void) {
@@ -815,6 +1192,7 @@ static void sn_tick(void) {
 
     if (demo) {
         bool any = controls_menu_select() || controls_get_raw_delta_x(0) != 0 || controls_get_raw_delta_x(1) != 0
+                 || controls_get_raw_delta(0) != 0 || controls_get_raw_delta(1) != 0
                  || controls_button_down(BTN_IDX_J1_A) || controls_button_down(BTN_IDX_J2_A);
         if (any || ++demo_ticks >= 60*30) { g_done = true; return; }
     }
@@ -823,17 +1201,28 @@ static void sn_tick(void) {
 
     case SN_READY:
         if (!demo) {
-            int d = controls_get_raw_delta_x(0);
-            if (d) {
-                menu_enc_acc += d;
-                if (menu_enc_acc >= 4)  { n_players = (n_players == 1) ? 2 : 1; menu_enc_acc = 0; draw_ready_screen(); }
-                if (menu_enc_acc <= -4) { n_players = (n_players == 1) ? 2 : 1; menu_enc_acc = 0; draw_ready_screen(); }
+            int d = controls_get_raw_delta(0);      // eje Y (arriba < 0, abajo > 0)
+            if (d == 0) {
+                // stick en el centro: pasado un instante se vuelve a armar el cambio
+                if (!menu_centered) { menu_centered = true; menu_center_since = now_ms(); }
+                else if (now_ms() - menu_center_since >= SN_MENU_REARM_MS) menu_armed = true;
+            } else {
+                menu_centered = false;
+                if (menu_armed && time_reached_ms(menu_gap_until)) {
+                    int want = ((d > 0) == (SN_MENU_DOWN_IS_POSITIVE != 0)) ? 2 : 1;
+                    if (want != n_players) {
+                        n_players = want;
+                        menu_armed = false;                      // no vuelve a cambiar hasta soltar el stick
+                        menu_gap_until = make_timeout_ms(SN_MENU_MIN_GAP_MS);
+                        draw_ready_screen();
+                    }
+                }
             }
         }
         if (time_reached_ms(ready_input_ok_time) && controls_menu_select()) {
             sound_stop_menu_music();
             game_reset_full();
-            begin_round();
+            begin_round(false);
             state = SN_ROUND_START;
         }
         break;
@@ -851,8 +1240,10 @@ static void sn_tick(void) {
             if (snakes[p].human) handle_turn_input(p);
             else                 ai_turn(p);
         }
-        bool boosting = (snakes[0].human && controls_button_down(BTN_IDX_J1_A)) ||
-                        (snakes[1].human && controls_button_down(BTN_IDX_J2_A));
+        boost_now[0] = snakes[0].human && controls_button_down(BTN_IDX_J1_A);   // impulso: mas rapido y fruta x2
+        boost_now[1] = snakes[1].human && controls_button_down(BTN_IDX_J2_A);
+        bool boosting = boost_now[0] || boost_now[1];
+        if (ai_waiting && !snakes[1].alive && time_reached_ms(ai_respawn_at)) try_respawn_ai();
 
         move_timer_ms -= g_elapsed_ms;
         if (move_timer_ms <= 0) {
@@ -870,21 +1261,31 @@ static void sn_tick(void) {
     case SN_ROUND_OVER:
         update_and_draw_particles();
         if (time_reached_ms(pause_until)) {
-            if (humans_out()) {
+            if (match_over()) {
+                if (n_players == 2) match_winner = compute_match_winner();
                 sound_effect_game_over();
                 update_messages("GAME OVER", COLOR_RED, 3, "", COLOR_BLACK, 1);
                 pause_until = make_timeout_ms(2000);
                 game_over_deadline = make_timeout_ms(8000);
                 state = SN_GAME_OVER;
             } else {
-                begin_round();
+                begin_round(false);
                 state = SN_ROUND_START;
             }
         }
         break;
 
     case SN_GAME_OVER:
-        update_messages((blink/15)%2==0 ? "PULSA PARA CONTINUAR" : "GAME OVER", COLOR_YELLOW, 2, "", COLOR_BLACK, 1);
+        if (!demo && n_players == 2) {
+            // 2 jugadores: alterna "GAME OVER" con el ganador de la partida
+            char w[40]; uint16_t wc = COLOR_WHITE;
+            if (match_winner == 0) snprintf(w, sizeof(w), "EMPATE");
+            else { snprintf(w, sizeof(w), "GANA JUGADOR %d", match_winner); wc = (match_winner == 1) ? COLOR_P1 : COLOR_P2; }
+            if ((blink/15)%2==0) update_messages(w, wc, 2, "PULSA PARA CONTINUAR", COLOR_WHITE, 1);
+            else                 update_messages("GAME OVER", COLOR_RED, 2, "PULSA PARA CONTINUAR", COLOR_WHITE, 1);
+        } else {
+            update_messages((blink/15)%2==0 ? "PULSA PARA CONTINUAR" : "GAME OVER", COLOR_YELLOW, 2, "", COLOR_BLACK, 1);
+        }
         if (time_reached_ms(pause_until) &&
             (controls_menu_select() || time_reached_ms(game_over_deadline))) {
             if (!demo) {
@@ -912,7 +1313,8 @@ void game_snake_run(game_mode_t mode) {
 
     demo = (mode == GAME_MODE_DEMO);
     n_players = (mode == GAME_MODE_2P) ? 2 : 1;
-    menu_enc_acc = 0;
+    menu_armed = false; menu_centered = false; menu_center_since = 0;   // exige centrar el stick antes del primer cambio
+    menu_gap_until = 0;
     blink = 0; demo_ticks = 0; g_done = false;
     last_tick_time_ms = now_ms();
     for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
@@ -921,7 +1323,7 @@ void game_snake_run(game_mode_t mode) {
     if (demo) {
         n_players = 2;   // solo afecta al HUD/selector -- game_reset_full() ya fuerza IA en ambas por "demo"
         game_reset_full();
-        begin_round();
+        begin_round(false);
         state = SN_ROUND_START;
     } else {
         state = SN_READY;

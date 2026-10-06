@@ -302,7 +302,7 @@ static inline int16_t can_dy(int a) { return -cos_deg(a); }
 #define DROP_WAVE_MAX_PCT      180
 
 // Tope de paracaidistas cayendo a la vez: 4 en la ola 1, +1 cada 2 olas, máx. 7.
-#define PARAS_AIR_BASE   4
+#define PARAS_AIR_BASE   1
 #define PARAS_AIR_MAX    7
 
 #define ATTACK_DUR_MS         6000

@@ -739,12 +739,6 @@ static void draw_alien_at(int r, int c, int x, int y, int anim) {
     else             draw_alien_C(x, y, anim, color);
 }
 
-static void draw_alien(int r, int c) {
-    Alien *a = &aliens[r][c];
-    if (!a->alive) return;
-    draw_alien_at(r, c, a->x, a->y, a->anim);
-}
-
 // Repinta solo los aliens vivos cuyo rectángulo solapa la zona dada
 // (p. ej. tras borrar el rastro del platillo sobre la fila superior).
 // Mucho más barato que redibujar la formación entera.

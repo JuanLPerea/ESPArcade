@@ -232,6 +232,28 @@ typedef struct { int x, y; bool active; } Bullet;
 
 static const char * const pu_labels[6] = { "?", "F", "W", "L", "M", "U" };
 
+// Color de cada tipo de power-up. Se eligio para que sea el MISMO que el de su
+// efecto en pantalla, asi la capsula "avisa" de lo que va a pasar:
+//   F  DISPARO       amarillo   (las balas son amarillas)
+//   W  WARP          verde      (el hueco que se abre en el lateral)
+//   L  PALA LARGA    cian       (la pala ancha se pinta cian)
+//   M  IMAN          magenta    (la bola con iman se pinta magenta)
+//   U  VIDA EXTRA    rojo
+static uint16_t pu_color(uint8_t type) {
+    switch (type) {
+        case PU_SHOOT:  return COLOR_YELLOW;
+        case PU_WARP:   return COLOR_GREEN;
+        case PU_WIDE:   return COLOR_CYAN;
+        case PU_MAGNET: return COLOR_MAGENTA;
+        case PU_LIFE:   return COLOR_RED;
+        default:        return COLOR_BLUE;
+    }
+}
+// Letra negra sobre los colores claros, blanca sobre los oscuros.
+static uint16_t pu_text_color(uint8_t type) {
+    return (type == PU_MAGNET || type == PU_LIFE) ? COLOR_WHITE : COLOR_BLACK;
+}
+
 // ---------------------------------------------------------------------------
 // Tipos de ladrillo -- color solido por tipo
 // ---------------------------------------------------------------------------
@@ -475,7 +497,7 @@ static void activate_powerup(uint8_t type) {
         case PU_WARP: {
             warp_side = rng_next() & 1;
             int wx = warp_side ? PLAY_X+PLAY_W-3 : PLAY_X;
-            renderer_fill_rect(wx, WARP_GAP_Y, 3, WARP_GAP_H, COLOR_CYAN);
+            renderer_fill_rect(wx, WARP_GAP_Y, 3, WARP_GAP_H, pu_color(PU_WARP));
             renderer_flush();
             break;
         }
@@ -587,6 +609,11 @@ static void restore_static_in_rect(int x, int y, int w, int h) {
         if (y <= top && y + h > top) renderer_fill_rect(x0, top, x1 - x0, 1, COLOR_WHITE);
         if (y <= bot && y + h > bot) renderer_fill_rect(x0, bot, x1 - x0, 1, COLOR_WHITE);
     }
+    if (active_pu == PU_WARP) {   // marca del hueco lateral del warp (la bola/pala la borran al cruzarla)
+        int wx = warp_side ? PLAY_X+PLAY_W-3 : PLAY_X;
+        if (wx < x + w && wx + 3 > x && WARP_GAP_Y < y + h && WARP_GAP_Y + WARP_GAP_H > y)
+            renderer_fill_rect(wx, WARP_GAP_Y, 3, WARP_GAP_H, pu_color(PU_WARP));
+    }
     if (y + h <= BRICK_Y0 || y >= BRICK_Y0 + BRICK_ROWS * BRICK_H) return;   // fuera de la zona de ladrillos
     for (int r = 0; r < BRICK_ROWS; r++)
         for (int c = 0; c < BRICK_COLS; c++) {
@@ -611,9 +638,11 @@ static void draw_ball_if_moved(void) {
 
 static void draw_paddle_if_moved(void) {
     if (pad_x == prev_pad_x && pad_w == prev_pad_w) return;
-    if (prev_pad_x >= 0)
+    if (prev_pad_x >= 0) {
         renderer_fill_rect(prev_pad_x, PAD_Y, prev_pad_w, PAD_H, COLOR_BLACK);
-    uint16_t color = (active_pu == PU_WIDE) ? COLOR_CYAN : COLOR_WHITE;
+        restore_static_in_rect(prev_pad_x, PAD_Y, prev_pad_w, PAD_H);
+    }
+    uint16_t color = (active_pu == PU_WIDE) ? pu_color(PU_WIDE) : COLOR_WHITE;
     renderer_fill_rect(pad_x, PAD_Y, pad_w, PAD_H, color);
     prev_pad_x = pad_x; prev_pad_w = pad_w;
     renderer_flush();
@@ -650,6 +679,17 @@ static void draw_bullets_if_moved(void) {
     if (any) renderer_flush();
 }
 
+// Capsula de power-up: borde blanco + anillo negro + relleno del color del tipo +
+// letra. El borde y el anillo la separan de los ladrillos por los que cae, que
+// usan esa misma paleta (rojo, amarillo, verde, cian, magenta, blanco).
+static void draw_powerup_capsule(int x, int y, uint8_t type) {
+    uint16_t c = pu_color(type);
+    renderer_fill_rect(x,   y,   PU_W,   PU_H,   COLOR_WHITE);
+    renderer_fill_rect(x+1, y+1, PU_W-2, PU_H-2, COLOR_BLACK);
+    renderer_fill_rect(x+2, y+2, PU_W-4, PU_H-4, c);
+    renderer_draw_text(x+PU_W/2-3, y+PU_H/2-4, pu_labels[type], pu_text_color(type), c, 1);
+}
+
 static void draw_powerups_if_moved(void) {
     bool any=false;
     for (int i=0;i<MAX_POWERUPS;i++) {
@@ -659,10 +699,7 @@ static void draw_powerups_if_moved(void) {
             renderer_fill_rect(prev_pu_x[i], prev_pu_y[i], PU_W, PU_H, COLOR_BLACK);
             restore_static_in_rect(prev_pu_x[i], prev_pu_y[i], PU_W, PU_H);
         }
-        if (show) {
-            renderer_fill_rect(powerups[i].x, powerups[i].y, PU_W, PU_H, COLOR_BLUE);
-            renderer_draw_text(powerups[i].x+PU_W/2-3, powerups[i].y+PU_H/2-4, pu_labels[powerups[i].type], COLOR_WHITE, COLOR_BLUE, 1);
-        }
+        if (show) draw_powerup_capsule(powerups[i].x, powerups[i].y, powerups[i].type);
         prev_pu_x[i]=powerups[i].x; prev_pu_y[i]=powerups[i].y; prev_pu_active[i]=show;
         any=true;
     }

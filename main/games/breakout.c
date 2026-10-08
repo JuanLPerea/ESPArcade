@@ -93,8 +93,21 @@
 // necesita ajustes finos de posicion (golpear la bola con un punto
 // concreto de la pala), asi que responde con menos brusquedad al
 // stick que un Pong tipico.
-#define PAD_ACCEL          100.0f  // px/s^2 por "unidad" de inclinacion de joystick
-#define PAD_VEL_MAX        8.0f  // px/s, tope de velocidad de la pala
+//
+// Modo INERCIA -- todo en UNIDADES REALES (px, s), independiente de los FPS:
+//   PAD_ACCEL: aceleracion por "unidad" de inclinacion del stick. Con inclinacion
+//     suave (1) tarda ~0,12 s en llegar a PAD_VEL_MAX; con 3, ~0,04 s.
+//   PAD_VEL_MAX: tope de velocidad. 560 px/s = cruza el campo (312 px) en ~0,55 s.
+//   PAD_DECAY_PER_SEC: al soltar el stick la velocidad cae como e^(-20 t); la
+//     pala se desliza todavia unos PAD_VEL_MAX/20 = 28 px.
+// Antes (100 / 8 / 20) la velocidad se SUMABA a la posicion en cada vuelta del
+// bucle sin multiplicar por dt, asi que eran px POR VUELTA: el juego esta pensado
+// para 60 FPS (480 px/s), pero en el ESP32 el bucle da una vuelta por tick de
+// FreeRTOS (10 ms = 100 FPS) y la pala llegaba a 800 px/s, y cambiaba de
+// velocidad si cambiaban los FPS. Para ir mas lento: bajar PAD_VEL_MAX; para
+// que arranque mas suave con el stick poco inclinado: bajar PAD_ACCEL.
+#define PAD_ACCEL          4500.0f  // px/s^2 por "unidad" de inclinacion de joystick
+#define PAD_VEL_MAX        280.0f   // px/s, tope de velocidad de la pala
 #define PAD_DECAY_PER_SEC  20.0f    // decaimiento exponencial al soltar el stick
 #define PAD_AI_SPEED_PPS   100.0f  // demo: velocidad de seguimiento de la IA, en px/s
 
@@ -179,7 +192,7 @@ static void pad_update(float dt) {
         pad_update_direct();
     } else {
         int d = controls_get_raw_delta_x(0);
-        pad_xf = clampf(pad_xf + enc_momentum(d, &pad_vel, dt), (float)PLAY_X, (float)(PLAY_X + PLAY_W - pad_w));
+        pad_xf = clampf(pad_xf + enc_momentum(d, &pad_vel, dt) * dt, (float)PLAY_X, (float)(PLAY_X + PLAY_W - pad_w));   // px/s * s = px
         pad_x = (int)(pad_xf + 0.5f);
     }
 }

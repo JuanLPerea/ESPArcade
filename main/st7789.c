@@ -25,7 +25,7 @@
 #define TFT_PANEL_ILI9341  2
 
 #ifndef TFT_PANEL
-#define TFT_PANEL TFT_PANEL_ST7789
+#define TFT_PANEL TFT_PANEL_ILI9341
 #endif
 
 #if TFT_PANEL == TFT_PANEL_ILI9341
@@ -120,7 +120,7 @@
   #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_RGB
   #define TFT_SWAP_BYTES      0
 #elif TFT_PANEL == TFT_PANEL_ILI9341
-  #define TFT_SPI_HZ          (10 * 1000 * 1000)
+  #define TFT_SPI_HZ          (20 * 1000 * 1000)
   #define TFT_INVERT_COLORS   false
   #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_BGR
   #define TFT_SWAP_BYTES      1
@@ -594,7 +594,7 @@ void st7789_set_rotation(uint8_t rotation) {
             break;
         case 1:
             esp_lcd_panel_swap_xy(s_panel, true);
-            esp_lcd_panel_mirror(s_panel, true, false);
+            esp_lcd_panel_mirror(s_panel, true, true);
             st7789_screen_w = 320; st7789_screen_h = 240;
             break;
         case 2:

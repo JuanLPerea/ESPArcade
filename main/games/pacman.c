@@ -1452,7 +1452,7 @@ static void pm_tick(void) {
             // rotation=0): misma resolución 240x320, pero girada 180°
             // respecto a rotation=0 -- es la que queda bien orientada
             // en este panel concreto.
-            st7789_set_rotation(2);
+            st7789_set_rotation(0);
             renderer_clear(COLOR_BLACK);
             renderer_flush();
         }

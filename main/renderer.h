@@ -26,6 +26,11 @@ void renderer_draw_pixel(uint16_t x, uint16_t y, uint16_t color);
 // último flush. Sin esto, lo dibujado no se ve.
 void renderer_flush(void);
 
+// Igual que renderer_flush(), pero con tope de bytes por llamada (lo
+// que no cabe se manda en los flush siguientes). Usar en el flush de
+// cada frame de juego; ver FLUSH_BUDGET_BYTES en st7789.h.
+void renderer_flush_limited(uint32_t max_bytes);
+
 // Como renderer_draw_pixel/fill_rect, pero para un bloque de
 // píxeles ya preparado (p.ej. un sprite): lo copia al framebuffer
 // en vez de mandarlo directo por SPI, para que respete el mismo

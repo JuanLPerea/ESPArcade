@@ -93,6 +93,11 @@
  * El framebuffer en RAM y la fuente 5x7 siguen siendo la misma
  * logica de siempre (C puro, no toca hardware).
  *
+ * DIFF POR TILES + PRESUPUESTO POR FLUSH (ver flush_tiles()): solo se
+ * transmiten los tiles de 8x8 cuyo contenido ha cambiado respecto a lo
+ * ultimo enviado, y st7789_flush_limited() acota los bytes por frame.
+ * La DMA ya no se drena al final de cada flush (ver drain_dma()).
+ *
  * Pines: SCK=18 MOSI=23 CS=5 DC=21 RST=22
  * =========================================================== */
 
@@ -102,7 +107,9 @@
 #define PIN_DC    21
 #define PIN_RST   22
 
-#define TFT_SPI_HOST SPI2_HOST
+// VSPI (SPI3_HOST): SCK=18/MOSI=23/CS=5 son sus pines nativos (IOMUX).
+// Con SPI2_HOST iban por la matriz de GPIO, que limita el reloj.
+#define TFT_SPI_HOST SPI3_HOST
 
 // Parametros que cambian segun el panel:
 //  - TFT_SPI_HZ:       el ILI9341 no aguanta 80 MHz. Si ves ruido o
@@ -306,56 +313,182 @@ static inline void copy_row_to_band(uint16_t *dst, const uint16_t *src, uint16_t
 #endif
 }
 
+// ---------------------------------------------------------
+// Estado de la DMA entre llamadas: bandas en vuelo (como mucho 2, una
+// por buffer) e indice del siguiente buffer a usar. Ya NO se drena al
+// final de cada rectangulo ni de cada flush: las ultimas bandas se
+// transmiten mientras el juego ya calcula el frame siguiente. Es
+// seguro porque la DMA lee de s_band_buf[], no del framebuffer.
+// Cualquier codigo que toque el panel por otra via (blit directo,
+// cambio de rotacion) debe llamar antes a drain_dma().
+// ---------------------------------------------------------
+static int s_buf_idx = 0;
+static int s_in_flight = 0;
+
+static void drain_dma(void) {
+    while (s_in_flight > 0) {
+        xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
+        s_in_flight--;
+    }
+}
+
 // Manda UN rectangulo (ya recortado a pantalla) en bandas de
-// FLUSH_BAND_ROWS filas, con doble buffer: como mucho 2 bandas en
-// vuelo a la vez (una por buffer), solo se espera de verdad cuando
-// hace falta reutilizar un buffer que la DMA todavia no ha
-// terminado de transmitir.
+// FLUSH_BAND_ROWS filas, con doble buffer ping-pong: solo se espera de
+// verdad cuando hace falta reutilizar un buffer que la DMA todavia no
+// ha terminado de transmitir.
 static void flush_one_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     uint16_t w = x1 - x0 + 1;
-    int buf_idx = 0;
-    int in_flight = 0;
 
     for (uint16_t band_y0 = y0; band_y0 <= y1; band_y0 += FLUSH_BAND_ROWS) {
         uint16_t rows = (band_y0 + FLUSH_BAND_ROWS - 1 <= y1)
                              ? FLUSH_BAND_ROWS
                              : (uint16_t)(y1 - band_y0 + 1);
 
-        if (in_flight == 2) {
+        if (s_in_flight == 2) {
             // Los 2 buffers estan ocupados -- espera a que el mas
-            // antiguo (el que estamos a punto de reescribir) haya
-            // terminado de verdad.
+            // antiguo (el que estamos a punto de reescribir) termine.
             xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
-            in_flight--;
+            s_in_flight--;
         }
 
-        uint16_t *buf = s_band_buf[buf_idx];
+        uint16_t *buf = s_band_buf[s_buf_idx];
         for (uint16_t r = 0; r < rows; r++) {
             uint32_t off = fb_index(x0, band_y0 + r);
             copy_row_to_band(&buf[(size_t)r * w], fb_ptr(off), w);
         }
 
         esp_lcd_panel_draw_bitmap(s_panel, x0, band_y0, x1 + 1, band_y0 + rows, buf);
-        in_flight++;
-        buf_idx ^= 1;
-    }
-
-    // Antes de volver, hay que asegurarse de que TODAS las bandas en
-    // vuelo de este rectangulo han terminado de verdad -- si no, el
-    // siguiente rectangulo (u otra llamada) podria pisar un buffer
-    // que la DMA todavia esta leyendo.
-    while (in_flight > 0) {
-        xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
-        in_flight--;
+        s_in_flight++;
+        s_buf_idx ^= 1;
     }
 }
 
-void st7789_flush(void) {
+/* ---------------------------------------------------------
+ * DIFF POR TILES + PRESUPUESTO DE BYTES POR FLUSH
+ *
+ * A 20 MHz el SPI mueve ~2,5 KB/ms: una pantalla entera son ~61 ms.
+ * Para no mandar lo que no ha cambiado, se guarda un hash por tile
+ * de 8x8 px de lo ULTIMO ENVIADO al panel (no hay RAM para una
+ * segunda copia del framebuffer, esto son ~8 KB). En cada flush solo
+ * se transmiten los tiles, dentro de las zonas sucias, cuyo hash
+ * difiere. Un HUD que se repinta igual, terreno plano, fondo negro...
+ * cuestan 0 bytes.
+ *
+ * st7789_flush_limited(budget) ademas limita los bytes de ese flush:
+ * lo que no cabe queda marcado TILE_PENDING y se manda en los
+ * siguientes flush (rotando la fila de inicio para no dejar sin
+ * actualizar siempre la parte baja). Asi, en escenas muy cargadas, lo
+ * que se ralentiza es el refresco de pantalla y NO el bucle del juego.
+ * st7789_flush() sigue enviando todo lo pendiente (pantallas de
+ * titulo, game over, menus...).
+ * --------------------------------------------------------- */
+#define TILE            8
+#define TILES_X         (320 / TILE)
+#define TILES_Y         (320 / TILE)      // retrato 240x320 llega a 40 filas
+#define TILE_VALID      0x01              // s_tile_hash coincide con lo que hay en pantalla
+#define TILE_PENDING    0x02              // hay que enviarlo
+
+#define RECT_OVERHEAD_BYTES 300           // coste fijo por rectangulo, en "bytes equivalentes"
+#define MERGE_GAP_TILES     2             // une tiles separados por hasta 2 huecos
+
+static uint32_t *s_tile_hash;             // heap_caps_calloc en st7789_init
+static uint8_t  *s_tile_flags;
+static int       s_rr_start = 0;          // fila por la que reanudar si se agota el presupuesto
+
+#define TPEND(tx, ty) (s_tile_flags[(ty) * TILES_X + (tx)] & TILE_PENDING)
+
+static void invalidate_tiles(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h) {
+    if (!s_tile_flags || w == 0 || h == 0) return;
+    for (int ty = y0 / TILE; ty <= (y0 + h - 1) / TILE && ty < TILES_Y; ty++)
+        for (int tx = x0 / TILE; tx <= (x0 + w - 1) / TILE && tx < TILES_X; tx++)
+            s_tile_flags[ty * TILES_X + tx] &= ~TILE_VALID;
+}
+
+// x multiplo de 8 y ancho par => cada fila del tile esta alineada a 4 bytes.
+static uint32_t tile_hash(int tx, int ty) {
+    uint32_t h = 2166136261u;
+    for (int r = 0; r < TILE; r++) {
+        const uint32_t *p = (const uint32_t *)fb_ptr(fb_index(tx * TILE, ty * TILE + r));
+        for (int i = 0; i < TILE / 2; i++) { h ^= p[i]; h *= 16777619u; }
+    }
+    return h;
+}
+
+// budget_bytes = 0 -> sin limite (envia todo lo pendiente).
+static void flush_tiles(uint32_t budget_bytes) {
+    int tw = TFT_WIDTH / TILE, th = TFT_HEIGHT / TILE;
+
+    // 1) Dentro de las zonas sucias, marca como pendientes los tiles que
+    //    realmente difieren de lo que hay en pantalla.
     for (int i = 0; i < s_dirty_count; i++) {
-        flush_one_rect(s_dirty[i].x0, s_dirty[i].y0, s_dirty[i].x1, s_dirty[i].y1);
+        for (int ty = s_dirty[i].y0 / TILE; ty <= s_dirty[i].y1 / TILE; ty++) {
+            for (int tx = s_dirty[i].x0 / TILE; tx <= s_dirty[i].x1 / TILE; tx++) {
+                int idx = ty * TILES_X + tx;
+                bool differs = !(s_tile_flags[idx] & TILE_VALID) ||
+                               tile_hash(tx, ty) != s_tile_hash[idx];
+                if (differs) s_tile_flags[idx] |= TILE_PENDING;
+                else         s_tile_flags[idx] &= ~TILE_PENDING;   // ya coincide
+            }
+        }
     }
     s_dirty_count = 0;
+
+    // 2) Envia pendientes agrupados en rectangulos, hasta agotar el presupuesto.
+    uint32_t spent = 0;
+    int stop_row = -1;
+    for (int n = 0; n < th && stop_row < 0; n++) {
+        int ty = (s_rr_start + n) % th;       // reparte la prioridad entre filas
+        for (int tx = 0; tx < tw; tx++) {
+            if (!TPEND(tx, ty)) continue;
+
+            // Extiende a la derecha saltando huecos pequenos: mandar 1-2
+            // tiles de relleno sale mas barato que otra transaccion aparte.
+            int end = tx;
+            for (int k = tx + 1; k < tw && k <= end + 1 + MERGE_GAP_TILES; k++)
+                if (TPEND(k, ty)) end = k;
+            int run = end - tx + 1;
+
+            // Extiende hacia abajo solo si TODAS las filas de abajo estan pendientes.
+            int rows = 1;
+            while (ty + rows < th) {
+                bool full = true;
+                for (int k = 0; k < run; k++)
+                    if (!TPEND(tx + k, ty + rows)) { full = false; break; }
+                if (!full) break;
+                rows++;
+            }
+
+            uint32_t row_bytes = (uint32_t)run * TILE * TILE * 2;
+            if (budget_bytes) {
+                if (spent > 0 && spent + row_bytes * rows + RECT_OVERHEAD_BYTES > budget_bytes) {
+                    stop_row = ty;
+                    break;
+                }
+                // Un rectangulo enorme tampoco debe saltarse el presupuesto.
+                uint32_t max_rows = (budget_bytes > RECT_OVERHEAD_BYTES)
+                                  ? (budget_bytes - RECT_OVERHEAD_BYTES) / row_bytes : 1;
+                if (max_rows < 1) max_rows = 1;
+                if ((uint32_t)rows > max_rows) rows = (int)max_rows;
+            }
+            spent += row_bytes * rows + RECT_OVERHEAD_BYTES;
+
+            for (int r = 0; r < rows; r++)
+                for (int k = 0; k < run; k++) {
+                    int idx = (ty + r) * TILES_X + tx + k;
+                    s_tile_hash[idx]  = tile_hash(tx + k, ty + r);
+                    s_tile_flags[idx] = (s_tile_flags[idx] | TILE_VALID) & ~TILE_PENDING;
+                }
+
+            flush_one_rect(tx * TILE, ty * TILE,
+                           (tx + run) * TILE - 1, (ty + rows) * TILE - 1);
+            tx = end;
+        }
+    }
+    s_rr_start = (stop_row >= 0) ? stop_row : 0;
 }
+
+void st7789_flush(void)                   { flush_tiles(0); }
+void st7789_flush_limited(uint32_t bytes) { flush_tiles(bytes); }
 
 void st7789_fill_screen(uint16_t color) {
     if (color == COLOR_BLACK || color == COLOR_WHITE) {
@@ -550,6 +683,8 @@ uint16_t st7789_text_width(const char *str, uint8_t scale) {
  * transmitirse.
  * --------------------------------------------------------- */
 void st7789_blit(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_t *buf) {
+    drain_dma();                          // este blit espera semaforo por banda
+    invalidate_tiles(x0, y0, w, h);       // escribe al panel sin pasar por el framebuffer
 #if TFT_SWAP_BYTES
     // El buffer del llamador esta en RGB565 nativo: hay que pasarlo
     // por el buffer de banda (con los bytes intercambiados) en
@@ -586,6 +721,37 @@ void st7789_set_rotation(uint8_t rotation) {
     // recuperamos swap_xy para probar apaisado de verdad -- antes
     // no podiamos saber si el gap/swap_xy fallaban por si mismos o
     // por la corrupcion de fondo que lo enmascaraba todo.
+    drain_dma();   // no cambiar la orientacion con bandas aun en vuelo
+#if TFT_PANEL == TFT_PANEL_ILI9341
+    // ILI9341: cada flag de MADCTL (MV=swap_xy, MX/MY=mirror) es un
+    // reflejo, asi que una imagen SIN espejo necesita siempre un numero
+    // IMPAR de flags activos (la apaisada que ya funciona, rotation 1, es
+    // swap+mirror(true,true) = 3 flags). Las verticales de antes
+    // (mirror(true,true) y mirror(false,false)) tenian 2 y 0 flags: salian
+    // reflejadas en este panel. Aqui cada par esta a 180 grados del otro.
+    switch (rotation & 0x03) {
+        case 0:   // vertical
+            esp_lcd_panel_swap_xy(s_panel, false);
+            esp_lcd_panel_mirror(s_panel, false, true);
+            st7789_screen_w = 240; st7789_screen_h = 320;
+            break;
+        case 1:   // apaisada (la que usan menu y juegos)
+            esp_lcd_panel_swap_xy(s_panel, true);
+            esp_lcd_panel_mirror(s_panel, true, true);
+            st7789_screen_w = 320; st7789_screen_h = 240;
+            break;
+        case 2:   // vertical, 180 grados respecto a 0 (la que usa Pac-Man)
+            esp_lcd_panel_swap_xy(s_panel, false);
+            esp_lcd_panel_mirror(s_panel, true, false);
+            st7789_screen_w = 240; st7789_screen_h = 320;
+            break;
+        default:  // 3: apaisada, 180 grados respecto a 1
+            esp_lcd_panel_swap_xy(s_panel, true);
+            esp_lcd_panel_mirror(s_panel, false, false);
+            st7789_screen_w = 320; st7789_screen_h = 240;
+            break;
+    }
+#else
     switch (rotation & 0x03) {
         case 0:
             esp_lcd_panel_swap_xy(s_panel, false);
@@ -608,13 +774,18 @@ void st7789_set_rotation(uint8_t rotation) {
             st7789_screen_w = 320; st7789_screen_h = 240;
             break;
     }
+#endif
+    // Todo lo que hay en pantalla deja de ser valido al cambiar de
+    // orientacion (el guard es porque init la llama antes de reservar).
+    if (s_tile_flags) memset(s_tile_flags, 0, TILES_X * TILES_Y);
+    mark_dirty(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);
 }
 
 void st7789_init(void) {
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_SCK,
         .mosi_io_num = PIN_MOSI,
-        .miso_io_num = 15,
+        .miso_io_num = -1,   // solo escritura (pon 19 si quieres leer el ID del panel)
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = 320 * FLUSH_BAND_ROWS * sizeof(uint16_t),
@@ -630,7 +801,7 @@ void st7789_init(void) {
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
-        .trans_queue_depth = 10,
+        .trans_queue_depth = 20,   // 2 bandas en vuelo x varias transacciones cada una
         .on_color_trans_done = on_color_trans_done,
         .user_ctx = NULL,
     };
@@ -685,7 +856,10 @@ void st7789_init(void) {
                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         fflush(stdout);
     }
-    assert(ok && "st7789: sin RAM suficiente para framebuffer/band buffers");
+    s_tile_hash  = heap_caps_calloc(TILES_X * TILES_Y, sizeof(uint32_t), MALLOC_CAP_8BIT);
+    s_tile_flags = heap_caps_calloc(TILES_X * TILES_Y, 1, MALLOC_CAP_8BIT);
+    if (!s_tile_hash || !s_tile_flags) { printf("[st7789] FALLO: tiles NULL\n"); ok = false; }
+    assert(ok && "st7789: sin RAM suficiente para framebuffer/band buffers/tiles");
 
     for (int i = 0; i < FB_CHUNKS; i++)
         memset(fb_chunk[i], 0, FB_CHUNK_PIXELS * sizeof(uint16_t));

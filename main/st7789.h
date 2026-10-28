@@ -43,6 +43,19 @@ void st7789_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
  * transmite el rectangulo que ha cambiado desde el flush anterior.
  * ----------------------------------------------------------- */
 void st7789_flush(void);
+
+// Como st7789_flush(), pero transmite como mucho ~max_bytes en esta
+// llamada. Lo que no cabe queda pendiente y se manda en los siguientes
+// flush. Pensado para el flush de cada frame de juego: con un SPI
+// lento, en escenas cargadas se ralentiza el refresco de pantalla en
+// vez de todo el bucle del juego. Las pantallas de titulo/menus deben
+// seguir usando st7789_flush() (envia todo).
+void st7789_flush_limited(uint32_t max_bytes);
+
+// Presupuesto recomendado por frame de juego: ~10 ms de SPI a 20 MHz.
+// Ajustalo entre 18000 (si el juego va a trompicones) y 32000 (si ves
+// la pantalla "a tirones" en las explosiones grandes).
+#define FLUSH_BUDGET_BYTES 24000
 void st7789_fill_screen(uint16_t color);
 void st7789_draw_pixel(uint16_t x, uint16_t y, uint16_t color);
 void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);

@@ -379,7 +379,7 @@ static EnemyBullet enemy_bullets[MAX_ENEMY_BULLETS];
 // partículas solapadas (ver boss_boom_ticks en scr_tick()) y con 48
 // se agotaba el pool enseguida, así que las oleadas siguientes se
 // quedaban sin partículas y la explosión se veía pobre.
-#define MAX_PARTICLES 110
+#define MAX_PARTICLES 64
 
 typedef struct { bool active; float x,y,vx,vy; int life; uint16_t color; } Particle;
 static Particle particles[MAX_PARTICLES];
@@ -391,7 +391,7 @@ typedef enum { BOOM_SMALL, BOOM_BIG, BOOM_HUGE } boom_size_t;
 
 static void add_explosion_sz(float x, float y, boom_size_t sz) {
     static const uint16_t pcolors[4] = { COLOR_WHITE, COLOR_YELLOW, COLOR_RED, COLOR_CYAN };
-    int count = (sz==BOOM_HUGE) ? 34 : (sz==BOOM_BIG) ? 40 : 8;
+    int count = (sz==BOOM_HUGE) ? 22 : (sz==BOOM_BIG) ? 24 : 5;
     int created = 0;
     for (int i=0;i<MAX_PARTICLES && created<count;i++) {
         if (particles[i].active) continue;
@@ -745,10 +745,27 @@ static void damage_object(int idx) {
     if (gobjs[idx].type == OBJ_METEOR) return;   // indestructible, sólo se esquiva
 
     gobjs[idx].hp--;
-    int sx = PLAY_X + (int)(gobjs[idx].world_x - scroll_px) + OBJ_W/2;
-    int fh = floor_h_for(gobjs[idx].world_x, zone);
-    int sy = (gobjs[idx].base_y > 0.5f) ? (int)gobjs[idx].base_y
-                                        : (PLAY_Y+PLAY_H-1-fh-OBJ_H+OBJ_H/2);
+    // Posicion del CENTRO del objeto, calculada igual que lo dibuja
+    // draw_objects(): antes el cohete explotaba siempre en el suelo
+    // (se ignoraba rel_y, lo que ha subido tras despegar) y el OVNI en
+    // su altura base (sin la oscilacion).
+    GroundObj *o = &gobjs[idx];
+    int sx = PLAY_X + (int)(o->world_x - scroll_px);
+    int sy;
+    if (o->type == OBJ_UFO) {
+        int fh = floor_h_for(o->world_x, zone);
+        int ch = ceil_h_for(o->world_x, zone);
+        int ground_top  = PLAY_Y+PLAY_H-1-fh;
+        int ceil_bottom = PLAY_Y+1+ch;
+        float ft = clampf(o->base_y + sinf(o->t+o->phase)*o->amp,
+                          (float)(ceil_bottom+4), (float)(ground_top-OBJ_H-4));
+        sy = (int)ft + OBJ_H/2;
+        sx += (int)(sinf((o->t+o->phase)*2.0f) * (o->amp*0.9f));
+    } else {
+        int fh = floor_h_for(o->world_x + OBJ_W/2, zone);
+        sy = (PLAY_Y + PLAY_H - fh - OBJ_H) - (int)o->rel_y + OBJ_H/2;
+    }
+    sx += OBJ_W/2;
 
     if (gobjs[idx].hp <= 0) {
         uint8_t type = gobjs[idx].type;
@@ -1460,7 +1477,10 @@ static void draw_playing_frame(void) {
     draw_hud();
     draw_zone_banner();
     draw_extra_life_banner();
-    renderer_flush();
+    // Flush con presupuesto de bytes: a 20 MHz de SPI, si hay muchas
+    // particulas/disparos lo que no cabe se manda en el frame siguiente
+    // en vez de frenar el bucle del juego.
+    renderer_flush_limited(FLUSH_BUDGET_BYTES);
 }
 
 // ---------------------------------------------------------------------------

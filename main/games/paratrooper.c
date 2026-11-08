@@ -476,18 +476,22 @@ static bool chit(int ax, int ay, int ra, int bx, int by, int rb) {
 // píxeles entre dos ticks y "saltarse" un objetivo pequeño sin que
 // chit() (que solo mira la posición final) llegue a verlo.
 static bool seg_hit(int x0, int y0, int x1, int y1, int cx, int cy, int r) {
-    long vx = x1-x0, vy = y1-y0;
-    long wx = cx-x0, wy = cy-y0;
-    long len2 = vx*vx + vy*vy;
-    long t256 = 0;                                   // punto más cercano, en 1/256
+    // OJO: int64_t, no long. En ESP32 (Xtensa) long son 32 bits y dx*dx+dy*dy
+    // (en 1/256 px) se desborda a partir de ~180 px de distancia, dando un
+    // valor negativo que pasaba el "<= r256^2": bombas "alcanzadas" por balas
+    // que estaban lejos.
+    int64_t vx = x1-x0, vy = y1-y0;
+    int64_t wx = cx-x0, wy = cy-y0;
+    int64_t len2 = vx*vx + vy*vy;
+    int64_t t256 = 0;                                // punto más cercano, en 1/256
     if (len2 > 0) {
         t256 = (wx*vx + wy*vy) * 256 / len2;
         if (t256 < 0)   t256 = 0;
         if (t256 > 256) t256 = 256;
     }
-    long qx = x0*256L + vx*t256, qy = y0*256L + vy*t256;   // en 1/256 px
-    long dx = cx*256L - qx,      dy = cy*256L - qy;
-    long r256 = r*256L;
+    int64_t qx = x0*256LL + vx*t256, qy = y0*256LL + vy*t256;   // en 1/256 px
+    int64_t dx = cx*256LL - qx,      dy = cy*256LL - qy;
+    int64_t r256 = r*256LL;
     return dx*dx + dy*dy <= r256*r256;
 }
 static int count_paras_air(void) {
@@ -774,8 +778,8 @@ static void player_fire(void) {
         bullets[i].active = true;
         bullets[i].x = PX2FP(tip_x); bullets[i].y = PX2FP(tip_y);
         bullets[i].px = bullets[i].x; bullets[i].py = bullets[i].y;
-        bullets[i].vx = (int32_t)BULLET_SPD*dx/256*FP;
-        bullets[i].vy = (int32_t)BULLET_SPD*dy/256*FP;
+        bullets[i].vx = (int32_t)BULLET_SPD*dx;
+        bullets[i].vy = (int32_t)BULLET_SPD*dy;
         if (score > 0) score--;
         sound_effect_shoot();
         return;
@@ -1238,7 +1242,7 @@ static void check_collisions(void) {
         for (int pi=0; pi<MAX_PLANES; pi++) {
             Plane *pl = &planes[pi];
             if (!pl->active) continue;
-            if (chit(bx,by,3,FP2PX(pl->x),FP2PX(pl->y),9)) {
+            if (seg_hit(FP2PX(bu->px), FP2PX(bu->py), bx, by, FP2PX(pl->x), FP2PX(pl->y), 12)) {
                 bu->active = pl->active = false;
                 spawn_expl(FP2PX(pl->x),FP2PX(pl->y),14,5,26);
                 score += PTS_PLANE; sound_effect_explosion();

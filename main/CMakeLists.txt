@@ -22,6 +22,7 @@ idf_component_register(
         "games/paratrooper.c"
         "games/frogger.c"
         "games/tetris.c"
+        "games/commando.c"
         "ArcadeColor.c"
     INCLUDE_DIRS
         "."

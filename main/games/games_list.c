@@ -12,6 +12,7 @@
 #include "paratrooper.h"
 #include "frogger.h"
 #include "tetris.h"
+#include "commando.h"
 
 const game_entry_t games_list[NUM_GAMES] = {
     { "PONG",           game_pong_run },
@@ -26,4 +27,5 @@ const game_entry_t games_list[NUM_GAMES] = {
     { "PARATROOPER",    game_paratrooper_run },
     { "FROGGER",        game_frogger_run },
     { "TETRIS",         game_tetris_run },
+    { "COMMANDO",         game_commando_run },
 };

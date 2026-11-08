@@ -127,7 +127,7 @@
   #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_RGB
   #define TFT_SWAP_BYTES      0
 #elif TFT_PANEL == TFT_PANEL_ILI9341
-  #define TFT_SPI_HZ          (20 * 1000 * 1000)
+  #define TFT_SPI_HZ          (27 * 1000 * 1000)
   #define TFT_INVERT_COLORS   false
   #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_BGR
   #define TFT_SWAP_BYTES      1

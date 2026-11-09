@@ -11,6 +11,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "driver/gpio.h"
 
 /* ===========================================================
  * SELECCION DE PANEL -- cambia SOLO esta constante:
@@ -30,6 +31,27 @@
 
 #if TFT_PANEL == TFT_PANEL_ILI9341
 #include "esp_lcd_ili9341.h"
+#endif
+
+/* ===========================================================
+ * VOLCADO RAPIDO (TFT_FAST_FLUSH) -- por defecto solo con ILI9341.
+ *
+ *   1 = el volcado de pixeles NO pasa por esp_lcd: se encolan
+ *       transacciones directamente en el bus SPI (ver "VOLCADO
+ *       RAPIDO" mas abajo). esp_lcd solo se usa en el arranque para
+ *       la secuencia de init del panel.
+ *   0 = comportamiento anterior (esp_lcd_panel_draw_bitmap).
+ *
+ * Si algo va mal (imagen rara, cuelgue al arrancar), pon aqui 0 --
+ * o pasa -DTFT_FAST_FLUSH=0 desde CMake -- y vuelves al camino que
+ * ya funcionaba.
+ * =========================================================== */
+#ifndef TFT_FAST_FLUSH
+#if TFT_PANEL == TFT_PANEL_ILI9341
+#define TFT_FAST_FLUSH 1
+#else
+#define TFT_FAST_FLUSH 0
+#endif
 #endif
 
 /* ===========================================================
@@ -98,6 +120,16 @@
  * ultimo enviado, y st7789_flush_limited() acota los bytes por frame.
  * La DMA ya no se drena al final de cada flush (ver drain_dma()).
  *
+ * VOLCADO RAPIDO (TFT_FAST_FLUSH, ver mas abajo): medido en la
+ * practica, con unos 54 rectangulos por frame cada esp_lcd_panel_draw_bitmap()
+ * costaba ~0.3 ms ademas de los datos (3 transacciones por llamada: columna,
+ * pagina y escritura, y el io de esp_lcd espera a que acabe la DMA anterior
+ * antes de enviar los parametros) -- la mitad del tiempo de flush. Ahora
+ * cada rectangulo son 6 transacciones encoladas SIN esperas, los pixeles
+ * salen de una cola circular de "slots" y flush() vuelve en cuanto lo ha
+ * encolado: la DMA sigue transmitiendo mientras el juego calcula y dibuja el
+ * frame siguiente.
+ *
  * Pines: SCK=18 MOSI=23 CS=5 DC=21 RST=22
  * =========================================================== */
 
@@ -127,6 +159,7 @@
   #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_RGB
   #define TFT_SWAP_BYTES      0
 #elif TFT_PANEL == TFT_PANEL_ILI9341
+  // 27 MHz = 80/3 = 26.67 MHz reales. 40 MHz no da imagen en esta placa.
   #define TFT_SPI_HZ          (27 * 1000 * 1000)
   #define TFT_INVERT_COLORS   false
   #define TFT_RGB_ORDER       LCD_RGB_ELEMENT_ORDER_BGR
@@ -313,6 +346,192 @@ static inline void copy_row_to_band(uint16_t *dst, const uint16_t *src, uint16_t
 #endif
 }
 
+#if TFT_FAST_FLUSH
+/* ---------------------------------------------------------
+ * VOLCADO RAPIDO: transacciones SPI directas, sin esperas.
+ *
+ * Cada rectangulo = 6 transacciones en cola:
+ *   0x2A (comando) + 4 bytes (columnas) | 0x2B + 4 bytes (filas) |
+ *   0x2C (escritura) + pixeles (1 o mas transacciones, una por slot)
+ * El pin DC lo pone el callback pre_cb segun trans->user (0 = comando,
+ * 1 = datos). Las de comando/parametros usan tx_data (van dentro de la
+ * propia estructura, sin buffer).
+ *
+ * Los pixeles se copian (con el cambio de bytes) a "slots" de 8 KB
+ * troceados de los dos buffers de banda de siempre (49152 B de 51200).
+ * Una cola circular de FX_POOL transacciones y otra de FX_SLOTS slots:
+ * como el bus las completa EN ORDEN, liberar la mas antigua libera el
+ * slot mas antiguo. Solo se espera (reap) cuando se agotan.
+ *
+ * flush() NO espera a que termine la DMA -- el siguiente frame sigue
+ * calculandose mientras sale el actual. Quien toque el bus de otra forma
+ * (registros, rotacion) debe llamar antes a drain_dma().
+ * --------------------------------------------------------- */
+#define FX_SLOT_BYTES      8192
+#define FX_SLOTS_PER_BUF   ((FLUSH_BAND_ROWS * 320 * 2) / FX_SLOT_BYTES)    /* 3 */
+#define FX_SLOTS           (2 * FX_SLOTS_PER_BUF)                             /* 6 */
+#define FX_POOL            40          /* transacciones en cola como maximo */
+
+_Static_assert(FX_SLOTS_PER_BUF >= 1, "banda demasiado pequena para un slot");
+_Static_assert(FX_SLOT_BYTES >= 320 * 2, "un slot tiene que caber una fila de 320 px");
+
+typedef struct {
+    spi_transaction_t t;               // DEBE ser el primer campo (container_of)
+    int8_t            slot;            // slot de pixeles que libera al completarse, o -1
+} fx_trans_t;
+
+static spi_device_handle_t s_spi;
+static fx_trans_t s_tx[FX_POOL];
+static int s_tx_head  = 0;             // siguiente estructura libre
+static int s_tx_count = 0;             // transacciones en cola/en vuelo
+static int s_slot_head = 0;            // siguiente slot a usar
+static int s_slots_free = FX_SLOTS;
+
+static void IRAM_ATTR fx_pre_cb(spi_transaction_t *t) {
+    gpio_set_level(PIN_DC, (int)(intptr_t)t->user);
+}
+
+static inline uint16_t *fx_slot_ptr(int i) {
+    return (uint16_t *)((uint8_t *)s_band_buf[i / FX_SLOTS_PER_BUF] +
+                        (size_t)(i % FX_SLOTS_PER_BUF) * FX_SLOT_BYTES);
+}
+
+// Espera a que termine la transaccion MAS ANTIGUA y recupera sus recursos.
+static void fx_reap_one(void) {
+    spi_transaction_t *done = NULL;
+    ESP_ERROR_CHECK(spi_device_get_trans_result(s_spi, &done, portMAX_DELAY));
+    fx_trans_t *ft = (fx_trans_t *)done;
+    if (ft->slot >= 0) s_slots_free++;
+    s_tx_count--;
+}
+
+static void drain_dma(void) {
+    while (s_tx_count > 0) fx_reap_one();
+}
+
+// Estructura de transaccion libre (limpia). Si la cola esta llena, espera.
+static fx_trans_t *fx_get(void) {
+    while (s_tx_count >= FX_POOL) fx_reap_one();
+    fx_trans_t *ft = &s_tx[s_tx_head];
+    s_tx_head = (s_tx_head + 1) % FX_POOL;
+    memset(ft, 0, sizeof(*ft));
+    ft->slot = -1;
+    return ft;
+}
+
+static void fx_queue(fx_trans_t *ft) {
+    ESP_ERROR_CHECK(spi_device_queue_trans(s_spi, &ft->t, portMAX_DELAY));
+    s_tx_count++;
+}
+
+static void fx_cmd(uint8_t cmd) {
+    fx_trans_t *ft = fx_get();
+    ft->t.length = 8;
+    ft->t.flags = SPI_TRANS_USE_TXDATA;
+    ft->t.tx_data[0] = cmd;
+    ft->t.user = (void *)0;            // DC = 0
+    fx_queue(ft);
+}
+
+static void fx_data4(uint16_t a, uint16_t b) {
+    fx_trans_t *ft = fx_get();
+    ft->t.length = 32;
+    ft->t.flags = SPI_TRANS_USE_TXDATA;
+    ft->t.tx_data[0] = (uint8_t)(a >> 8);
+    ft->t.tx_data[1] = (uint8_t)a;
+    ft->t.tx_data[2] = (uint8_t)(b >> 8);
+    ft->t.tx_data[3] = (uint8_t)b;
+    ft->t.user = (void *)1;            // DC = 1
+    fx_queue(ft);
+}
+
+// Ventana de escritura (inclusive) y comando de escritura de memoria.
+static void fx_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    fx_cmd(0x2A); fx_data4(x0, x1);
+    fx_cmd(0x2B); fx_data4(y0, y1);
+    fx_cmd(0x2C);
+}
+
+// Reserva el siguiente slot de pixeles (espera si estan todos en vuelo).
+static uint16_t *fx_slot_acquire(int *idx) {
+    while (s_slots_free == 0) fx_reap_one();
+    *idx = s_slot_head;
+    s_slot_head = (s_slot_head + 1) % FX_SLOTS;
+    s_slots_free--;
+    return fx_slot_ptr(*idx);
+}
+
+static void fx_queue_pixels(uint16_t *buf, int slot, size_t npx) {
+    fx_trans_t *ft = fx_get();
+    ft->t.length = npx * 16;           // en bits
+    ft->t.tx_buffer = buf;
+    ft->t.user = (void *)1;
+    ft->slot = (int8_t)slot;
+    fx_queue(ft);
+}
+
+// Registro de configuracion (<= 4 parametros), sincrono. Vacia la cola antes.
+static void fx_reg(uint8_t cmd, const uint8_t *p, int n) {
+    drain_dma();
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = cmd;
+    t.user = (void *)0;
+    ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
+    if (n > 0) {
+        memset(&t, 0, sizeof(t));
+        t.length = (size_t)n * 8;
+        t.flags = SPI_TRANS_USE_TXDATA;
+        for (int i = 0; i < n && i < 4; i++) t.tx_data[i] = p[i];
+        t.user = (void *)1;
+        ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
+    }
+}
+
+// Manda UN rectangulo del framebuffer (ya recortado a pantalla).
+static void flush_one_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    uint16_t w = x1 - x0 + 1;
+    uint16_t rows_per_slot = (uint16_t)(FX_SLOT_BYTES / ((size_t)w * 2));
+
+    fx_set_window(x0, y0, x1, y1);
+    for (uint16_t y = y0; y <= y1; y = (uint16_t)(y + rows_per_slot)) {
+        uint16_t rows = (y + rows_per_slot - 1 <= y1) ? rows_per_slot : (uint16_t)(y1 - y + 1);
+        int slot;
+        uint16_t *buf = fx_slot_acquire(&slot);
+        for (uint16_t r = 0; r < rows; r++)
+            copy_row_to_band(&buf[(size_t)r * w], fb_ptr(fb_index(x0, (uint16_t)(y + r))), w);
+        fx_queue_pixels(buf, slot, (size_t)rows * w);
+    }
+}
+
+// Toma el control del bus: elimina el io de esp_lcd (que ya hizo el init)
+// y crea nuestro propio dispositivo SPI con el mismo CS.
+static void fx_take_over(void) {
+    ESP_ERROR_CHECK(esp_lcd_panel_io_del(s_io));
+    s_io = NULL;                       // s_panel ya no se puede usar a partir de aqui
+
+    gpio_config_t dc = {
+        .pin_bit_mask = 1ULL << PIN_DC,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&dc));
+
+    spi_device_interface_config_t dev = {
+        .clock_speed_hz = TFT_SPI_HZ,
+        .mode = 0,
+        .spics_io_num = PIN_CS,
+        .queue_size = FX_POOL,
+        .pre_cb = fx_pre_cb,
+    };
+    ESP_ERROR_CHECK(spi_bus_add_device(TFT_SPI_HOST, &dev, &s_spi));
+}
+
+#else  /* !TFT_FAST_FLUSH: camino original con esp_lcd_panel_draw_bitmap */
 // ---------------------------------------------------------
 // Estado de la DMA entre llamadas: bandas en vuelo (como mucho 2, una
 // por buffer) e indice del siguiente buffer a usar. Ya NO se drena al
@@ -362,6 +581,8 @@ static void flush_one_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
         s_buf_idx ^= 1;
     }
 }
+
+#endif /* TFT_FAST_FLUSH */
 
 /* ---------------------------------------------------------
  * DIFF POR TILES + PRESUPUESTO DE BYTES POR FLUSH
@@ -683,8 +904,24 @@ uint16_t st7789_text_width(const char *str, uint8_t scale) {
  * transmitirse.
  * --------------------------------------------------------- */
 void st7789_blit(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_t *buf) {
-    drain_dma();                          // este blit espera semaforo por banda
     invalidate_tiles(x0, y0, w, h);       // escribe al panel sin pasar por el framebuffer
+#if TFT_FAST_FLUSH
+    // Se copia a los slots (con el cambio de bytes), asi que el buffer del
+    // llamador ya se puede reutilizar al volver; el orden respecto al resto
+    // de volcados lo garantiza la cola (FIFO).
+    if (w == 0 || h == 0 || w > 320) return;
+    uint16_t rows_per = (uint16_t)(FX_SLOT_BYTES / ((size_t)w * 2));
+    fx_set_window(x0, y0, (uint16_t)(x0 + w - 1), (uint16_t)(y0 + h - 1));
+    for (uint16_t y = 0; y < h; y = (uint16_t)(y + rows_per)) {
+        uint16_t n = (h - y < rows_per) ? (uint16_t)(h - y) : rows_per;
+        int slot;
+        uint16_t *dst = fx_slot_acquire(&slot);
+        for (uint16_t r = 0; r < n; r++)
+            copy_row_to_band(&dst[(size_t)r * w], buf + (size_t)(y + r) * w, w);
+        fx_queue_pixels(dst, slot, (size_t)n * w);
+    }
+#else
+    drain_dma();                          // este blit espera semaforo por banda
 #if TFT_SWAP_BYTES
     // El buffer del llamador esta en RGB565 nativo: hay que pasarlo
     // por el buffer de banda (con los bytes intercambiados) en
@@ -702,6 +939,7 @@ void st7789_blit(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_
     esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x0 + w, y0 + h, buf);
     xSemaphoreTake(s_color_done_sem, portMAX_DELAY);
 #endif
+#endif /* TFT_FAST_FLUSH */
 }
 
 void st7789_blit_to_buffer(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_t *buf) {
@@ -714,6 +952,22 @@ void st7789_blit_to_buffer(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, con
         memcpy(fb_ptr(offset), buf + (uint32_t)row * w, (size_t)w * sizeof(uint16_t));
     }
     mark_dirty(x0, y0, x0 + w - 1, y0 + h - 1);
+}
+
+// Orientacion del panel (swap_xy + espejos). Con volcado rapido se escribe
+// MADCTL (0x36) a mano -- mismos bits que usa esp_lcd: MV=0x20 (swap),
+// MX=0x40, MY=0x80, BGR=0x08 -- porque el io de esp_lcd ya no existe.
+static void panel_orient(bool swap, bool mx, bool my) {
+#if TFT_FAST_FLUSH
+    uint8_t m = (TFT_RGB_ORDER == LCD_RGB_ELEMENT_ORDER_BGR) ? 0x08 : 0x00;
+    if (swap) m |= 0x20;
+    if (mx)   m |= 0x40;
+    if (my)   m |= 0x80;
+    fx_reg(0x36, &m, 1);
+#else
+    esp_lcd_panel_swap_xy(s_panel, swap);
+    esp_lcd_panel_mirror(s_panel, mx, my);
+#endif
 }
 
 void st7789_set_rotation(uint8_t rotation) {
@@ -731,46 +985,38 @@ void st7789_set_rotation(uint8_t rotation) {
     // reflejadas en este panel. Aqui cada par esta a 180 grados del otro.
     switch (rotation & 0x03) {
         case 0:   // vertical
-            esp_lcd_panel_swap_xy(s_panel, false);
-            esp_lcd_panel_mirror(s_panel, false, true);
+            panel_orient(false, false, true);
             st7789_screen_w = 240; st7789_screen_h = 320;
             break;
         case 1:   // apaisada (la que usan menu y juegos)
-            esp_lcd_panel_swap_xy(s_panel, true);
-            esp_lcd_panel_mirror(s_panel, true, true);
+            panel_orient(true, true, true);
             st7789_screen_w = 320; st7789_screen_h = 240;
             break;
         case 2:   // vertical, 180 grados respecto a 0 (la que usa Pac-Man)
-            esp_lcd_panel_swap_xy(s_panel, false);
-            esp_lcd_panel_mirror(s_panel, true, false);
+            panel_orient(false, true, false);
             st7789_screen_w = 240; st7789_screen_h = 320;
             break;
         default:  // 3: apaisada, 180 grados respecto a 1
-            esp_lcd_panel_swap_xy(s_panel, true);
-            esp_lcd_panel_mirror(s_panel, false, false);
+            panel_orient(true, false, false);
             st7789_screen_w = 320; st7789_screen_h = 240;
             break;
     }
 #else
     switch (rotation & 0x03) {
         case 0:
-            esp_lcd_panel_swap_xy(s_panel, false);
-            esp_lcd_panel_mirror(s_panel, true, true);
+            panel_orient(false, true, true);
             st7789_screen_w = 240; st7789_screen_h = 320;
             break;
         case 1:
-            esp_lcd_panel_swap_xy(s_panel, true);
-            esp_lcd_panel_mirror(s_panel, true, true);
+            panel_orient(true, true, true);
             st7789_screen_w = 320; st7789_screen_h = 240;
             break;
         case 2:
-            esp_lcd_panel_swap_xy(s_panel, false);
-            esp_lcd_panel_mirror(s_panel, false, false);
+            panel_orient(false, false, false);
             st7789_screen_w = 240; st7789_screen_h = 320;
             break;
         default: // 3
-            esp_lcd_panel_swap_xy(s_panel, true);
-            esp_lcd_panel_mirror(s_panel, false, true);
+            panel_orient(true, false, true);
             st7789_screen_w = 320; st7789_screen_h = 240;
             break;
     }
@@ -825,6 +1071,7 @@ void st7789_init(void) {
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
     uint8_t id[4] = {0};
+    (void)id;                              // solo lo usa el bloque DEBUG de abajo
 
 // DEBUG: leer ID del panel y mostrarlo por consola
 //   esp_lcd_panel_io_rx_param(s_io, 0x04, id, 4);   // RDDID
@@ -834,8 +1081,16 @@ void st7789_init(void) {
 
     esp_lcd_panel_invert_color(s_panel, TFT_INVERT_COLORS);
     esp_lcd_panel_set_gap(s_panel, 0, 0);
+#if TFT_FAST_FLUSH
+    // A partir de aqui el bus es nuestro: rotacion y DISPON van por fx_reg().
+    // (s_band_buf[] se reserva mas abajo, pero fx_reg() no lo usa.)
+    fx_take_over();
+    st7789_set_rotation(TFT_INITIAL_ROTATION);
+    fx_reg(0x29, NULL, 0);                 // DISPON
+#else
     st7789_set_rotation(TFT_INITIAL_ROTATION);
     esp_lcd_panel_disp_on_off(s_panel, true);
+#endif
 
     // Framebuffer en FB_CHUNKS trozos (ver comentario en su declaración)
     // y ANTES que s_band_buf[]: los trozos son los que más espacio

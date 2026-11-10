@@ -42,6 +42,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "commando.h"
+#include "commando_title.h"
 #include "../renderer.h"
 #include "../controls.h"
 #include "../sound.h"
@@ -266,7 +267,7 @@ static int path_half(int y)
 /* ---------------------------------------------------------
  * Estado del juego
  * --------------------------------------------------------- */
-typedef enum { ST_TITLE, ST_PLAYING, ST_GAMEOVER } GameState;
+typedef enum { ST_TITLE, ST_PLAYING, ST_GAMEOVER, ST_WIN } GameState;
 
 typedef struct {
     int32_t x, y;            /* esquina superior izquierda, Q8 */
@@ -287,7 +288,7 @@ typedef struct {
     int32_t x, y;            /* Q8, mundo */
     int32_t vx, vy;          /* Q8 por paso */
     int     life;
-    uint16_t rolled;         /* soldados que ya intentaron esquivarla */
+    uint32_t rolled;         /* soldados que ya intentaron esquivarla */
 } Bullet;
 
 static GameState state;
@@ -311,11 +312,11 @@ static int cam_px(void) { return UNFX(cam_q8); }
  * muerte/respawn, objetos. Medidas del HTML * 0.625 (px/paso ya escalados).
  * La IA usa float (el ESP32 tiene FPU).
  * ========================================================= */
-#define MAX_ENEMIES   12
+#define MAX_ENEMIES   32
 #define MAX_EBULLETS  12
 #define MAX_GRENADES  8
 #define MAX_EXPL      10
-#define MAX_OBS       56
+#define MAX_OBS       72
 #define MAX_ITEMS     16
 #define EW            12             /* tamaño del soldado */
 #define EH            15
@@ -324,7 +325,7 @@ static int cam_px(void) { return UNFX(cam_q8); }
 #define DEATH_STEPS   110
 #define INVULN_STEPS  150
 
-typedef enum { OB_SANDBAG, OB_ROCK, OB_TREE, OB_TENT, OB_HOUSE, OB_BARRACKS, OB_BUILDING, OB_BUNKER, OB_RUBBLE } ObType;
+typedef enum { OB_SANDBAG, OB_ROCK, OB_TREE, OB_TENT, OB_HOUSE, OB_BARRACKS, OB_BUILDING, OB_BUNKER, OB_FORT, OB_GATE, OB_BRIDGE, OB_RUBBLE, OB_WATER } ObType;
 typedef struct { int16_t x, y, w, h; uint8_t type, v; int8_t hp, maxhp; } Obstacle;   /* hp en cuartos de punto */
 #define IS_STRUCT(t) ((t) >= OB_TENT && (t) <= OB_BUNKER)
 /* estado extra por obstáculo: torreta del búnker / reloj de aparición del barracón */
@@ -335,20 +336,25 @@ static int      obs_n;
 
 typedef enum { E_PATROL, E_SEARCH, E_CHASE } EState;
 typedef struct {
-    bool active, anchored, dormant, has_los, has_lk, alerted, stat;
+    bool active, anchored, dormant, has_los, has_lk, alerted, stat, fort, rusher;
     uint8_t type, state;           /* type: 0 soldado, 1 oficial */
     int8_t  cover;                 /* índice de obstáculo (sacos de arena) o -1 */
     float   x, y, fx, fy;          /* esquina sup. izq. y dirección de apuntado */
     float   pat_ang, det_ang, strafe, dodge_x, dodge_y, lkx, lky;
     int     shoot_cd, nade_cd, strafe_t, patrol_t, search_t, dodge_t, detour_t;
-    int     los_t, age, life, leaving, peek, anim, aim, rocket_cd, mflash;
+    int     los_t, age, life, leaving, peek, anim, aim, rocket_cd, mflash, slot_t, hold_flip;
+    float   slot_x, slot_y, hold_dir;
+    uint8_t escort;                /* 1..3: escolta del rehén n-1 */
 } Enemy;
 
 typedef struct { bool active, rocket, shell; float x, y, vx, vy, dist, sp; int8_t ignore; } EBullet;
-typedef struct { bool active; bool mine; float sx, sy, tx, ty, prog, speed, arc, r; uint16_t rolled; } Grenade;
+typedef struct { bool active; bool mine; float sx, sy, tx, ty, prog, speed, arc, r; uint32_t rolled; } Grenade;
 typedef struct { bool active; float x, y, r, maxr; } Explosion;
 typedef enum { IT_SPREAD, IT_GRENADES, IT_LIFE } ItemType;
 typedef struct { bool active; int16_t x, y; uint8_t type; } Item;
+#define MAX_HOSTAGES 3
+typedef struct { bool active, freed; float x, y; int t, killed; } Hostage;
+static Hostage hostages[MAX_HOSTAGES];
 
 static Enemy     enemies[MAX_ENEMIES];
 static EBullet   ebullets[MAX_EBULLETS];
@@ -393,7 +399,7 @@ static int point_solid_idx(int x, int y, int ignore)
     for (int i = 0; i < obs_n; i++) {
         if (i == ignore) continue;
         const Obstacle *o = &obs[i];
-        if (o->type != OB_RUBBLE && x >= o->x && x < o->x + o->w && y >= o->y && y < o->y + o->h) return i;
+        if (o->type != OB_RUBBLE && o->type != OB_WATER && x >= o->x && x < o->x + o->w && y >= o->y && y < o->y + o->h) return i;
     }
     return -1;
 }
@@ -409,15 +415,94 @@ static bool los_blocked(float x1, float y1, float x2, float y2)
     return false;
 }
 
-static void obs_add(int type, int x, int y, int w, int h)
+/* zonas reservadas (ríos, puente, fortaleza, salida): ningún elemento corriente cae encima */
+typedef struct { int16_t x, y, w, h; } Zone;
+static Zone zones[8];
+static int  zone_n;
+static void zone_add(int x, int y, int w, int h) { if (zone_n < 8) zones[zone_n++] = (Zone){ (int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h }; }
+static bool zone_blocked(int x, int y, int w, int h)
 {
-    if (obs_n >= MAX_OBS) return;
-    if (x < 4) x = 4;
-    if (x + w > FIELD_W - 4) x = FIELD_W - 4 - w;
-    static const int8_t hp_q[9] = { 0, 0, 0, 8, 12, 16, 20, 12, 0 };   /* tienda 2, casa 3, barracón 4, edificio 5, búnker 3 */
+    for (int i = 0; i < zone_n; i++)
+        if (rects_hit(x, y, w, h, zones[i].x, zones[i].y, zones[i].w, zones[i].h)) return true;
+    return false;
+}
+
+static bool obs_add(int type, int x, int y, int w, int h)
+{
+    if (obs_n >= MAX_OBS) return false;
+    if (type < OB_FORT && zone_blocked(x - 9, y - 9, w + 18, h + 18)) return false;
+    if ((type < OB_FORT || type > OB_BRIDGE) && type != OB_WATER) {
+        if (x < 4) x = 4;
+        if (x + w > FIELD_W - 4) x = FIELD_W - 4 - w;
+    }
+    static const int8_t hp_q[13] = { 0, 0, 0, 8, 12, 16, 20, 12, 0, 0, 0, 0, 0 };   /* tienda 2, casa 3, barracón 4, edificio 5, búnker 3 */
     aux[obs_n] = (ObAux){ 1.5708f, rnd_range(90, 200), 0, 0, 0 };
     obs[obs_n++] = (Obstacle){ (int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h, (uint8_t)type,
                                (uint8_t)rnd_range(0, 255), hp_q[type], hp_q[type] };
+    return true;
+}
+
+/* ---- Fortaleza final y puente con túnel ---- */
+#define FORT_DOOR_W    36
+#define FORT_ENEMIES   20
+#define FORT_TRIGGER_Y 262
+#define BR_H           40
+#define TUNNEL_W       42
+static int  fort_x;                 /* esquina izquierda de la puerta */
+static int  gate_idx;
+static bool fort_active;
+static int  fort_spawned, fort_killed, fort_timer;
+static int  bridge_y, tunnel_x;
+typedef struct { int16_t y, h, bx, bw; } River;
+static River rivers[2];
+static int   river_n;
+static int  win_t;
+
+static bool near_bridge(int y, int h) { return y + h > bridge_y - 36 && y < bridge_y + BR_H + 36; }
+static bool player_in_tunnel(void);
+
+static void fort_bridge_generate(void)
+{
+    fort_x = fort_door_cx - FORT_DOOR_W / 2;
+    if (fort_x < 6) fort_x = 6;
+    if (fort_x > FIELD_W - FORT_DOOR_W - 6) fort_x = FIELD_W - FORT_DOOR_W - 6;
+    obs_add(OB_FORT, 0, 12, FIELD_W, 32);
+    obs_add(OB_FORT, 0, 44, fort_x, 68);
+    obs_add(OB_FORT, fort_x + FORT_DOOR_W, 44, FIELD_W - fort_x - FORT_DOOR_W, 68);
+    gate_idx = obs_n;
+    obs_add(OB_GATE, fort_x, 74, FORT_DOOR_W, 8);
+    zone_add(0, 0, FIELD_W, 206);                         /* zona de la fortaleza */
+    zone_add(0, MAP_H - 137, FIELD_W, 137);               /* zona de salida del jugador */
+
+    /* tres elementos que cruzan el campo (puente + 2 ríos) en posiciones y orden aleatorios */
+    int slots[3], ns = 0;
+    for (int t = 0; t < 600 && ns < 3; t++) {
+        int y = rnd_range(594, MAP_H - 719);
+        bool ok = true;
+        for (int k = 0; k < ns; k++) if (abs(slots[k] - y) < 269) ok = false;
+        if (ok) slots[ns++] = y;
+    }
+    if (ns < 3) { slots[0] = MAP_H - 1375; slots[1] = MAP_H - 938; slots[2] = MAP_H - 563; }
+    for (int i = 0; i < 2; i++)
+        for (int j = i + 1; j < 3; j++) if (slots[j] < slots[i]) { int t = slots[i]; slots[i] = slots[j]; slots[j] = t; }
+    int bridge_idx = rnd_range(0, 2);
+    river_n = 0;
+    for (int i = 0; i < 3; i++) {
+        if (i == bridge_idx) {                           /* el puente solo se pasa por el túnel */
+            bridge_y = slots[i];
+            tunnel_x = rnd_range(25, FIELD_W - TUNNEL_W - 25);
+            obs_add(OB_BRIDGE, 0, bridge_y, tunnel_x, BR_H);
+            obs_add(OB_BRIDGE, tunnel_x + TUNNEL_W, bridge_y, FIELD_W - tunnel_x - TUNNEL_W, BR_H);
+            zone_add(0, bridge_y - 31, FIELD_W, BR_H + 62);
+        } else {                                         /* río con un puente de madera */
+            River *r = &rivers[river_n++];
+            r->y = (int16_t)slots[i]; r->h = (int16_t)rnd_range(37, 59); r->bw = (int16_t)rnd_range(40, 56);
+            r->bx = (int16_t)rnd_range(25, FIELD_W - 25 - r->bw);
+            obs_add(OB_WATER, 0, r->y, r->bx, r->h);
+            obs_add(OB_WATER, r->bx + r->bw, r->y, FIELD_W - r->bx - r->bw, r->h);
+            zone_add(0, r->y - 25, FIELD_W, r->h + 50);
+        }
+    }
 }
 
 static void bunkers_generate(void)
@@ -431,9 +516,9 @@ static void bunkers_generate(void)
             int c = path_center(py), h = path_half(py);
             int x = c + side * (h + 8 + rnd_range(0, 25)) - (side < 0 ? 44 : 0);
             if (x < 6 || x + 44 > FIELD_W - 6) continue;
+            if (near_bridge(py, 34) || py < 250) continue;
             if (obs_collide(x - 6, py - 6, 56, 46)) continue;
-            obs_add(OB_BUNKER, x, py, 44, 34);
-            break;
+            if (obs_add(OB_BUNKER, x, py, 44, 34)) break;
         }
     }
 }
@@ -441,9 +526,12 @@ static void bunkers_generate(void)
 static void obs_generate(void)
 {
     obs_n = 0;
+    zone_n = 0;
+    fort_bridge_generate();
     bunkers_generate();
-    for (int y = MAP_H - 200; y > 160 && obs_n < MAX_OBS; y -= rnd_range(46, 80)) {
+    for (int y = MAP_H - 200; y > 230 && obs_n < MAX_OBS; y -= rnd_range(46, 80)) {
         int c = path_center(y), h = path_half(y);
+        if (near_bridge(y - 20, 60)) continue;
         int r = rnd_range(0, 99);
         int side = (rng() & 1) ? 1 : -1;
         if (r < 30) {                                    /* barricada de sacos a un lado del sendero */
@@ -524,6 +612,8 @@ static void enemy_kill(Enemy *e)
 {
     if (!e->active) return;
     e->active = false;
+    if (e->fort) fort_killed++;
+    if (e->escort) hostages[e->escort - 1].killed++;
     static const uint16_t pts[4] = { 100, 300, 250, 250 };
     score += pts[e->type & 3];
     expl_add(e->x + EW / 2.0f, e->y + EH / 2.0f, 12);
@@ -592,7 +682,7 @@ static void rocket_detonate(const EBullet *b)
 {
     expl_add(b->x, b->y, 16);
     sound_effect_explosion();
-    if (!pl.dying && hypotf(pl_cx() - b->x, pl_cy() - b->y) < 15) player_hit();
+    if (!pl.dying && !player_in_tunnel() && hypotf(pl_cx() - b->x, pl_cy() - b->y) < 15) player_hit();
 }
 
 static void enemy_shoot(Enemy *e, float dist)
@@ -682,7 +772,7 @@ static void enemy_check_dodge(Enemy *e, int idx, float cx, float cy)
             if (sp < 0.01f) continue;
             if ((vx * dx + vy * dy) / (sp * d) < 0.9f) continue;
             if (b->rolled & (1u << idx)) continue;
-            b->rolled |= (uint16_t)(1u << idx);
+            b->rolled |= (1u << idx);
             if (frnd(0, 1) > 0.75f) continue;
             float nx = -vy / sp, ny = vx / sp;
             float side = dx * nx + dy * ny;
@@ -697,13 +787,58 @@ static void enemy_check_dodge(Enemy *e, int idx, float cx, float cy)
         float d = hypotf(cx - g->tx, cy - g->ty);
         if (d < g->r + 9) {
             if (g->rolled & (1u << idx)) continue;
-            g->rolled |= (uint16_t)(1u << idx);
+            g->rolled |= (1u << idx);
             if (frnd(0, 1) > 0.75f) continue;
             if (d < 0.01f) d = 1;
             e->dodge_x = (cx - g->tx) / d; e->dodge_y = (cy - g->ty) / d; e->dodge_t = 28;
             return;
         }
     }
+}
+
+static void fort_pick_slot(Enemy *e, float pcx, float pcy)
+{
+    float lo = e->rusher ? 28.0f : 53.0f, hi = e->rusher ? 59.0f : 125.0f;
+    int camy = cam_px();
+    float maxy = pcy + 75; if (maxy > camy + SCR_H - 37) maxy = (float)(camy + SCR_H - 37); if (maxy < 156) maxy = 156;
+    bool ok = false;
+    for (int t = 0; t < 16 && !ok; t++) {
+        float x = frnd(14, FIELD_W - 26), y = frnd(128, maxy);
+        float d = hypotf(x + 6 - pcx, y + 7 - pcy);
+        if (d < lo || d > hi || obs_collide((int)x, (int)y, EW, EH)) continue;
+        bool free_ = true;
+        for (int k = 0; k < MAX_ENEMIES && free_; k++) {
+            const Enemy *o = &enemies[k];
+            if (o != e && o->active && o->fort && hypotf(o->slot_x - x, o->slot_y - y) < 27) free_ = false;
+        }
+        if (!free_) continue;
+        e->slot_x = x; e->slot_y = y; ok = true;
+    }
+    if (!ok) {
+        float a = frnd(0, 6.2831f), r = frnd(lo + 10, hi - 12);
+        e->slot_x = pcx + cosf(a) * r - 6; e->slot_y = pcy + sinf(a) * r - 7;
+        if (e->slot_x < 12) e->slot_x = 12;
+        if (e->slot_x > FIELD_W - 24) e->slot_x = (float)(FIELD_W - 24);
+        if (e->slot_y < 128) e->slot_y = 128;
+        if (e->slot_y > camy + SCR_H - 37) e->slot_y = (float)(camy + SCR_H - 37);
+    }
+    e->slot_t = rnd_range(150, 320);
+}
+
+static void fort_move(Enemy *e, float cx, float cy, float pcx, float pcy, float ang, float *mx, float *my)
+{
+    if (cy < 120) {                                      /* salir por la puerta sin pararse */
+        float tx = fort_x + FORT_DOOR_W / 2.0f;
+        float d = (tx - cx) / 12.0f;
+        *mx = d > 1 ? 1 : (d < -1 ? -1 : d); *my = 1;
+        return;
+    }
+    if (e->slot_t <= 0 || e->slot_x == 0) fort_pick_slot(e, pcx, pcy);
+    e->slot_t--;
+    float sx = e->slot_x + 6 - cx, sy = e->slot_y + 7 - cy, d = hypotf(sx, sy);
+    if (d > 9) { *mx = sx / d; *my = sy / d; return; }
+    if (--e->hold_flip <= 0) { e->hold_dir = -e->hold_dir; e->hold_flip = rnd_range(50, 110); }
+    *mx = -sinf(ang) * e->hold_dir * 0.45f; *my = cosf(ang) * e->hold_dir * 0.45f;
 }
 
 static void enemy_update(Enemy *e, int idx)
@@ -716,7 +851,7 @@ static void enemy_update(Enemy *e, int idx)
     int camy = cam_px();
 
     if (e->anchored) { enemy_cover_update(e, dist, ang, pcy); return; }
-    if (e->dormant) {
+    if (e->dormant && !e->fort) {
         if (e->y > camy - 12 && e->y < camy + SCR_H && dist < 270) e->dormant = false;
         else return;
     }
@@ -727,7 +862,7 @@ static void enemy_update(Enemy *e, int idx)
         if (dist < 47) { e->stat = false; e->state = E_CHASE; return; }   /* pegado a él: lucha como soldado */
         e->fx = cosf(ang); e->fy = sinf(ang);
         if (e->rocket_cd > 0) { e->rocket_cd--; return; }
-        if (pl.dying || dist > 225 || dist < 75) return;
+        if (pl.dying || dist > 225 || dist < 75 || e->y < camy || e->y > camy + SCR_H - 12) return;
         if (!can_enemy_throw()) { e->rocket_cd = rnd_range(20, 50); return; }
         grenade_throw_ex(cx, e->y + 2, pcx + pl.vx * 24 + frnd(-19, 19), pcy + pl.vy * 24 + frnd(-19, 19),
                          false, 0.0075f, 59.0f, 29.0f);
@@ -736,7 +871,16 @@ static void enemy_update(Enemy *e, int idx)
         return;
     }
 
-    /* Desaparición por tiempo o por el borde de la pantalla */
+    /* Desaparición por tiempo o por el borde de la pantalla (la fortaleza no) */
+    if (e->escort) {                                       /* escolta de rehén: no se va, huye del jugador y se queda junto al rehén */
+        e->age++;
+        if (e->age > 60 && (e->x < -12 || e->x > FIELD_W || e->y < camy - 19 || e->y > camy + SCR_H)) {
+            for (int k = 0; k < MAX_ENEMIES; k++) if (enemies[k].active && enemies[k].escort == e->escort) enemies[k].active = false;
+            return;
+        }
+        if (dist < 130 && e->state != E_CHASE) e->state = E_CHASE;
+    }
+    if (!e->fort && !e->escort) {
     if (e->leaving > 0) { if (--e->leaving <= 0) e->active = false; return; }
     e->age++;
     {
@@ -745,10 +889,11 @@ static void enemy_update(Enemy *e, int idx)
         bool edge = e->x < 3 || e->x > FIELD_W - 15 || e->y < camy + 3 || e->y > camy + SCR_H - 16;
         if (e->age > e->life || (edge && e->age > 240)) { e->leaving = 30; return; }
     }
+    }
 
     /* Percepción */
     if (--e->los_t <= 0) { e->los_t = 6; e->has_los = !los_blocked(cx, cy, pcx, pcy); }
-    bool sees = dist < (e->type ? 119 : 100) && e->has_los;
+    bool sees = e->fort ? dist < 281 : (dist < (e->type ? 119 : 100) && e->has_los);
     bool heard = !sees && pl.noise > 0 && dist < 187;
     if (sees) {
         if (e->state != E_CHASE) e->state = E_CHASE;
@@ -763,13 +908,15 @@ static void enemy_update(Enemy *e, int idx)
     if (e->dodge_t <= 0) enemy_check_dodge(e, idx, cx, cy);
 
     /* Decisión de movimiento */
-    float mx = 0, my = 0, spd = spd0;
+    float mx = 0, my = 0, spd = spd0 * (e->rusher ? 1.2f : 1.0f);
     if (e->aim > 0) {
         /* quieto apuntando el bazooka */
     } else if (e->dodge_t > 0) {
         e->dodge_t--; mx = e->dodge_x; my = e->dodge_y; spd = e->type ? 1.19f : 1.0f;
     } else if (e->detour_t > 0) {
         e->detour_t--; mx = cosf(e->det_ang); my = sinf(e->det_ang);
+    } else if (e->fort) {
+        fort_move(e, cx, cy, pcx, pcy, ang, &mx, &my);
     } else if (e->state == E_CHASE) {
         float nearD = e->type == 2 ? 75.0f : 53.0f, farD = e->type == 2 ? 119.0f : 84.0f;
         if (dist > farD) { mx = cosf(ang); my = sinf(ang); }
@@ -808,18 +955,25 @@ static void enemy_update(Enemy *e, int idx)
         }
     } else if (e->state == E_CHASE && e->dodge_t <= 0 && !pl.dying) {
         if (e->shoot_cd <= 0 && dist < 125 && e->has_los) {
-            if (can_enemy_shoot()) { enemy_shoot(e, dist); e->shoot_cd = 100 + rnd_range(0, 59); }
+            if (can_enemy_shoot()) { enemy_shoot(e, dist); e->shoot_cd = (e->fort ? 75 : 100) + rnd_range(0, 59); }
             else e->shoot_cd = rnd_range(8, 29);
         }
         if (e->nade_cd <= 0 && dist > 44 && dist < 134) {
             if (can_enemy_throw()) {
                 grenade_throw(cx, cy,
                               pcx + frnd(-14, 14) + pl.vx * 12, pcy + frnd(-14, 14) + pl.vy * 12, false);
-                e->nade_cd = 280 + rnd_range(0, 419);
+                e->nade_cd = (e->fort ? 200 : 280) + rnd_range(0, 419);
             } else e->nade_cd = rnd_range(20, 59);
         }
     }
 
+    if (e->escort) {
+        const Hostage *h = &hostages[e->escort - 1];
+        float hx = h->x + 6, hy = h->y + 7, dh = hypotf(hx - cx, hy - cy);
+        mx = my = 0;
+        if (dist < 162) { mx = -cosf(ang) * 0.8f; my = -sinf(ang) * 0.8f; }
+        if (dh > 25) { mx += (hx - cx) / dh * 1.2f; my += (hy - cy) / dh * 1.2f; }
+    }
     /* Movimiento */
     float len = hypotf(mx, my);
     if (len > 1) { mx /= len; my /= len; len = 1; }
@@ -837,11 +991,12 @@ static void enemy_update(Enemy *e, int idx)
 
 static void enemies_spawn(void)
 {
+    if (fort_active) return;
     if (++spawn_timer <= 120 + (level < 4 ? (4 - level) * 30 : 0)) return;
     spawn_timer = 0;
     int act = 0;
     for (int i = 0; i < MAX_ENEMIES; i++)
-        if (enemies[i].active && !enemies[i].anchored && !enemies[i].dormant) act++;
+        if (enemies[i].active && !enemies[i].anchored && !enemies[i].dormant && !enemies[i].stat && !enemies[i].escort) act++;
     int limit = 3 + 2 * level; if (limit > 10) limit = 10;
     if (act >= limit) return;
     int camy = cam_px();
@@ -864,6 +1019,24 @@ static void enemies_spawn(void)
 static void enemies_populate(void)
 {
     memset(enemies, 0, sizeof(enemies));
+    memset(hostages, 0, sizeof(hostages));
+    {   /* rehenes con dos guardias cada uno */
+        static const int16_t ylo[3] = { 1750, 1062, 562 }, yhi[3] = { 2094, 1437, 937 };
+        for (int i = 0; i < MAX_HOSTAGES; i++) {
+            for (int tries = 0; tries < 20; tries++) {
+                int x = rnd_range(10, FIELD_W - 70), y = rnd_range(ylo[i], yhi[i]);
+                if (obs_collide(x - 4, y - 4, 64, 29) || zone_blocked(x - 8, y - 8, 72, 37)) continue;
+                for (int g = 0; g < 2; g++) {
+                    Enemy *e = enemy_alloc();
+                    if (!e) break;
+                    enemy_init(e, (float)(x + g * 44), (float)y, 0);
+                    e->dormant = true; e->escort = (uint8_t)(i + 1);
+                }
+                hostages[i] = (Hostage){ true, false, (float)(x + 22), (float)(y + 2), 0, 0 };
+                break;
+            }
+        }
+    }
     for (int i = 0; i < obs_n; i++) {
         if (obs[i].type != OB_SANDBAG) continue;
         int n = rnd_range(0, 99) < (level == 1 ? 30 : 60) ? 2 : 1;
@@ -881,7 +1054,7 @@ static void enemies_populate(void)
         for (int n = 0; n < nm; n++) {
             for (int tries = 0; tries < 10; tries++) {
                 int x = rnd_range(10, FIELD_W - 24), y = rnd_range(500, MAP_H - 437);
-                if (obs_collide(x - 4, y - 4, 20, 24)) continue;
+                if (obs_collide(x - 4, y - 4, 20, 24) || near_bridge(y, 15)) continue;
                 Enemy *e = enemy_alloc();
                 if (!e) break;
                 enemy_init(e, (float)x, (float)y, 3);
@@ -897,7 +1070,7 @@ static void enemies_populate(void)
             Enemy *e = enemy_alloc();
             if (!e) return;
             int x = c + rnd_range(-40, 40), yy = y + rnd_range(-20, 20);
-            if (obs_collide(x, yy, EW, EH)) continue;
+            if (obs_collide(x, yy, EW, EH) || near_bridge(yy, EH)) continue;
             enemy_init(e, (float)x, (float)yy, enemy_pick_type());
             e->dormant = true;
         }
@@ -986,7 +1159,7 @@ static void grenade_explode(Grenade *g)
             TrSoldier *s = &trs[i];
             if (s->active && s->r > 0.6f && hypotf(s->x - g->tx, trenches[s->t].y + 4 - g->ty) < g->r) trench_soldier_kill(s);
         }
-    } else if (!pl.dying && hypotf(pl_cx() - g->tx, pl_cy() - g->ty) < g->r - 4) {
+    } else if (!pl.dying && !player_in_tunnel() && hypotf(pl_cx() - g->tx, pl_cy() - g->ty) < g->r - 4) {
         player_hit();
     }
 }
@@ -1092,7 +1265,7 @@ static void truck_update(Vehicle *v)
 
 static void trucks_spawn(void)
 {
-    if (pl.dying || trucks_sent >= (1 + level > 5 ? 5 : 1 + level)) return;
+    if (fort_active || pl.dying || trucks_sent >= (1 + level > 5 ? 5 : 1 + level)) return;
     if (--truck_timer > 0) return;
     int camy = cam_px(), py = UNFX(pl.y);
     if (py > MAP_H - 437 || py < 406) { truck_timer = 60; return; }
@@ -1166,7 +1339,7 @@ static void structures_update(void)
             if (a->cd > 0) { if (on) a->cd--; continue; }
             int act = 0;
             for (int k = 0; k < MAX_ENEMIES; k++)
-                if (enemies[k].active && !enemies[k].anchored && !enemies[k].dormant) act++;
+                if (enemies[k].active && !enemies[k].anchored && !enemies[k].dormant && !enemies[k].stat && !enemies[k].escort) act++;
             if (a->spawned >= 3 + level || act >= 12 || pl.dying) { a->cd = 90; continue; }
             int ex = o->x + o->w / 2 - 6 + rnd_range(-5, 5), ey = o->y + o->h + 2;
             Enemy *e = enemy_alloc();
@@ -1188,6 +1361,7 @@ static void trenches_generate(void)
         for (int tries = 0; tries < 12; tries++) {
             int y = rnd_range(406, MAP_H - 320);
             int x = rnd_range(8, FIELD_W - 68);          /* se puede cruzar: da igual que caiga sobre el sendero */
+            if (near_bridge(y, 18)) continue;
             bool clash = obs_collide(x - 6, y - 6, 72, 30);
             for (int k = 0; k < trench_n && !clash; k++)
                 clash = rects_hit(x - 6, y - 30, 72, 78, trenches[k].x, trenches[k].y, trenches[k].w, trenches[k].h);
@@ -1237,8 +1411,108 @@ static void trenches_update(void)
     }
 }
 
+static bool player_in_tunnel(void)
+{
+    float cx = pl_cx(), cy = pl_cy();
+    return cx > tunnel_x && cx < tunnel_x + TUNNEL_W && cy > bridge_y && cy < bridge_y + BR_H;
+}
+
+static void fort_update(void)
+{
+    if (!fort_active && UNFX(pl.y) < FORT_TRIGGER_Y) {            /* se abre la puerta */
+        fort_active = true;
+        obs[gate_idx].type = OB_RUBBLE; obs[gate_idx].hp = 0;
+        sound_effect_alarm();
+    }
+    if (!fort_active) return;
+    fort_timer++;
+    if (fort_spawned < FORT_ENEMIES && fort_timer >= 85) {
+        float sx = (float)(fort_x + 4) + frnd(0, FORT_DOOR_W - 20), sy = 52;
+        bool blocked = false;
+        for (int i = 0; i < MAX_ENEMIES; i++)
+            if (enemies[i].active && fabsf(enemies[i].x - sx) < 12 && fabsf(enemies[i].y - sy) < 16) blocked = true;
+        Enemy *e = enemy_alloc();
+        if (!blocked && e) {
+            fort_timer = 0; fort_spawned++;
+            enemy_init(e, sx, sy, enemy_pick_type());
+            e->fort = true; e->state = E_CHASE; e->alerted = true;
+            e->rusher = rnd_range(0, 99) < 25;
+            e->nade_cd = rnd_range(150, 300);
+            e->hold_dir = (rng() & 1) ? 1.0f : -1.0f; e->hold_flip = rnd_range(40, 100);
+        }
+    }
+    if (fort_killed >= FORT_ENEMIES && state == ST_PLAYING) {
+        state = ST_WIN; win_t = 0;
+        sound_start_scramble_victory();
+        score += 5000 + (uint32_t)pl.lives * 500;
+    }
+}
+
+/* ---- Moto bombardera sobre el puente ---- */
+typedef struct { float x; int dir, wait, bomb_cd, g_cd, throw_anim; } Bike;
+static Bike bike;
+
+static void bike_update(void)
+{
+    float by = bridge_y + BR_H / 2.0f;
+    if (bike.wait > 0) bike.wait--;
+    else {
+        bike.x += bike.dir * 0.94f;
+        if (bike.x > FIELD_W + 30) { bike.dir = -1; bike.wait = 120; }
+        else if (bike.x < -30) { bike.dir = 1; bike.wait = 120; }
+    }
+    if (bike.bomb_cd > 0) bike.bomb_cd--;
+    if (bike.throw_anim > 0) bike.throw_anim--;
+    if (bike.g_cd > 0) bike.g_cd--;
+    bool near = abs(UNFX(pl.y) - bridge_y) < 206 && !pl.dying && !player_in_tunnel();
+    bool on = bike.wait <= 0 && bike.x > 5 && bike.x < FIELD_W - 5 && near;
+    if (on && bike.bomb_cd <= 0 && can_enemy_throw()) {
+        float tx = pl_cx() + frnd(-19, 19), ty = pl_cy() + frnd(-19, 19);
+        if (tx < 10) tx = 10;
+        if (tx > FIELD_W - 10) tx = (float)(FIELD_W - 10);
+        grenade_throw_ex(bike.x, by, tx, ty, false, 0.011f, 16.0f, 27.0f);
+        bike.bomb_cd = rnd_range(110, 180);
+    }
+    if (on && bike.g_cd <= 0 && can_enemy_throw()) {
+        float gx = pl_cx() + pl.vx * 16 + frnd(-15, 15), gy = pl_cy() + pl.vy * 16 + frnd(-15, 15);
+        if (gx < 10) gx = 10;
+        if (gx > FIELD_W - 10) gx = (float)(FIELD_W - 10);
+        grenade_throw_ex(bike.x, by + 12, gx, gy, false, 0.012f, 22.0f, 24.0f);
+        bike.throw_anim = 14;
+        bike.g_cd = rnd_range(150, 230);
+    }
+}
+
+static void hostages_update(void)
+{
+    for (int i = 0; i < MAX_HOSTAGES; i++) {
+        Hostage *h = &hostages[i];
+        if (!h->active) continue;
+        if (h->freed) { if (++h->t > 170) h->active = false; continue; }
+        int alive = 0; float ax = 0, ay = 0;
+        for (int k = 0; k < MAX_ENEMIES; k++) {
+            const Enemy *e = &enemies[k];
+            if (!e->active || e->escort != i + 1) continue;
+            alive++;
+            if (!e->dormant) { ax += e->x + EW / 2.0f; ay += e->y + EH - 15; }
+            else { ax += h->x + 6; ay += h->y; }
+        }
+        if (alive > 0) {
+            ax = ax / alive - 6; ay /= alive;
+            float nx = h->x + (ax - h->x) * 0.1f, ny = h->y + (ay - h->y) * 0.1f;
+            if (nx > 3 && nx < FIELD_W - 15 && !obs_collide((int)nx, (int)ny, 12, 15)) { h->x = nx; h->y = ny; }
+        } else if (h->killed >= 2) {
+            h->freed = true; h->t = 0; score += 1000;
+            sound_effect_extra_life();
+        } else h->active = false;                    /* los guardias huyeron: rehén perdido */
+    }
+}
+
 static void update_world(void)
 {
+    hostages_update();
+    fort_update();
+    bike_update();
     structures_update();
     trenches_update();
     vehicles_update();
@@ -1303,7 +1577,7 @@ static void world_init(void)
         int ys[3], placed = 0;
         for (int tries = 0; tries < 40 && placed < nt; tries++) {
             int x = rnd_range(10, FIELD_W - 42), y = rnd_range(562, MAP_H - 500);
-            if (obs_collide(x - 4, y - 4, 40, 40)) continue;
+            if (obs_collide(x - 4, y - 4, 40, 40) || near_bridge(y, 32)) continue;
             bool far = true;
             for (int k = 0; k < placed; k++) if (abs(ys[k] - y) < 312) far = false;
             if (!far) continue;
@@ -1315,6 +1589,8 @@ static void world_init(void)
         }
     }
     truck_timer = rnd_range(500, 900); trucks_sent = 0;
+    fort_active = false; fort_spawned = fort_killed = fort_timer = 0;
+    bike = (Bike){ -25.0f, 1, 60, 120, 200, 0 };
     memset(ebullets, 0, sizeof(ebullets));
     memset(grenades, 0, sizeof(grenades));
     memset(booms, 0, sizeof(booms));
@@ -1322,7 +1598,7 @@ static void world_init(void)
     enemies_populate();
     for (int y = MAP_H - 500, n = 0; y > 220 && n < 6; y -= rnd_range(280, 380), n++) {
         int x = path_center(y) + rnd_range(-30, 30);
-        if (obs_collide(x, y, 10, 10)) continue;
+        if (obs_collide(x, y, 10, 10) || near_bridge(y, 10)) continue;
         items[n] = (Item){ true, (int16_t)x, (int16_t)y, IT_GRENADES };
     }
     spawn_timer = 0;
@@ -1332,8 +1608,10 @@ static void world_init(void)
 /* ---------------------------------------------------------
  * Inicio de partida
  * --------------------------------------------------------- */
-static void game_init(void)
+static void game_init(bool next)
 {
+    const int keep_lives = pl.lives, keep_nades = pl.grenades;
+    const uint32_t keep_score = score;
     path_generate(level);
     theme = &THEMES[(level - 1) % 3];
 
@@ -1350,6 +1628,11 @@ static void game_init(void)
     gameover_t = 0;
     cam_q8 = FX(MAP_H - SCR_H);
     score = 0;
+    if (next) {                         /* siguiente fase: una vida de premio y 4 granadas */
+        pl.lives = keep_lives + 1 > 10 ? 10 : keep_lives + 1;
+        pl.grenades = keep_nades + 4;
+        score = keep_score;
+    }
     panels_ready = false;
 }
 
@@ -1371,6 +1654,8 @@ static void pbullet_add(int32_t vx, int32_t vy)
     }
 }
 
+static bool chomp_alt;
+
 static void player_shoot(void)
 {
     int dx = pl.dir_x, dy = pl.dir_y;
@@ -1384,7 +1669,8 @@ static void player_shoot(void)
         pbullet_add(dx * sp, dy * sp);
     }
     pl.noise = 40;
-    sound_effect_shoot();
+    sound_effect_pacman_chomp(chomp_alt);       /* el chomp de Pac-Man, alternando tic/tac */
+    chomp_alt = !chomp_alt;
 }
 
 static void player_throw(void)
@@ -1408,6 +1694,18 @@ static void player_respawn(void)
         if (ebullets[i].active && hypotf(ebullets[i].x - px, ebullets[i].y - py) < 80) ebullets[i].active = false;
     for (int i = 0; i < MAX_GRENADES; i++)
         if (grenades[i].active && !grenades[i].mine && hypotf(grenades[i].tx - px, grenades[i].ty - py) < 44) grenades[i].active = false;
+}
+
+/* los vehículos son sólidos para el jugador (salvo que ya se solape con uno al aparecer) */
+static bool veh_block(int nx, int ny)
+{
+    for (int i = 0; i < MAX_VEH; i++) {
+        const Vehicle *v = &veh[i];
+        if (!v->active) continue;
+        if (rects_hit(nx, ny, PLAYER_W, PLAYER_H, (int)v->x, (int)v->y, v->w, v->h) &&
+            !rects_hit(UNFX(pl.x), UNFX(pl.y), PLAYER_W, PLAYER_H, (int)v->x, (int)v->y, v->w, v->h)) return true;
+    }
+    return false;
 }
 
 static void update_player(void)
@@ -1442,9 +1740,9 @@ static void update_player(void)
         int camy = cam_px();
 
         if (UNFX(nx) >= 3 && UNFX(nx) + PLAYER_W <= FIELD_W - 3 &&
-            !obs_collide(UNFX(nx), UNFX(pl.y), PLAYER_W, PLAYER_H)) { pl.vx = (float)vx / 256.0f; pl.x = nx; }
+            !obs_collide(UNFX(nx), UNFX(pl.y), PLAYER_W, PLAYER_H) && !veh_block(UNFX(nx), UNFX(pl.y))) { pl.vx = (float)vx / 256.0f; pl.x = nx; }
         if (UNFX(ny) >= camy + (SIDE_PANELS ? 0 : HUD_H) + 2 && UNFX(ny) + PLAYER_H <= camy + SCR_H - 8 &&
-            !obs_collide(UNFX(pl.x), UNFX(ny), PLAYER_W, PLAYER_H)) { pl.vy = (float)vy / 256.0f; pl.y = ny; }
+            !obs_collide(UNFX(pl.x), UNFX(ny), PLAYER_W, PLAYER_H) && !veh_block(UNFX(pl.x), UNFX(ny))) { pl.vy = (float)vy / 256.0f; pl.y = ny; }
 
         pl.anim += 2;
     }
@@ -1528,7 +1826,8 @@ static void logic_step(void)
     if (state == ST_TITLE) {
         title_t++;
         if (in_start_edge) {
-            game_init();
+            level = 1;
+            game_init(false);
             state = ST_PLAYING;
         }
         return;
@@ -1538,6 +1837,11 @@ static void logic_step(void)
         update_player();
         update_bullets();
         update_world();
+        return;
+    }
+    if (state == ST_WIN) {
+        update_world();
+        if (++win_t > GAME_SPEED * 3 && in_start_edge) { sound_stop_scramble_victory(); level++; game_init(true); state = ST_PLAYING; }
         return;
     }
     if (state == ST_GAMEOVER) {
@@ -1898,6 +2202,8 @@ static void draw_obstacles(bool bags)
     for (int i = 0; i < obs_n; i++) {
         const Obstacle *o = &obs[i];
         if ((o->type == OB_SANDBAG) != bags) continue;
+        if ((o->type >= OB_FORT && o->type <= OB_BRIDGE) || o->type == OB_WATER) continue;     /* se dibujan aparte */
+        if (i == gate_idx) continue;
         if (!on_screen(o->y - 16, o->h + 18, camy)) continue;
         int x = o->x, y = o->y - camy;
         if (o->type == OB_SANDBAG) {
@@ -1967,9 +2273,35 @@ static void draw_enemy(const Enemy *e, int camy)
     else if (e->state == E_SEARCH) rect(x + 5, y - 6, 2, 4, COLOR_YELLOW);
 }
 
+static void draw_hostages(void)
+{
+    int camy = cam_px();
+    for (int i = 0; i < MAX_HOSTAGES; i++) {
+        const Hostage *h = &hostages[i];
+        if (!h->active || !on_screen((int)h->y, 15, camy)) continue;
+        int x = (int)h->x, y = (int)h->y - camy;
+        if (h->freed) y += ((h->t / 6) & 1) ? -1 : 0;
+        rect(x + 1, y + 5, 10, 6, RGB(0xd9,0xd0,0x90));                 /* camisa */
+        rect(x + 3, y + 2, 6, 3, C_SKIN);
+        rect(x + 2, y, 8, 3, h->freed ? RGB(0xd0,0x20,0x20) : RGB(0x4a,0x3a,0x20));
+        rect(x + 2, y + 11, 3, 4, RGB(0x4a,0x5a,0x7a));
+        rect(x + 7, y + 11, 3, 4, RGB(0x4a,0x5a,0x7a));
+        if (h->freed) { rect(x - 1, y - 3, 2, 8, C_SKIN); rect(x + 11, y - 3, 2, 8, C_SKIN); }
+        else { rect(x + 1, y + 8, 10, 2, RGB(0x6a,0x4a,0x2a)); }        /* atado */
+    }
+}
+
 static void draw_enemies(void)
 {
     int camy = cam_px();
+    for (int i = 0; i < MAX_ENEMIES; i++) {                              /* nidos de mortero (sacos en U) */
+        const Enemy *e = &enemies[i];
+        if (!e->active || !e->stat || !on_screen((int)e->y, EH, camy)) continue;
+        int x = (int)e->x, y = (int)e->y - camy;
+        rect(x - 5, y + 8, 22, 6, C_BAG); rect(x - 5, y + 8, 22, 1, C_BAG_DK);
+        rect(x - 5, y + 1, 5, 10, C_BAG); rect(x + 12, y + 1, 5, 10, C_BAG);
+        rect(x - 5, y + 5, 5, 1, C_BAG_DK); rect(x + 12, y + 5, 5, 1, C_BAG_DK);
+    }
     for (int i = 0; i < MAX_ENEMIES; i++) {
         const Enemy *e = &enemies[i];
         if (!e->active || e->dormant || !on_screen((int)e->y, EH, camy)) continue;
@@ -2135,22 +2467,149 @@ static void draw_hud(void)
 
 static void draw_title(void)
 {
-    renderer_clear(RGB(0x10, 0x14, 0x08));
-    const char *a = "MISSING IN";
-    const char *b = "ARCADE";
-    const char *c = "PULSA FUEGO";
-    renderer_draw_text((SCR_W - (int)st7789_text_width(a, 3)) / 2, SCR_H * 28 / 100, a, RGB(0xf8, 0x48, 0x28), COLOR_BLACK, 3);
-    renderer_draw_text((SCR_W - (int)st7789_text_width(b, 4)) / 2, SCR_H * 39 / 100, b, RGB(0xf8, 0xb8, 0x00), COLOR_BLACK, 4);
-    if ((title_t / 25) & 1)
-        renderer_draw_text((SCR_W - (int)st7789_text_width(c, 2)) / 2, SCR_H * 75 / 100, c, COLOR_WHITE, COLOR_BLACK, 2);
+    uint16_t row[CMD_TITLE_W];
+    for (int y = 0; y < CMD_TITLE_H; y++) {                 /* cartel a pantalla completa, fila a fila */
+        const uint8_t *p = &cmd_title_pixels[y * CMD_TITLE_W];
+        for (int x = 0; x < CMD_TITLE_W; x++) row[x] = cmd_title_palette[p[x] & 63];
+        renderer_blit_to_buffer(0, (uint16_t)y, CMD_TITLE_W, 1, row);
+    }
+    {   /* el título va en el recuadro oscuro de arriba a la derecha del cartel */
+        const char *t1 = "MISSING IN", *t2 = "ARCADE";
+        const int cx = 228;
+        renderer_draw_text((uint16_t)(cx - (int)st7789_text_width(t1, 2) / 2)+12, 32, t1, RGB(0xf8, 0x48, 0x28), COLOR_BLACK, 2);
+        renderer_draw_text((uint16_t)(cx - (int)st7789_text_width(t2, 4) / 2)+12, 58, t2, RGB(0xf8, 0xb8, 0x00), COLOR_BLACK, 4);
+    }
+    if ((title_t / 25) & 1) {
+        const char *c = "PULSA FUEGO";
+        renderer_draw_text((SCR_W - (int)st7789_text_width(c, 2)) / 2, SCR_H - 26, c, COLOR_WHITE, COLOR_BLACK, 2);
+    }
+}
+
+
+/* ---------------------------------------------------------
+ * Fortaleza, puente con túnel y moto bombardera
+ * --------------------------------------------------------- */
+static void draw_wall(int x, int y, int w, int h)
+{
+    rect(x, y, w, h, RGB(0x4d,0x4a,0x45));
+    for (int yy = 8, row = 0; yy < h; yy += 8, row++) {
+        rect(x, y + yy, w, 1, RGB(0x34,0x32,0x2e));
+        for (int xx = (row & 1) * 12 + 12; xx < w; xx += 24) rect(x + xx, y + yy - 8, 1, 8, RGB(0x34,0x32,0x2e));
+    }
+}
+
+static void draw_fort(void)
+{
+    int camy = cam_px();
+    if (camy > 130) return;
+    int fx = fort_x;
+    draw_wall(0, 12 - camy, FIELD_W, 32);
+    draw_wall(0, 44 - camy, fx, 68);
+    draw_wall(fx + FORT_DOOR_W, 44 - camy, FIELD_W - fx - FORT_DOOR_W, 68);
+    for (int x = 0; x < FIELD_W; x += 15) rect(x + 1, 6 - camy, 10, 8, RGB(0x6a,0x66,0x5e));   /* almenas */
+    rect(fx, 44 - camy, FORT_DOOR_W, 30, RGB(0x14,0x11,0x0c));
+    rect(fx, 74 - camy, FORT_DOOR_W, 38, RGB(0x2a,0x21,0x18));
+    if (!fort_active) {                                    /* portón cerrado */
+        rect(fx, 70 - camy, FORT_DOOR_W, 14, RGB(0x5a,0x3a,0x1a));
+        for (int k = 5; k < FORT_DOOR_W; k += 10) rect(fx + k, 70 - camy, 2, 14, RGB(0x2b,0x1b,0x0a));
+        rect(fx, 75 - camy, FORT_DOOR_W, 2, RGB(0x9a,0xa0,0xa6));
+    }
+    rect(fx - 3, 44 - camy, 3, 68, RGB(0x2d,0x2b,0x27));
+    rect(fx + FORT_DOOR_W, 44 - camy, 3, 68, RGB(0x2d,0x2b,0x27));
+    rect(fx + 19, -4 - camy, 2, 18, RGB(0x8a,0x8a,0x8a));          /* bandera */
+    rect(fx + 21, -4 - camy, 9, 6, RGB(0xc4,0x16,0x1c));
+}
+
+static void draw_rivers(void)
+{
+    int camy = cam_px();
+    for (int i = 0; i < river_n; i++) {
+        const River *r = &rivers[i];
+        if (!on_screen(r->y, r->h, camy)) continue;
+        int sy = r->y - camy;
+        rect(0, sy, FIELD_W, r->h, RGB(0x1b,0x5e,0x85));
+        for (int y = 5; y < r->h - 3; y += 9)
+            for (int x = ((y / 9) & 1) * 11 + 3; x < FIELD_W; x += 22) rect(x, sy + y, 8, 1, RGB(0x29,0x80,0xb9));
+        rect(0, sy, FIELD_W, 2, RGB(0x4a,0x3a,0x22)); rect(0, sy + r->h - 2, FIELD_W, 2, RGB(0x4a,0x3a,0x22));
+        rect(r->bx, sy - 2, r->bw, r->h + 4, RGB(0x8a,0x5a,0x2b));                /* puente de madera */
+        for (int y = 1; y < r->h + 3; y += 5) rect(r->bx, sy - 2 + y, r->bw, 1, RGB(0x4a,0x2f,0x13));
+        rect(r->bx, sy - 2, 2, r->h + 4, RGB(0x5a,0x3a,0x18)); rect(r->bx + r->bw - 2, sy - 2, 2, r->h + 4, RGB(0x5a,0x3a,0x18));
+    }
+}
+
+static void draw_tunnel_floor(void)
+{
+    int camy = cam_px();
+    if (!on_screen(bridge_y, BR_H, camy)) return;
+    rect(tunnel_x, bridge_y - camy, TUNNEL_W, BR_H, RGB(0x2a,0x21,0x18));
+}
+
+static void draw_bridge(void)
+{
+    int camy = cam_px();
+    if (!on_screen(bridge_y, BR_H, camy)) return;
+    int sy = bridge_y - camy, rx = tunnel_x + TUNNEL_W;
+    rect(0, sy + BR_H, tunnel_x, 5, RGB(0x1c,0x30,0x14));                    /* sombra */
+    rect(rx, sy + BR_H, FIELD_W - rx, 5, RGB(0x1c,0x30,0x14));
+    for (int side = 0; side < 2; side++) {                                    /* calzada */
+        int a = side ? rx : 0, b = side ? FIELD_W : tunnel_x;
+        rect(a, sy, b - a, BR_H, RGB(0x6f,0x6f,0x6f));
+        for (int x = a; x < b; x += 10) rect(x, sy + 3, 1, BR_H - 6, RGB(0x5b,0x5b,0x5b));
+    }
+    if (player_in_tunnel()) {                                                 /* dentro se ve al jugador: solo los bordes del techo */
+        rect(tunnel_x, sy, TUNNEL_W, 4, RGB(0x30,0x2c,0x26));
+        rect(tunnel_x, sy + BR_H - 4, TUNNEL_W, 4, RGB(0x30,0x2c,0x26));
+    } else {
+        rect(tunnel_x, sy, TUNNEL_W, BR_H, RGB(0x30,0x2c,0x26));
+    }
+    for (int x = 3; x < FIELD_W; x += 14) rect(x, sy + BR_H / 2 - 1, 7, 2, RGB(0xd9,0xc4,0x41));   /* línea central */
+    rect(0, sy, FIELD_W, 3, RGB(0xb5,0xb5,0xb5));                              /* barandillas */
+    rect(0, sy + BR_H - 3, FIELD_W, 3, RGB(0xb5,0xb5,0xb5));
+    for (int x = 0; x < FIELD_W; x += 15) { rect(x, sy - 1, 3, 5, RGB(0x8a,0x8a,0x8a)); rect(x, sy + BR_H - 4, 3, 5, RGB(0x8a,0x8a,0x8a)); }
+    rect(tunnel_x - 4, sy - 1, 4, 9, RGB(0x4a,0x4a,0x4a));                     /* bocas del túnel */
+    rect(rx, sy - 1, 4, 9, RGB(0x4a,0x4a,0x4a));
+    rect(tunnel_x - 4, sy + BR_H - 8, 4, 9, RGB(0x4a,0x4a,0x4a));
+    rect(rx, sy + BR_H - 8, 4, 9, RGB(0x4a,0x4a,0x4a));
+    rect(tunnel_x, sy, TUNNEL_W, 4, RGB(0x1e,0x1c,0x18));
+    rect(tunnel_x, sy + BR_H - 4, TUNNEL_W, 4, RGB(0x1e,0x1c,0x18));
+}
+
+static void bike_rect(int dx, int dy, int w, int h, uint16_t c)
+{
+    int sy = bridge_y + BR_H / 2 - cam_px();
+    int x = bike.dir > 0 ? (int)bike.x + dx : (int)bike.x - dx - w;
+    rect(x, sy + dy, w, h, c);
+}
+
+static void draw_bike(void)
+{
+    if (bike.wait > 0 && (bike.x < -30 || bike.x > FIELD_W + 30)) return;
+    int sy = bridge_y + BR_H / 2 - cam_px();
+    if (sy < -30 || sy > SCR_H + 30) return;
+    bike_rect(-14, -3, 6, 5, RGB(0x11,0x11,0x11)); bike_rect(9, -3, 6, 5, RGB(0x11,0x11,0x11));          /* ruedas */
+    bike_rect(-5, 4, 3, 5, RGB(0x55,0x55,0x55)); bike_rect(4, 4, 3, 5, RGB(0x55,0x55,0x55));              /* unión sidecar */
+    bike_rect(-2, 17, 7, 3, RGB(0x11,0x11,0x11));
+    bike_rect(-10, 8, 21, 10, RGB(0x4f,0x5a,0x2a)); bike_rect(-10, 8, 21, 2, RGB(0x3b,0x44,0x20));
+    bike_rect(-6, 10, 12, 6, RGB(0x1d,0x24,0x10));
+    bike_rect(-3, 10, 8, 6, RGB(0x2b,0x44,0x66)); bike_rect(-2, 9, 5, 4, RGB(0x1c,0x2d,0x42)); bike_rect(-1, 12, 3, 2, C_SKIN);
+    if (bike.throw_anim > 0) { bike_rect(3, 14, 3, 7, RGB(0x2b,0x44,0x66)); bike_rect(4, 21, 3, 3, RGB(0x3b,0x4a,0x2a)); }
+    else { bike_rect(3, 11, 3, 4, RGB(0x2b,0x44,0x66)); bike_rect(5, 15, 2, 2, RGB(0x3b,0x4a,0x2a)); }
+    bike_rect(-10, -3, 21, 7, RGB(0xd9,0x53,0x1e)); bike_rect(-10, -3, 21, 2, RGB(0xa6,0x3c,0x12));       /* moto */
+    bike_rect(8, -6, 3, 12, RGB(0x8c,0x8c,0x8c));
+    bike_rect(-5, -5, 8, 10, RGB(0x2f,0x2f,0x2f)); bike_rect(-3, -2, 5, 5, RGB(0x1a,0x1a,0x1a));
+    bike_rect(-12, -5, 6, 3, RGB(0xc0,0x26,0x1b));
 }
 
 static void render(void)
 {
     if (state == ST_TITLE) { draw_title(); return; }
     draw_terrain();
+    draw_rivers();
     draw_trenches();
+    draw_fort();
+    draw_tunnel_floor();
     draw_items();
+    draw_hostages();
     draw_obstacles(false);
     draw_vehicles();
     draw_enemies();
@@ -2158,12 +2617,28 @@ static void render(void)
     draw_obstacles(true);
     draw_bullets();
     draw_ebullets();
+    draw_bridge();
+    draw_bike();
     draw_grenades();
     draw_explosions();
     if (state == ST_GAMEOVER) {
         const char *g = "GAME OVER";
         int w = (int)st7789_text_width(g, 2);
         renderer_draw_text(FIELD_X + (FIELD_W - w) / 2, SCR_H / 2 - 7, g, COLOR_RED, COLOR_BLACK, 2);
+    }
+    if (state == ST_WIN) {
+        char buf[24];
+        const char *t1 = "FELICIDADES!";
+        snprintf(buf, sizeof buf, "FASE %d SUPERADA", level);
+        int w1 = (int)st7789_text_width(t1, 2), w2 = (int)st7789_text_width(buf, 1);
+        renderer_fill_rect((uint16_t)(FIELD_X + 10), (uint16_t)(SCR_H / 2 - 30), (uint16_t)(FIELD_W - 20), 60, COLOR_BLACK);
+        renderer_draw_text((uint16_t)(FIELD_X + (FIELD_W - w1) / 2), SCR_H / 2 - 24, t1, COLOR_YELLOW, COLOR_BLACK, 2);
+        renderer_draw_text((uint16_t)(FIELD_X + (FIELD_W - w2) / 2), SCR_H / 2 - 2, buf, COLOR_WHITE, COLOR_BLACK, 1);
+        if (win_t > GAME_SPEED * 3 && ((win_t / 25) & 1)) {
+            const char *c = "PULSA FUEGO";
+            int w3 = (int)st7789_text_width(c, 1);
+            renderer_draw_text((uint16_t)(FIELD_X + (FIELD_W - w3) / 2), SCR_H / 2 + 14, c, COLOR_RED, COLOR_BLACK, 1);
+        }
     }
     draw_hud();
 }

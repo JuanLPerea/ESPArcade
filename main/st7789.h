@@ -52,6 +52,16 @@ void st7789_flush(void);
 // seguir usando st7789_flush() (envia todo).
 void st7789_flush_limited(uint32_t max_bytes);
 
+// Estadisticas del ULTIMO flush (para el medidor de rendimiento del juego).
+//  rects/bytes : rectangulos y bytes de pixeles enviados.
+//  wait_us     : tiempo que flush() estuvo bloqueado esperando hueco (slot o cola).
+//  spi_us/trans: tiempo ocupado y transacciones del hilo SPI desde el flush
+//                anterior (solo con TFT_FAST_FLUSH; 0 en el camino antiguo).
+typedef struct {
+    uint32_t rects, bytes, wait_us, spi_us, trans;
+} st7789_flush_stats_t;
+void st7789_get_flush_stats(st7789_flush_stats_t *out);
+
 // Presupuesto recomendado por frame de juego: ~10 ms de SPI a 20 MHz.
 // Ajustalo entre 18000 (si el juego va a trompicones) y 32000 (si ves
 // la pantalla "a tirones" en las explosiones grandes).

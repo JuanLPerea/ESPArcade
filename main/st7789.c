@@ -5,6 +5,8 @@
 #include <assert.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_err.h"
@@ -348,44 +350,69 @@ static inline void copy_row_to_band(uint16_t *dst, const uint16_t *src, uint16_t
 
 #if TFT_FAST_FLUSH
 /* ---------------------------------------------------------
- * VOLCADO RAPIDO: transacciones SPI directas, sin esperas.
+ * VOLCADO RAPIDO: un hilo SPI propio, en el OTRO nucleo, con transacciones
+ * SPI directas (polling).
  *
- * Cada rectangulo = 6 transacciones en cola:
- *   0x2A (comando) + 4 bytes (columnas) | 0x2B + 4 bytes (filas) |
- *   0x2C (escritura) + pixeles (1 o mas transacciones, una por slot)
- * El pin DC lo pone el callback pre_cb segun trans->user (0 = comando,
- * 1 = datos). Las de comando/parametros usan tx_data (van dentro de la
- * propia estructura, sin buffer).
+ * Medido en la placa: la cola de transacciones de ESP-IDF
+ * (spi_device_queue_trans) cuesta ~80 us por transaccion, y cada rectangulo
+ * son 6 (0x2A + 4 bytes, 0x2B + 4 bytes, 0x2C + pixeles); con unos 300 por
+ * frame eran ~24 ms de pura espera ademas de los ~17 ms de datos. Las
+ * transacciones en polling no pasan por la cola ni por interrupciones y
+ * cuestan ~10 us, pero bloquean a quien las hace: por eso las hace un hilo
+ * aparte y el juego sigue dibujando.
  *
- * Los pixeles se copian (con el cambio de bytes) a "slots" de 8 KB
- * troceados de los dos buffers de banda de siempre (49152 B de 51200).
- * Una cola circular de FX_POOL transacciones y otra de FX_SLOTS slots:
- * como el bus las completa EN ORDEN, liberar la mas antigua libera el
- * slot mas antiguo. Solo se espera (reap) cuando se agotan.
+ *   juego (productor)                       hilo SPI (consumidor, nucleo 1)
+ *   flush_tiles() -> por cada rectangulo:
+ *     post WINDOW                      -->    0x2A/0x2B/0x2C (omite lo repetido)
+ *     coge un slot libre (semaforo)
+ *     copia filas con bswap al slot
+ *     post PIXELS (slot, n)            -->    datos por DMA (polling)
+ *                                             devuelve el slot (semaforo)
  *
- * flush() NO espera a que termine la DMA -- el siguiente frame sigue
- * calculandose mientras sale el actual. Quien toque el bus de otra forma
- * (registros, rotacion) debe llamar antes a drain_dma().
+ * Los pixeles se copian a "slots" de 8 KB troceados de los dos buffers de
+ * banda de siempre, asi que el framebuffer queda libre al instante. El hilo
+ * es el UNICO que toca el bus despues del arranque (los registros, como
+ * MADCTL, tambien van como trabajos). drain_dma() = barrera: espera a que
+ * el hilo haya terminado todo lo anterior.
  * --------------------------------------------------------- */
 #define FX_SLOT_BYTES      8192
 #define FX_SLOTS_PER_BUF   ((FLUSH_BAND_ROWS * 320 * 2) / FX_SLOT_BYTES)    /* 3 */
 #define FX_SLOTS           (2 * FX_SLOTS_PER_BUF)                             /* 6 */
-#define FX_POOL            40          /* transacciones en cola como maximo */
+#define FX_JOBS            48          /* trabajos en cola como maximo */
+#define FX_TASK_PRIO       2
+#define FX_YIELD_EVERY_US  3000000     /* cede 1 tick cada 3 s si va saturado (ver fx_task) */
 
 _Static_assert(FX_SLOTS_PER_BUF >= 1, "banda demasiado pequena para un slot");
 _Static_assert(FX_SLOT_BYTES >= 320 * 2, "un slot tiene que caber una fila de 320 px");
 
+typedef enum { FXJ_WINDOW = 1, FXJ_PIXELS, FXJ_REG, FXJ_FENCE } fx_kind_t;
+
 typedef struct {
-    spi_transaction_t t;               // DEBE ser el primer campo (container_of)
-    int8_t            slot;            // slot de pixeles que libera al completarse, o -1
-} fx_trans_t;
+    uint8_t  kind;
+    uint8_t  slot;                     // PIXELS: slot que contiene los datos
+    uint8_t  n;                        // REG: numero de parametros (0..4)
+    uint8_t  cmd;                      // REG: comando
+    uint16_t x0, y0, x1, y1;           // WINDOW (inclusive)
+    uint8_t  p[4];                     // REG: parametros
+    uint32_t npx;                      // PIXELS: numero de pixeles
+} fx_job_t;
 
 static spi_device_handle_t s_spi;
-static fx_trans_t s_tx[FX_POOL];
-static int s_tx_head  = 0;             // siguiente estructura libre
-static int s_tx_count = 0;             // transacciones en cola/en vuelo
-static int s_slot_head = 0;            // siguiente slot a usar
-static int s_slots_free = FX_SLOTS;
+static QueueHandle_t       s_jobq;
+static SemaphoreHandle_t   s_slot_sem;       // cuenta de slots libres
+static SemaphoreHandle_t   s_fence_sem;
+static int                 s_slot_head = 0;  // solo lo toca el productor
+
+// Estado del hilo SPI (solo lo toca el hilo SPI)
+static bool     s_win_valid = false;
+static uint16_t s_wx0, s_wx1, s_wy0, s_wy1;
+
+// Contadores: los escribe el hilo SPI, los lee flush (atomicos relajados)
+static uint32_t s_spi_busy_us = 0, s_spi_trans = 0;
+// Contadores del productor
+static uint32_t s_p_wait_us = 0, s_p_rects = 0, s_p_bytes = 0;
+
+static inline uint32_t fx_now_us(void) { return (uint32_t)esp_timer_get_time(); }
 
 static void IRAM_ATTR fx_pre_cb(spi_transaction_t *t) {
     gpio_set_level(PIN_DC, (int)(intptr_t)t->user);
@@ -396,98 +423,149 @@ static inline uint16_t *fx_slot_ptr(int i) {
                         (size_t)(i % FX_SLOTS_PER_BUF) * FX_SLOT_BYTES);
 }
 
-// Espera a que termine la transaccion MAS ANTIGUA y recupera sus recursos.
-static void fx_reap_one(void) {
-    spi_transaction_t *done = NULL;
-    ESP_ERROR_CHECK(spi_device_get_trans_result(s_spi, &done, portMAX_DELAY));
-    fx_trans_t *ft = (fx_trans_t *)done;
-    if (ft->slot >= 0) s_slots_free++;
-    s_tx_count--;
-}
-
-static void drain_dma(void) {
-    while (s_tx_count > 0) fx_reap_one();
-}
-
-// Estructura de transaccion libre (limpia). Si la cola esta llena, espera.
-static fx_trans_t *fx_get(void) {
-    while (s_tx_count >= FX_POOL) fx_reap_one();
-    fx_trans_t *ft = &s_tx[s_tx_head];
-    s_tx_head = (s_tx_head + 1) % FX_POOL;
-    memset(ft, 0, sizeof(*ft));
-    ft->slot = -1;
-    return ft;
-}
-
-static void fx_queue(fx_trans_t *ft) {
-    ESP_ERROR_CHECK(spi_device_queue_trans(s_spi, &ft->t, portMAX_DELAY));
-    s_tx_count++;
-}
-
-static void fx_cmd(uint8_t cmd) {
-    fx_trans_t *ft = fx_get();
-    ft->t.length = 8;
-    ft->t.flags = SPI_TRANS_USE_TXDATA;
-    ft->t.tx_data[0] = cmd;
-    ft->t.user = (void *)0;            // DC = 0
-    fx_queue(ft);
-}
-
-static void fx_data4(uint16_t a, uint16_t b) {
-    fx_trans_t *ft = fx_get();
-    ft->t.length = 32;
-    ft->t.flags = SPI_TRANS_USE_TXDATA;
-    ft->t.tx_data[0] = (uint8_t)(a >> 8);
-    ft->t.tx_data[1] = (uint8_t)a;
-    ft->t.tx_data[2] = (uint8_t)(b >> 8);
-    ft->t.tx_data[3] = (uint8_t)b;
-    ft->t.user = (void *)1;            // DC = 1
-    fx_queue(ft);
-}
-
-// Ventana de escritura (inclusive) y comando de escritura de memoria.
-static void fx_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
-    fx_cmd(0x2A); fx_data4(x0, x1);
-    fx_cmd(0x2B); fx_data4(y0, y1);
-    fx_cmd(0x2C);
-}
-
-// Reserva el siguiente slot de pixeles (espera si estan todos en vuelo).
-static uint16_t *fx_slot_acquire(int *idx) {
-    while (s_slots_free == 0) fx_reap_one();
-    *idx = s_slot_head;
-    s_slot_head = (s_slot_head + 1) % FX_SLOTS;
-    s_slots_free--;
-    return fx_slot_ptr(*idx);
-}
-
-static void fx_queue_pixels(uint16_t *buf, int slot, size_t npx) {
-    fx_trans_t *ft = fx_get();
-    ft->t.length = npx * 16;           // en bits
-    ft->t.tx_buffer = buf;
-    ft->t.user = (void *)1;
-    ft->slot = (int8_t)slot;
-    fx_queue(ft);
-}
-
-// Registro de configuracion (<= 4 parametros), sincrono. Vacia la cola antes.
-static void fx_reg(uint8_t cmd, const uint8_t *p, int n) {
-    drain_dma();
+/* ----- lado del hilo SPI: transacciones directas ----- */
+static void fx_hw_cmd(uint8_t c) {
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));
     t.length = 8;
     t.flags = SPI_TRANS_USE_TXDATA;
-    t.tx_data[0] = cmd;
-    t.user = (void *)0;
+    t.tx_data[0] = c;
+    t.user = (void *)0;                // DC = 0
     ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
-    if (n > 0) {
-        memset(&t, 0, sizeof(t));
-        t.length = (size_t)n * 8;
-        t.flags = SPI_TRANS_USE_TXDATA;
-        for (int i = 0; i < n && i < 4; i++) t.tx_data[i] = p[i];
-        t.user = (void *)1;
-        ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
+    __atomic_fetch_add(&s_spi_trans, 1, __ATOMIC_RELAXED);
+}
+
+static void fx_hw_params(const uint8_t *p, int n) {
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = (size_t)n * 8;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    for (int i = 0; i < n && i < 4; i++) t.tx_data[i] = p[i];
+    t.user = (void *)1;                // DC = 1
+    ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
+    __atomic_fetch_add(&s_spi_trans, 1, __ATOMIC_RELAXED);
+}
+
+static void fx_hw_range(uint8_t cmd, uint16_t a, uint16_t b) {
+    uint8_t p[4] = { (uint8_t)(a >> 8), (uint8_t)a, (uint8_t)(b >> 8), (uint8_t)b };
+    fx_hw_cmd(cmd);
+    fx_hw_params(p, 4);
+}
+
+// Ventana de escritura. Columnas/filas iguales a la ventana anterior no se
+// vuelven a mandar (el controlador las conserva); 0x2C reinicia el puntero.
+static void fx_hw_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    if (!s_win_valid || x0 != s_wx0 || x1 != s_wx1) { fx_hw_range(0x2A, x0, x1); s_wx0 = x0; s_wx1 = x1; }
+    if (!s_win_valid || y0 != s_wy0 || y1 != s_wy1) { fx_hw_range(0x2B, y0, y1); s_wy0 = y0; s_wy1 = y1; }
+    s_win_valid = true;
+    fx_hw_cmd(0x2C);
+}
+
+static void fx_hw_pixels(const uint16_t *buf, size_t npx) {
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = npx * 16;               // en bits
+    t.tx_buffer = buf;
+    t.user = (void *)1;
+    ESP_ERROR_CHECK(spi_device_polling_transmit(s_spi, &t));
+    __atomic_fetch_add(&s_spi_trans, 1, __ATOMIC_RELAXED);
+}
+
+static void fx_task(void *arg) {
+    (void)arg;
+    fx_job_t j;
+    uint32_t last_idle = fx_now_us();
+    for (;;) {
+        if (xQueueReceive(s_jobq, &j, 0) != pdTRUE) {
+            // Cola vacia: el juego va por detras del SPI. Aqui bloqueamos de
+            // verdad, y la tarea IDLE de este nucleo puede alimentar al watchdog.
+            last_idle = fx_now_us();
+            xQueueReceive(s_jobq, &j, portMAX_DELAY);
+        } else if (fx_now_us() - last_idle > FX_YIELD_EVERY_US) {
+            // El SPI va saturado y nunca se vacia la cola: sin esto la tarea
+            // IDLE de este nucleo no correria nunca (el task watchdog se queja).
+            // Un tick de pausa cada pocos segundos (un frame algo mas largo).
+            vTaskDelay(1);
+            last_idle = fx_now_us();
+        }
+
+        uint32_t t0 = fx_now_us();
+        switch (j.kind) {
+        case FXJ_WINDOW:
+            fx_hw_window(j.x0, j.y0, j.x1, j.y1);
+            break;
+        case FXJ_PIXELS:
+            fx_hw_pixels(fx_slot_ptr(j.slot), j.npx);
+            xSemaphoreGive(s_slot_sem);
+            break;
+        case FXJ_REG:
+            fx_hw_cmd(j.cmd);
+            if (j.n > 0) fx_hw_params(j.p, j.n);
+            if (j.cmd == 0x36) s_win_valid = false;     // por si el cambio de orientacion toca el puntero
+            break;
+        case FXJ_FENCE:
+            xSemaphoreGive(s_fence_sem);
+            break;
+        default:
+            break;
+        }
+        __atomic_fetch_add(&s_spi_busy_us, fx_now_us() - t0, __ATOMIC_RELAXED);
     }
+}
+
+/* ----- lado del juego: encolar trabajos ----- */
+static void fx_post(const fx_job_t *j) {
+    uint32_t t0 = fx_now_us();
+    xQueueSend(s_jobq, j, portMAX_DELAY);           // bloquea si hay FX_JOBS pendientes
+    s_p_wait_us += fx_now_us() - t0;
+}
+
+// Barrera: vuelve cuando el hilo SPI ha terminado todo lo encolado antes.
+static void drain_dma(void) {
+    fx_job_t j;
+    memset(&j, 0, sizeof(j));
+    j.kind = FXJ_FENCE;
+    xQueueSend(s_jobq, &j, portMAX_DELAY);
+    xSemaphoreTake(s_fence_sem, portMAX_DELAY);
+}
+
+// Registro de configuracion (<= 4 parametros), sincrono.
+static void fx_reg(uint8_t cmd, const uint8_t *p, int n) {
+    fx_job_t j;
+    memset(&j, 0, sizeof(j));
+    j.kind = FXJ_REG;
+    j.cmd = cmd;
+    j.n = (uint8_t)n;
+    for (int i = 0; i < n && i < 4; i++) j.p[i] = p[i];
+    xQueueSend(s_jobq, &j, portMAX_DELAY);
+    drain_dma();
+}
+
+static void fx_send_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    fx_job_t j;
+    memset(&j, 0, sizeof(j));
+    j.kind = FXJ_WINDOW;
+    j.x0 = x0; j.y0 = y0; j.x1 = x1; j.y1 = y1;
+    fx_post(&j);
+}
+
+// Reserva el siguiente slot de pixeles (espera si estan todos pendientes).
+static uint16_t *fx_slot_acquire(int *idx) {
+    uint32_t t0 = fx_now_us();
+    xSemaphoreTake(s_slot_sem, portMAX_DELAY);
+    s_p_wait_us += fx_now_us() - t0;
+    *idx = s_slot_head;
+    s_slot_head = (s_slot_head + 1) % FX_SLOTS;
+    return fx_slot_ptr(*idx);
+}
+
+static void fx_send_pixels(int slot, size_t npx) {
+    fx_job_t j;
+    memset(&j, 0, sizeof(j));
+    j.kind = FXJ_PIXELS;
+    j.slot = (uint8_t)slot;
+    j.npx = (uint32_t)npx;
+    fx_post(&j);
 }
 
 // Manda UN rectangulo del framebuffer (ya recortado a pantalla).
@@ -495,19 +573,21 @@ static void flush_one_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     uint16_t w = x1 - x0 + 1;
     uint16_t rows_per_slot = (uint16_t)(FX_SLOT_BYTES / ((size_t)w * 2));
 
-    fx_set_window(x0, y0, x1, y1);
+    s_p_rects++;
+    s_p_bytes += (uint32_t)w * (y1 - y0 + 1) * 2;
+    fx_send_window(x0, y0, x1, y1);
     for (uint16_t y = y0; y <= y1; y = (uint16_t)(y + rows_per_slot)) {
         uint16_t rows = (y + rows_per_slot - 1 <= y1) ? rows_per_slot : (uint16_t)(y1 - y + 1);
         int slot;
         uint16_t *buf = fx_slot_acquire(&slot);
         for (uint16_t r = 0; r < rows; r++)
             copy_row_to_band(&buf[(size_t)r * w], fb_ptr(fb_index(x0, (uint16_t)(y + r))), w);
-        fx_queue_pixels(buf, slot, (size_t)rows * w);
+        fx_send_pixels(slot, (size_t)rows * w);
     }
 }
 
-// Toma el control del bus: elimina el io de esp_lcd (que ya hizo el init)
-// y crea nuestro propio dispositivo SPI con el mismo CS.
+// Toma el control del bus: elimina el io de esp_lcd (que ya hizo el init),
+// crea nuestro dispositivo SPI con el mismo CS y arranca el hilo SPI.
 static void fx_take_over(void) {
     ESP_ERROR_CHECK(esp_lcd_panel_io_del(s_io));
     s_io = NULL;                       // s_panel ya no se puede usar a partir de aqui
@@ -525,10 +605,21 @@ static void fx_take_over(void) {
         .clock_speed_hz = TFT_SPI_HZ,
         .mode = 0,
         .spics_io_num = PIN_CS,
-        .queue_size = FX_POOL,
+        .queue_size = 1,               // solo polling
         .pre_cb = fx_pre_cb,
     };
     ESP_ERROR_CHECK(spi_bus_add_device(TFT_SPI_HOST, &dev, &s_spi));
+
+    s_jobq      = xQueueCreate(FX_JOBS, sizeof(fx_job_t));
+    s_slot_sem  = xSemaphoreCreateCounting(FX_SLOTS, FX_SLOTS);
+    s_fence_sem = xSemaphoreCreateBinary();
+    assert(s_jobq && s_slot_sem && s_fence_sem);
+
+    // En el nucleo contrario al que ejecuta el juego (que es quien llama aqui).
+    BaseType_t core = (portNUM_PROCESSORS > 1) ? (xPortGetCoreID() == 0 ? 1 : 0) : 0;
+    BaseType_t ok = xTaskCreatePinnedToCore(fx_task, "tft_spi", 4096, NULL, FX_TASK_PRIO, NULL, core);
+    assert(ok == pdPASS);
+    (void)ok;
 }
 
 #else  /* !TFT_FAST_FLUSH: camino original con esp_lcd_panel_draw_bitmap */
@@ -636,8 +727,23 @@ static uint32_t tile_hash(int tx, int ty) {
 }
 
 // budget_bytes = 0 -> sin limite (envia todo lo pendiente).
+static st7789_flush_stats_t s_stats;      // ultimo flush
+#if TFT_FAST_FLUSH
+static uint32_t s_prev_busy_us, s_prev_trans;
+#endif
+#if !TFT_FAST_FLUSH
+static uint32_t s_legacy_rects;           // contador del camino antiguo
+#endif
+
+void st7789_get_flush_stats(st7789_flush_stats_t *out) { *out = s_stats; }
+
 static void flush_tiles(uint32_t budget_bytes) {
     int tw = TFT_WIDTH / TILE, th = TFT_HEIGHT / TILE;
+#if TFT_FAST_FLUSH
+    s_p_wait_us = 0; s_p_rects = 0; s_p_bytes = 0;
+#else
+    s_legacy_rects = 0;
+#endif
 
     // 1) Dentro de las zonas sucias, marca como pendientes los tiles que
     //    realmente difieren de lo que hay en pantalla.
@@ -700,12 +806,29 @@ static void flush_tiles(uint32_t budget_bytes) {
                     s_tile_flags[idx] = (s_tile_flags[idx] | TILE_VALID) & ~TILE_PENDING;
                 }
 
+#if !TFT_FAST_FLUSH
+            s_legacy_rects++;
+#endif
             flush_one_rect(tx * TILE, ty * TILE,
                            (tx + run) * TILE - 1, (ty + rows) * TILE - 1);
             tx = end;
         }
     }
     s_rr_start = (stop_row >= 0) ? stop_row : 0;
+
+#if TFT_FAST_FLUSH
+    // Lo que ha trabajado el hilo SPI desde el flush anterior (va algo por detras).
+    uint32_t busy = __atomic_load_n(&s_spi_busy_us, __ATOMIC_RELAXED);
+    uint32_t trans = __atomic_load_n(&s_spi_trans, __ATOMIC_RELAXED);
+    s_stats.rects   = s_p_rects;
+    s_stats.bytes   = s_p_bytes;
+    s_stats.wait_us = s_p_wait_us;
+    s_stats.spi_us  = busy - s_prev_busy_us;
+    s_stats.trans   = trans - s_prev_trans;
+    s_prev_busy_us = busy; s_prev_trans = trans;
+#else
+    s_stats.rects = s_legacy_rects; s_stats.bytes = spent; s_stats.wait_us = 0; s_stats.spi_us = 0; s_stats.trans = 0;
+#endif
 }
 
 void st7789_flush(void)                   { flush_tiles(0); }
@@ -911,14 +1034,14 @@ void st7789_blit(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, const uint16_
     // de volcados lo garantiza la cola (FIFO).
     if (w == 0 || h == 0 || w > 320) return;
     uint16_t rows_per = (uint16_t)(FX_SLOT_BYTES / ((size_t)w * 2));
-    fx_set_window(x0, y0, (uint16_t)(x0 + w - 1), (uint16_t)(y0 + h - 1));
+    fx_send_window(x0, y0, (uint16_t)(x0 + w - 1), (uint16_t)(y0 + h - 1));
     for (uint16_t y = 0; y < h; y = (uint16_t)(y + rows_per)) {
         uint16_t n = (h - y < rows_per) ? (uint16_t)(h - y) : rows_per;
         int slot;
         uint16_t *dst = fx_slot_acquire(&slot);
         for (uint16_t r = 0; r < n; r++)
             copy_row_to_band(&dst[(size_t)r * w], buf + (size_t)(y + r) * w, w);
-        fx_queue_pixels(dst, slot, (size_t)n * w);
+        fx_send_pixels(slot, (size_t)n * w);
     }
 #else
     drain_dma();                          // este blit espera semaforo por banda

@@ -787,9 +787,20 @@ static void draw_bunker_full(int b) {
 }
 
 static void draw_saucer(int x, int y) {
-    renderer_fill_rect(x, y, SAUCER_W, SAUCER_H, COLOR_RED);
-}
 
+    // Cúpula superior
+    renderer_fill_rect(x + 6, y,     6, 2, COLOR_CYAN);
+
+    // Parte superior del platillo
+    renderer_fill_rect(x + 3, y + 2, 12, 2, COLOR_RED);
+
+    // Cuerpo principal
+    renderer_fill_rect(x,     y + 4, 18, 2, COLOR_RED);
+
+    // Parte inferior
+    renderer_fill_rect(x + 4, y + 6, 10, 1, COLOR_RED);
+
+}
 // ---------------------------------------------------------------------------
 // Render incremental de la partida en curso (SI_PLAYING/SI_PLAYER_DEAD/
 // SI_LEVEL_CLEAR). Cada elemento se borra/redibuja y transmite por

@@ -106,7 +106,7 @@ static inline void menu_sleep_ms(uint32_t ms)
 // más abajo.
 #define MENU_MUSIC_SILENCE_MS (2 * 1000)
 
-static const char *PROJECT_TITLE = "ARCADE COLOR";
+static const char *PROJECT_TITLE = "MISSING IN ARCADE";
 
 
 static int wrap_index(int idx)
@@ -223,6 +223,7 @@ static void draw_title(void)
         COLOR_BLACK
     );
 
+    // Dibujar el título principal con la escala actual
     renderer_draw_text(
         centered_x(
             PROJECT_TITLE,
@@ -235,6 +236,7 @@ static void draw_title(void)
         TITLE_SCALE
     );
 
+    // Detalle gráfico: Doble línea divisoria con muescas laterales estilo arcade
     renderer_fill_rect(
         10,
         DIVIDER_Y,
@@ -242,6 +244,17 @@ static void draw_title(void)
         2,
         COLOR_CYAN
     );
+    renderer_fill_rect(
+        20,
+        DIVIDER_Y + 3,
+        TFT_WIDTH - 40,
+        1,
+        COLOR_MAGENTA
+    );
+
+    // Pequeños adornos gráficos en las esquinas de la cabecera
+    renderer_fill_rect(5, 5, 3, 3, COLOR_YELLOW);
+    renderer_fill_rect(TFT_WIDTH - 8, 5, 3, 3, COLOR_YELLOW);
 }
 
 
@@ -526,7 +539,7 @@ static void animate_transition(
  * ===========================================================
  */
 
-#define FIRMWARE_VERSION "v1.5 ESP32"
+#define FIRMWARE_VERSION "v2.0 ESP32"
 #define FIRMWARE_AUTHOR  "JUANLU"
 
 typedef enum {
@@ -1696,9 +1709,9 @@ static void run_about_screen(void)
     about_draw_image();
 
     renderer_draw_text(
-        centered_x(PROJECT_TITLE, TITLE_SCALE),
+        centered_x("3 AMIGOS", TITLE_SCALE),
         5,
-        PROJECT_TITLE,
+        "3 AMIGOS",
         COLOR_RED,
         COLOR_BLACK,
         TITLE_SCALE

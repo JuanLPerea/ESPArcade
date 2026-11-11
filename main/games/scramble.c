@@ -1372,13 +1372,13 @@ static void draw_big_ship(void) {
     snprintf(buf, sizeof(buf), "%d", alien_hp);
     renderer_draw_text(core_x+ALIEN_CORE_W/2-3, ay+ALIEN_CORE_H+2, buf, COLOR_WHITE, COLOR_BLACK, 1);
 }
-/*
+
 static void draw_enemy_bullets(void) {
     for (int i=0;i<MAX_ENEMY_BULLETS;i++)
         if (enemy_bullets[i].active)
             renderer_fill_rect((int)enemy_bullets[i].x, (int)enemy_bullets[i].y, 4, 3, COLOR_RED);
 }
-*/
+
 static void draw_bullets(void) {
     for (int i=0;i<MAX_BULLETS;i++)
         if (bullets[i].active) renderer_fill_rect(bullets[i].x, bullets[i].y, 3, 2, COLOR_WHITE);
@@ -1472,6 +1472,7 @@ static void draw_playing_frame(void) {
     draw_big_ship();
     draw_bullets();
     draw_bombs();
+    draw_enemy_bullets();
     draw_particles();
     if (state == SCR_PLAYING || state == SCR_DEAD) draw_ship();
     draw_hud();

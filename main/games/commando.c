@@ -46,6 +46,7 @@
 #include "../renderer.h"
 #include "../controls.h"
 #include "../sound.h"
+#include "../highscores.h"
 
 /* ---------------------------------------------------------
  * Específico de ESP32: tiempo, rotación, controles
@@ -123,6 +124,7 @@ static int controls_joy_y(void) { return joy_axis(1, CMD_INVERT_Y); }   /* J1 Y,
 /* Entrada leída UNA vez por frame del bucle principal (los flancos no se
  * pierden aunque en un frame corran varios pasos de lógica). */
 static bool in_fire_down, in_nade_down, in_start_edge, in_quit_edge;
+static int  fire_buf;                 /* pulsación de disparo pendiente (el disparo no es automático) */
 static bool g_done;
 
 /* ---------------------------------------------------------
@@ -267,7 +269,7 @@ static int path_half(int y)
 /* ---------------------------------------------------------
  * Estado del juego
  * --------------------------------------------------------- */
-typedef enum { ST_TITLE, ST_PLAYING, ST_GAMEOVER, ST_WIN } GameState;
+typedef enum { ST_TITLE, ST_PLAYING, ST_GAMEOVER, ST_WIN, ST_SCORES } GameState;
 
 typedef struct {
     int32_t x, y;            /* esquina superior izquierda, Q8 */
@@ -363,6 +365,9 @@ static Explosion booms[MAX_EXPL];
 static Item      items[MAX_ITEMS];
 static int       spawn_timer;
 static int       gameover_t;
+static int       scores_t;
+static bool      scores_drawn;
+static bool      g_demo;
 
 static float frnd(float a, float b) { return a + (float)(rng() & 0xFFFF) / 65536.0f * (b - a); }
 static inline float pl_cx(void) { return (float)pl.x / 256.0f + PLAYER_W / 2.0f; }
@@ -1427,8 +1432,12 @@ static void fort_update(void)
     if (!fort_active) return;
     fort_timer++;
     if (fort_spawned < FORT_ENEMIES && fort_timer >= 85) {
-        float sx = (float)(fort_x + 4) + frnd(0, FORT_DOOR_W - 20), sy = 52;
-        bool blocked = false;
+        /* 1/3 por la puerta, 1/3 por cada lado del campo (bajo los muros, a la vista) */
+        int side = rnd_range(0, 2);
+        float sx, sy;
+        if (side == 0) { sx = (float)(fort_x + 4) + frnd(0, FORT_DOOR_W - 20); sy = 52; }
+        else { sx = (side == 1) ? 3.0f : (float)(FIELD_W - EW - 3); sy = frnd(118, 205); }
+        bool blocked = (side != 0 && obs_collide((int)sx, (int)sy, EW, EH));
         for (int i = 0; i < MAX_ENEMIES; i++)
             if (enemies[i].active && fabsf(enemies[i].x - sx) < 12 && fabsf(enemies[i].y - sy) < 16) blocked = true;
         Enemy *e = enemy_alloc();
@@ -1621,7 +1630,7 @@ static void game_init(bool next)
     pl.dir_x = 0; pl.dir_y = -1;
     pl.lives = 10;
     pl.grenades = 8;
-    pl.fire_cd = 0;
+    pl.fire_cd = 0; fire_buf = 0;
 
     memset(pbullets, 0, sizeof(pbullets));
     world_init();
@@ -1753,7 +1762,9 @@ static void update_player(void)
     if (pl.noise > 0) pl.noise--;
     if (pl.spread > 0) pl.spread--;
 
-    if (in_fire_down && pl.fire_cd <= 0) {
+    if (fire_buf > 0) fire_buf--;
+    if (fire_buf > 0 && pl.fire_cd <= 0) {
+        fire_buf = 0;
         player_shoot();
         pl.fire_cd = FIRE_CD;
     }
@@ -1846,7 +1857,15 @@ static void logic_step(void)
     }
     if (state == ST_GAMEOVER) {
         update_world();
-        if (--gameover_t <= 0) { state = ST_TITLE; title_t = 0; }
+        if (--gameover_t <= 0) {
+            if (!g_demo && highscores_is_top(CMD_GAME_ID, score))
+                highscores_enter(CMD_GAME_ID, score);          /* bloqueante, como en Scramble */
+            state = ST_SCORES; scores_t = 0; scores_drawn = false;
+        }
+        return;
+    }
+    if (state == ST_SCORES) {
+        if (++scores_t > GAME_SPEED * 8 || (scores_t > GAME_SPEED && in_start_edge)) g_done = true;   /* vuelta al menú */
     }
 }
 
@@ -2409,45 +2428,103 @@ static int perf_spi_ms10, perf_wait_ms10, perf_rects, perf_kb;
 #define C_PANEL RGB(0x10, 0x14, 0x08)
 #define C_FRAME RGB(0x6a, 0x6a, 0x5a)
 
+#ifndef CMD_SHOW_STATS
+#define CMD_SHOW_STATS 0                   /* 1 = muestra FPS/tiempos de depuración en el panel derecho */
+#endif
+
+/* Estrella de 11x11 para la decoración de los paneles */
+static const char *const STAR_BMP[11] = {
+    "     X     ", "     X     ", "    XXX    ", "XXXXXXXXXXX", " XXXXXXXXX ", "  XXXXXXX  ",
+    "  XXXXXXX  ", " XXXXXXXXX ", " XXXX XXXX ", " XXX   XXX ", "XX       XX" };
+
+static void panel_star(int cx, int cy, int sc, uint16_t col, uint16_t shadow)
+{
+    for (int pass = 0; pass < 2; pass++)
+        for (int y = 0; y < 11; y++)
+            for (int x = 0; x < 11; x++)
+                if (STAR_BMP[y][x] == 'X')
+                    rect_abs(cx - 11 * sc / 2 + x * sc + (pass == 0 ? 1 : 0), cy - 11 * sc / 2 + y * sc + (pass == 0 ? 1 : 0),
+                             sc, sc, pass == 0 ? shadow : col);
+}
+
+static void panel_bullet(int x, int y)
+{
+    rect_abs(x + 1, y, 4, 3, RGB(0xb8, 0x6a, 0x30));          /* punta de cobre */
+    rect_abs(x, y + 3, 6, 8, RGB(0xd8, 0xa8, 0x20));          /* vaina de latón */
+    rect_abs(x + 4, y + 3, 2, 8, RGB(0x9a, 0x78, 0x18));
+    rect_abs(x, y + 10, 6, 1, RGB(0x5a, 0x44, 0x10));
+}
+
+static void panel_text_c(int x0, int w, int y, const char *t, uint16_t col)
+{
+    renderer_draw_text((uint16_t)(x0 + (w - (int)st7789_text_width(t, 1)) / 2), (uint16_t)y, t, col, C_PANEL, 1);
+}
+
 static void draw_hud(void)
 {
     char buf[24];
     const int rx = FIELD_X + FIELD_W;                 /* inicio del panel derecho */
+    const int lw = FIELD_X - 2;                       /* ancho útil del panel izquierdo */
+    const int rw = SCR_W - rx - 2, rx0 = rx + 2;      /* ídem, panel derecho */
 
     if (!panels_ready) {
         rect_abs(0, 0, FIELD_X, SCR_H, C_PANEL);
         rect_abs(rx, 0, SCR_W - rx, SCR_H, C_PANEL);
         rect_abs(FIELD_X - 2, 0, 2, SCR_H, C_FRAME);   /* marco del campo */
         rect_abs(rx, 0, 2, SCR_H, C_FRAME);
-        renderer_draw_text(6, 8, "PUNTOS", COLOR_YELLOW, C_PANEL, 1);
-        renderer_draw_text(6, SCR_H - 30, "VIDAS", COLOR_YELLOW, C_PANEL, 1);
-        renderer_draw_text(6, 44, "GRANADAS", COLOR_YELLOW, C_PANEL, 1);
+        panel_text_c(0, lw, 8, "PUNTOS", COLOR_YELLOW);
+        panel_text_c(0, lw, 44, "GRANADAS", COLOR_YELLOW);
+        panel_text_c(0, lw, SCR_H - 30, "VIDAS", COLOR_YELLOW);
+
+        /* decoración (se pinta una sola vez por partida, no cuesta fps) */
+        panel_star(lw / 2, 112, 3, RGB(0xd8, 0xa8, 0x20), RGB(0x5a, 0x44, 0x10));
+        for (int r = 0; r < 2; r++)                                    /* cinta de balas */
+            for (int i = 0; i < 5; i++) panel_bullet(lw / 2 - 25 + i * 10, 150 + r * 16);
+        rect_abs(4, 80, lw - 8, 1, C_FRAME); rect_abs(4, 188, lw - 8, 1, C_FRAME);
+
+        panel_text_c(rx0, rw, 8, "COMMANDO", RGB(0xf8, 0x48, 0x28));
+        panel_text_c(rx0, rw, 20, "1985", COLOR_WHITE);
+        rect_abs(rx0 + 4, 34, rw - 8, 1, C_FRAME);
+        {   /* bloque de camuflaje */
+            static const uint16_t camo[4] = { RGB(0x2a,0x3a,0x18), RGB(0x3a,0x4a,0x20), RGB(0x1a,0x24,0x0e), RGB(0x4a,0x40,0x22) };
+            const int cx0 = rx0 + 5, cw = rw - 10, cy0 = 44, ch = SCR_H - 44 - 40;
+            rect_abs(cx0, cy0, cw, ch, camo[0]);
+            uint32_t q = 12345;
+            for (int i = 0; i < 26; i++) {
+                q = q * 1103515245u + 12345u;
+                int bw = 8 + (int)((q >> 16) % 14), bh = 6 + (int)((q >> 20) % 12);
+                q = q * 1103515245u + 12345u;
+                int bx = cx0 + (int)((q >> 16) % (uint32_t)(cw - bw)), by = cy0 + (int)((q >> 20) % (uint32_t)(ch - bh));
+                rect_abs(bx, by, bw, bh, camo[1 + (i % 3)]);
+            }
+            rect_abs(cx0 - 1, cy0 - 1, cw + 2, 1, C_FRAME); rect_abs(cx0 - 1, cy0 + ch, cw + 2, 1, C_FRAME);
+            rect_abs(cx0 - 1, cy0 - 1, 1, ch + 2, C_FRAME); rect_abs(cx0 + cw, cy0 - 1, 1, ch + 2, C_FRAME);
+            panel_star(rx0 + rw / 2, cy0 + ch / 2, 2, RGB(0xd8, 0xa8, 0x20), RGB(0x1a, 0x14, 0x04));
+        }
+        for (int i = 0; i < 4; i++) panel_bullet(rx0 + rw / 2 - 20 + i * 10, SCR_H - 30);
         panels_ready = true;
     }
 
     snprintf(buf, sizeof(buf), "%06lu", (unsigned long)score);
-    renderer_draw_text(6, 20, buf, COLOR_WHITE, C_PANEL, 1);
+    panel_text_c(0, lw, 20, buf, COLOR_WHITE);
     snprintf(buf, sizeof(buf), "%3d", pl.grenades);
-    renderer_draw_text(6, 56, buf, COLOR_WHITE, C_PANEL, 1);
+    panel_text_c(0, lw, 56, buf, COLOR_WHITE);
 
+#if CMD_SHOW_STATS
     snprintf(buf, sizeof(buf), "%2dFPS", perf_fps);
     renderer_draw_text(rx + 8, 8, buf, COLOR_YELLOW, C_PANEL, 1);
-    snprintf(buf, sizeof(buf), "D%2d.%d", perf_draw_ms10 / 10, perf_draw_ms10 % 10);
+    snprintf(buf, sizeof(buf), "D%2d.%d F%2d.%d", perf_draw_ms10 / 10, perf_draw_ms10 % 10, perf_flush_ms10 / 10, perf_flush_ms10 % 10);
     renderer_draw_text(rx + 8, 20, buf, COLOR_YELLOW, C_PANEL, 1);
-    snprintf(buf, sizeof(buf), "F%2d.%d", perf_flush_ms10 / 10, perf_flush_ms10 % 10);
-    renderer_draw_text(rx + 8, 32, buf, COLOR_YELLOW, C_PANEL, 1);
-    snprintf(buf, sizeof(buf), "S%2d.%d", perf_spi_ms10 / 10, perf_spi_ms10 % 10);
-    renderer_draw_text(rx + 8, 48, buf, COLOR_CYAN, C_PANEL, 1);
-    snprintf(buf, sizeof(buf), "W%2d.%d", perf_wait_ms10 / 10, perf_wait_ms10 % 10);
-    renderer_draw_text(rx + 8, 60, buf, COLOR_CYAN, C_PANEL, 1);
-    snprintf(buf, sizeof(buf), "R%3d", perf_rects);
-    renderer_draw_text(rx + 8, 72, buf, COLOR_CYAN, C_PANEL, 1);
-    snprintf(buf, sizeof(buf), "K%3d", perf_kb);
-    renderer_draw_text(rx + 8, 84, buf, COLOR_CYAN, C_PANEL, 1);
+    snprintf(buf, sizeof(buf), "S%2d.%d W%2d.%d", perf_spi_ms10 / 10, perf_spi_ms10 % 10, perf_wait_ms10 / 10, perf_wait_ms10 % 10);
+    renderer_draw_text(rx + 8, 32, buf, COLOR_CYAN, C_PANEL, 1);
+    snprintf(buf, sizeof(buf), "R%3d K%3d", perf_rects, perf_kb);
+    renderer_draw_text(rx + 8, 44, buf, COLOR_CYAN, C_PANEL, 1);
+#endif
 
-    rect_abs(6, SCR_H - 18, 10 * 5, 4, C_PANEL);      /* borra y repinta las vidas */
+    const int lx = (lw - (10 * 5 - 2)) / 2;           /* vidas centradas */
+    rect_abs(lx, SCR_H - 18, 10 * 5, 4, C_PANEL);     /* borra y repinta las vidas */
     for (int i = 0; i < pl.lives && i < 10; i++)
-        rect_abs(6 + i * 5, SCR_H - 18, 3, 4, C_BAND);
+        rect_abs(lx + i * 5, SCR_H - 18, 3, 4, C_BAND);
 }
 #else
 static void draw_hud(void)
@@ -2456,10 +2533,6 @@ static void draw_hud(void)
     rect(0, 0, FIELD_W, HUD_H, RGB(0, 0, 0));
     snprintf(buf, sizeof(buf), "PTS %06lu", (unsigned long)score);
     renderer_draw_text(FIELD_X + 3, 3, buf, COLOR_WHITE, COLOR_BLACK, 1);
-    snprintf(buf, sizeof(buf), "%2dFPS D%d.%d F%d.%d", perf_fps,
-             perf_draw_ms10 / 10, perf_draw_ms10 % 10,
-             perf_flush_ms10 / 10, perf_flush_ms10 % 10);
-    renderer_draw_text(FIELD_X + FIELD_W - (int)st7789_text_width(buf, 1) - 3, 3, buf, COLOR_YELLOW, COLOR_BLACK, 1);
     for (int i = 0; i < pl.lives && i < 10; i++)
         rect(3 + i * 5, SCR_H - 6, 3, 4, C_BAND);
 }
@@ -2476,8 +2549,8 @@ static void draw_title(void)
     {   /* el título va en el recuadro oscuro de arriba a la derecha del cartel */
         const char *t1 = "MISSING IN", *t2 = "ARCADE";
         const int cx = 228;
-        renderer_draw_text((uint16_t)(cx - (int)st7789_text_width(t1, 2) / 2)+12, 32, t1, RGB(0xf8, 0x48, 0x28), COLOR_BLACK, 2);
-        renderer_draw_text((uint16_t)(cx - (int)st7789_text_width(t2, 4) / 2)+12, 58, t2, RGB(0xf8, 0xb8, 0x00), COLOR_BLACK, 4);
+        renderer_draw_text((uint16_t)(cx - (int)st7789_text_width(t1, 2) / 2), 24, t1, RGB(0xf8, 0x48, 0x28), COLOR_BLACK, 2);
+        renderer_draw_text((uint16_t)(cx - (int)st7789_text_width(t2, 4) / 2), 46, t2, RGB(0xf8, 0xb8, 0x00), COLOR_BLACK, 4);
     }
     if ((title_t / 25) & 1) {
         const char *c = "PULSA FUEGO";
@@ -2603,6 +2676,10 @@ static void draw_bike(void)
 static void render(void)
 {
     if (state == ST_TITLE) { draw_title(); return; }
+    if (state == ST_SCORES) {
+        if (!scores_drawn) { renderer_clear(COLOR_BLACK); highscores_draw(CMD_GAME_ID, "COMMANDO", 20); scores_drawn = true; }
+        return;
+    }
     draw_terrain();
     draw_rivers();
     draw_trenches();
@@ -2659,13 +2736,14 @@ void game_commando_run(game_mode_t mode)
     /* 1 jugador; 2P se trata como 1P. En DEMO (attract del menú) aún no hay IA:
      * se muestra el título unos segundos y se vuelve al menú. */
     const bool is_demo = (mode == GAME_MODE_DEMO);
+    g_demo = is_demo;
     uint64_t demo_t0 = now_us();
 
     math_init();
     rng_state ^= (uint32_t)now_us();
     if (!rng_state) rng_state = 1;
     state = ST_TITLE;
-    g_done = false;
+    g_done = false; fire_buf = 0;
     title_t = 0;
 
     st7789_set_rotation(CMD_ROTATION);
@@ -2695,7 +2773,9 @@ void game_commando_run(game_mode_t mode)
 
         in_fire_down  = controls_button_down(BTN_FIRE);
         in_nade_down  = controls_button_down(BTN_NADE);
-        in_start_edge = controls_button_pressed(BTN_FIRE) || controls_button_pressed(BTN_NADE);
+        const bool fire_edge = controls_button_pressed(BTN_FIRE);
+        in_start_edge = fire_edge || controls_button_pressed(BTN_NADE);
+        if (fire_edge) fire_buf = 8;                 /* cada pulsación = un disparo (se guarda unos pasos si aún recarga) */
         in_quit_edge  = controls_button_pressed(BTN_IDX_J1_SW) || controls_button_pressed(BTN_IDX_J2_SW);
         if (in_quit_edge) break;
         if (is_demo && (now - demo_t0 > 5000000ULL || in_start_edge || in_fire_down)) break;
@@ -2742,6 +2822,9 @@ void game_commando_run(game_mode_t mode)
 
         vTaskDelayUntil(&last_wake, period_ticks ? period_ticks : 1);
     }
+
+    sound_stop_scramble_victory();
+    highscores_flush();
 
     /* Vuelta al menú: rotación horizontal y entrada limpia. */
     st7789_set_rotation(MENU_ROTATION);

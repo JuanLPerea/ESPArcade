@@ -11,8 +11,8 @@
  *
  *  - Resolución: campo a pantalla casi completa (320x240 apaisada,
  *    igual que Pong) en vez de 768x576 de vídeo compuesto. La
- *    formación original (32x20px por alien) no cabe ni de lejos aquí
- *    -- se reduce a 14x8px, manteniendo las 11 columnas.
+ *    formación original (32x20px por alien) no cabía aquí
+ *    -- ahora 24x15px y 8 columnas (sprites escalados con arect()).
  *  - Tiempo real: los 3 temporizadores del juego (paso de formación,
  *    aparición del platillo, velocidad de bombas) usaban
  *    absolute_time_t/make_timeout_ms()/time_reached_ms() del SDK de
@@ -158,10 +158,12 @@ static uint32_t prof_over;   // frames cuyo trabajo superó el período del bucl
 // ---------------------------------------------------------------------------
 // Dimensiones -- ver cabecera del archivo sobre el reescalado
 // ---------------------------------------------------------------------------
-#define ALIEN_COLS      6
+#define ALIEN_COLS      8
 #define ALIEN_ROWS      4
-#define ALIEN_W        32   // tamaño ORIGINAL -- con solo 6 columnas ya cabe de sobra
-#define ALIEN_H        20   // tamaño ORIGINAL
+#define ALIEN_W        24   // sprites diseñados en 32x20 y reducidos a 24x15 (ver arect())
+#define ALIEN_H        15
+#define ALIEN_DESIGN_W 32   // rejilla en la que están dibujados los sprites
+#define ALIEN_DESIGN_H 20
 #define ALIEN_PADX      6
 #define ALIEN_PADY      6
 #define ALIEN_STEP_X    3
@@ -380,8 +382,12 @@ static void reset_render_trace(void) {
  * (Antes la fórmula estaba calibrada para hasta 55 aliens; con solo
  * 24 ahora, recalibrada para el mismo tipo de curva de aceleración.)
  */
+// Paso horizontal por movimiento: el ÚLTIMO alien avanza a pasos más largos
+// (además de moverse en cada tick), así va claramente más rápido que con 2.
+static int form_step_px(void) { return (falive <= 1) ? ALIEN_STEP_X + 1 : ALIEN_STEP_X; }
+
 static int formation_interval_ms(int alive) {
-    if (alive <= 1) return 20; // Máxima velocidad absoluta para el último alien
+    if (alive <= 1) return 1; // el último alien se mueve en CADA tick (la mayor velocidad posible)
 
     int total_aliens = ALIEN_ROWS * ALIEN_COLS;
     if (total_aliens <= 1) return 20;
@@ -530,8 +536,9 @@ static void formation_step(void) {
     int xmin, ymin, xmax, ymax;
     formation_bounds(&xmin, &ymin, &xmax, &ymax);
 
-    bool hit_right = (xmax + ALIEN_STEP_X * fdir > PLAY_X + PLAY_W - 2);
-    bool hit_left  = (xmin + ALIEN_STEP_X * fdir < PLAY_X + 2);
+    const int stp = form_step_px();
+    bool hit_right = (xmax + stp * fdir > PLAY_X + PLAY_W - 2);
+    bool hit_left  = (xmin + stp * fdir < PLAY_X + 2);
 
     if ((fdir > 0 && hit_right) || (fdir < 0 && hit_left)) {
         for (int r = 0; r < ALIEN_ROWS; r++)
@@ -543,7 +550,7 @@ static void formation_step(void) {
         for (int r = 0; r < ALIEN_ROWS; r++)
             for (int c = 0; c < ALIEN_COLS; c++)
                 if (aliens[r][c].alive)
-                    aliens[r][c].x += ALIEN_STEP_X * fdir;
+                    aliens[r][c].x += stp * fdir;
     }
 
     fanim_phase ^= 1;
@@ -641,91 +648,102 @@ static int centered_x(const char *text, int scale) {
     return (x < 0) ? 0 : x;
 }
 
+// Rectángulo del sprite en la rejilla de diseño (32x20) llevado al tamaño real
+// del alien (ALIEN_W x ALIEN_H). Se escalan los BORDES (no ancho/alto), así los
+// rectángulos contiguos siguen encajando sin dejar huecos ni solaparse.
+static void arect(int x, int y, int rx, int ry, int rw, int rh, uint16_t color) {
+    int x0 = rx * ALIEN_W / ALIEN_DESIGN_W,        x1 = (rx + rw) * ALIEN_W / ALIEN_DESIGN_W;
+    int y0 = ry * ALIEN_H / ALIEN_DESIGN_H,        y1 = (ry + rh) * ALIEN_H / ALIEN_DESIGN_H;
+    if (x1 <= x0) x1 = x0 + 1;
+    if (y1 <= y0) y1 = y0 + 1;
+    renderer_fill_rect(x + x0, y + y0, x1 - x0, y1 - y0, color);
+}
+
 // Alien tipo A -- fila 0 (4 pts), sprite único (sin animación de cuerpo)
 static void draw_alien_A(int x, int y, int anim, uint16_t color) {
-    renderer_fill_rect(x+12, y+ 0,  8,  2, color);
-    renderer_fill_rect(x+10, y+ 2, 14,  2, color);
-    renderer_fill_rect(x+ 6, y+ 4, 20,  2, color);
-    renderer_fill_rect(x+ 2, y+ 6, 28,  2, color);
-    renderer_fill_rect(x+ 0, y+ 8,  8,  2, color);
-    renderer_fill_rect(x+14, y+ 8,  6,  2, color);
-    renderer_fill_rect(x+24, y+ 8,  8,  2, color);
-    renderer_fill_rect(x+ 0, y+10, 32,  2, color);
-    renderer_fill_rect(x+ 6, y+12,  8,  4, color);
-    renderer_fill_rect(x+18, y+12,  8,  4, color);
-    renderer_fill_rect(x+ 4, y+16,  4,  2, color);
-    renderer_fill_rect(x+12, y+16,  8,  2, color);
-    renderer_fill_rect(x+24, y+16,  6,  2, color);
+    arect(x, y, 12, 0, 8, 2, color);
+    arect(x, y, 10, 2, 14, 2, color);
+    arect(x, y, 6, 4, 20, 2, color);
+    arect(x, y, 2, 6, 28, 2, color);
+    arect(x, y, 0, 8, 8, 2, color);
+    arect(x, y, 14, 8, 6, 2, color);
+    arect(x, y, 24, 8, 8, 2, color);
+    arect(x, y, 0, 10, 32, 2, color);
+    arect(x, y, 6, 12, 8, 4, color);
+    arect(x, y, 18, 12, 8, 4, color);
+    arect(x, y, 4, 16, 4, 2, color);
+    arect(x, y, 12, 16, 8, 2, color);
+    arect(x, y, 24, 16, 6, 2, color);
     if (anim == 0) {
-        renderer_fill_rect(x+ 0, y+18,  4,  2, color);
-        renderer_fill_rect(x+ 8, y+18,  4,  2, color);
-        renderer_fill_rect(x+20, y+18,  4,  2, color);
-        renderer_fill_rect(x+28, y+18,  4,  2, color);
+        arect(x, y, 0, 18, 4, 2, color);
+        arect(x, y, 8, 18, 4, 2, color);
+        arect(x, y, 20, 18, 4, 2, color);
+        arect(x, y, 28, 18, 4, 2, color);
     } else {
-        renderer_fill_rect(x+ 2, y+16,  4,  2, color);
-        renderer_fill_rect(x+10, y+18,  4,  2, color);
-        renderer_fill_rect(x+18, y+18,  4,  2, color);
-        renderer_fill_rect(x+26, y+16,  4,  2, color);
+        arect(x, y, 2, 16, 4, 2, color);
+        arect(x, y, 10, 18, 4, 2, color);
+        arect(x, y, 18, 18, 4, 2, color);
+        arect(x, y, 26, 16, 4, 2, color);
     }
 }
 
 // Alien tipo B -- filas 1-2 (3 pts), 2 frames de animación de cuerpo
 static void draw_alien_B(int x, int y, int anim, uint16_t color) {
-    renderer_fill_rect(x+ 6, y+ 0,  2,  2, color);
-    renderer_fill_rect(x+24, y+ 0,  2,  2, color);
-    renderer_fill_rect(x+ 8, y+ 2,  4,  2, color);
-    renderer_fill_rect(x+20, y+ 2,  4,  2, color);
-    renderer_fill_rect(x+ 6, y+ 4, 20,  2, color);
-    renderer_fill_rect(x+ 4, y+ 6, 24,  2, color);
-    renderer_fill_rect(x+ 0, y+10, 32,  2, color);
-    renderer_fill_rect(x+ 6, y+14,  4,  4, color);
-    renderer_fill_rect(x+22, y+14,  4,  4, color);
-    renderer_fill_rect(x+ 0, y+16,  2,  2, color);
-    renderer_fill_rect(x+30, y+16,  2,  2, color);
+    arect(x, y, 6, 0, 2, 2, color);
+    arect(x, y, 24, 0, 2, 2, color);
+    arect(x, y, 8, 2, 4, 2, color);
+    arect(x, y, 20, 2, 4, 2, color);
+    arect(x, y, 6, 4, 20, 2, color);
+    arect(x, y, 4, 6, 24, 2, color);
+    arect(x, y, 0, 10, 32, 2, color);
+    arect(x, y, 6, 14, 4, 4, color);
+    arect(x, y, 22, 14, 4, 4, color);
+    arect(x, y, 0, 16, 2, 2, color);
+    arect(x, y, 30, 16, 2, 2, color);
     if (anim == 0) {
-        renderer_fill_rect(x+ 2, y+ 8,  6,  2, color);
-        renderer_fill_rect(x+12, y+ 8,  8,  2, color);
-        renderer_fill_rect(x+24, y+ 8,  6,  2, color);
-        renderer_fill_rect(x+ 0, y+12,  4,  4, color);
-        renderer_fill_rect(x+ 6, y+12, 20,  2, color);
-        renderer_fill_rect(x+28, y+12,  4,  4, color);
-        renderer_fill_rect(x+ 8, y+18,  6,  2, color);
-        renderer_fill_rect(x+18, y+18,  6,  2, color);
+        arect(x, y, 2, 8, 6, 2, color);
+        arect(x, y, 12, 8, 8, 2, color);
+        arect(x, y, 24, 8, 6, 2, color);
+        arect(x, y, 0, 12, 4, 4, color);
+        arect(x, y, 6, 12, 20, 2, color);
+        arect(x, y, 28, 12, 4, 4, color);
+        arect(x, y, 8, 18, 6, 2, color);
+        arect(x, y, 18, 18, 6, 2, color);
     } else {
-        renderer_fill_rect(x+ 4, y+ 6,  6,  2, color);
-        renderer_fill_rect(x+12, y+ 6, 16,  2, color);
-        renderer_fill_rect(x+ 2, y+ 8,  8,  2, color);
-        renderer_fill_rect(x+12, y+ 8,  8,  2, color);
-        renderer_fill_rect(x+24, y+ 8,  6,  2, color);
-        renderer_fill_rect(x+ 0, y+12,  4,  4, color);
-        renderer_fill_rect(x+ 6, y+12, 20,  2, color);
-        renderer_fill_rect(x+28, y+12,  4,  4, color);
-        renderer_fill_rect(x+ 6, y+18,  6,  2, color);
-        renderer_fill_rect(x+20, y+18,  6,  2, color);
+        arect(x, y, 4, 6, 6, 2, color);
+        arect(x, y, 12, 6, 16, 2, color);
+        arect(x, y, 2, 8, 8, 2, color);
+        arect(x, y, 12, 8, 8, 2, color);
+        arect(x, y, 24, 8, 6, 2, color);
+        arect(x, y, 0, 12, 4, 4, color);
+        arect(x, y, 6, 12, 20, 2, color);
+        arect(x, y, 28, 12, 4, 4, color);
+        arect(x, y, 6, 18, 6, 2, color);
+        arect(x, y, 20, 18, 6, 2, color);
     }
 }
 
 // Alien tipo C -- fila 3 (1 pt), alien grande
 static void draw_alien_C(int x, int y, int anim, uint16_t color) {
-    renderer_fill_rect(x+10, y+ 0, 12,  2, color);
-    renderer_fill_rect(x+ 4, y+ 2, 24,  2, color);
-    renderer_fill_rect(x+ 2, y+ 4, 30,  2, color);
-    renderer_fill_rect(x+ 0, y+ 6, 32,  2, color);
-    renderer_fill_rect(x+ 0, y+ 8,  8,  2, color);
-    renderer_fill_rect(x+14, y+ 8,  6,  2, color);
-    renderer_fill_rect(x+24, y+ 8,  8,  2, color);
-    renderer_fill_rect(x+ 0, y+10, 32,  2, color);
-    renderer_fill_rect(x+ 4, y+12, 10,  4, color);
-    renderer_fill_rect(x+18, y+12, 10,  4, color);
-    renderer_fill_rect(x+ 4, y+16,  6,  2, color);
-    renderer_fill_rect(x+14, y+16,  4,  2, color);
-    renderer_fill_rect(x+24, y+16,  4,  2, color);
+    arect(x, y, 10, 0, 12, 2, color);
+    arect(x, y, 4, 2, 24, 2, color);
+    arect(x, y, 2, 4, 30, 2, color);
+    arect(x, y, 0, 6, 32, 2, color);
+    arect(x, y, 0, 8, 8, 2, color);
+    arect(x, y, 14, 8, 6, 2, color);
+    arect(x, y, 24, 8, 8, 2, color);
+    arect(x, y, 0, 10, 32, 2, color);
+    arect(x, y, 4, 12, 10, 4, color);
+    arect(x, y, 18, 12, 10, 4, color);
+    arect(x, y, 4, 16, 6, 2, color);
+    arect(x, y, 14, 16, 4, 2, color);
+    arect(x, y, 24, 16, 4, 2, color);
     if (anim == 0) {
-        renderer_fill_rect(x+ 6, y+18,  4,  2, color);
-        renderer_fill_rect(x+22, y+18,  4,  2, color);
+        arect(x, y, 6, 18, 4, 2, color);
+        arect(x, y, 22, 18, 4, 2, color);
     } else {
-        renderer_fill_rect(x+ 2, y+18,  4,  2, color);
-        renderer_fill_rect(x+26, y+18,  4,  2, color);
+        arect(x, y, 2, 18, 4, 2, color);
+        arect(x, y, 26, 18, 4, 2, color);
     }
 }
 

@@ -112,17 +112,23 @@
 // ---------------------------------------------------------------------------
 // IA Adaptativa -- identica al original.
 // ---------------------------------------------------------------------------
-static const float AI_BASE_SPEED[4] = { 90.0f, 150.0f, 220.0f, 340.0f }; // px/s
-#define AI_SPEED_CAP 480.0f                                              // px/s
+static const float AI_BASE_SPEED[4] = { 120.0f, 170.0f, 230.0f, 300.0f }; // px/s
+#define AI_SPEED_CAP 380.0f                                              // px/s
 #define AI_CENTER_SPEED 220.0f  // px/s, recentrado suave cuando la bola está lejos
 #define DEMO_AI_SPEED   260.0f  // px/s, velocidad de ambas palas en el modo demo (attract mode)
 static const int AI_BASE_VISION[4] = {
-    PLAY_X + PLAY_W*4/5,
-    PLAY_X + PLAY_W*3/5,
-    PLAY_X + PLAY_W*2/5,
-    0,
+    PLAY_X + PLAY_W*11/20,
+    PLAY_X + PLAY_W*9/20,
+    PLAY_X + PLAY_W*7/20,
+    PLAY_X + PLAY_W*5/20,
 };
-static const int AI_BASE_ERROR[4] = { 32, 24, 18, 10 };
+// Error MAXIMO de puntería (px). En cada punto el error real es un valor al
+// azar entre 0 y este máximo, con signo al azar. La pala de la IA acierta si
+// el error es menor de ~25 px (media pala + media bola), así que estos
+// máximos dan una probabilidad de fallo por golpe de ~34%, 31%, 22% y 17%
+// según el nivel. (Antes el error era FIJO: 32 px en el nivel 0 = fallaba
+// siempre, y 24/18/10 en los demás = no fallaba nunca por puntería.)
+static const int AI_BASE_ERROR[4] = { 38, 36, 32, 30 };
 
 typedef struct {
     int   avg_center_y;
@@ -131,6 +137,7 @@ typedef struct {
     int   player_total_pts;
     int   ai_total_pts;
     int   ai_error;
+    int   ai_error_max;   // error máximo del nivel/racha actual (ver ai_roll_error)
     int   ai_error_dir;
     float ai_speed;   // px/s
     int   target_y;
@@ -177,6 +184,23 @@ static bool field_needs_redraw = true;
 
 static char prev_bottom_msg[32] = "";
 static bool prev_levelup_shown = false;
+
+// ---------------------------------------------------------------------------
+// Modo de control de las palas -- seleccionable en la pantalla de título
+// (izquierda/derecha del stick; arriba/abajo sigue cambiando 1/2 jugadores):
+//  - INERCIA (por defecto): el stick acelera la pala (enc_momentum), hay que
+//    soltarlo para que frene.
+//  - DIRECTO: la posición del stick (eje Y) se mapea 1:1 a la posición de la
+//    pala: centrado = pala en el centro, a fondo = pala en el extremo.
+// ---------------------------------------------------------------------------
+typedef enum { PONG_CTRL_INERTIA = 0, PONG_CTRL_DIRECT = 1, PONG_CTRL_COUNT } pong_ctrl_mode_t;
+static pong_ctrl_mode_t ctrl_mode = PONG_CTRL_INERTIA;
+static const char * const ctrl_mode_names[PONG_CTRL_COUNT] = { "INERCIA", "DIRECTO" };
+#define PAD_DIRECT_DEADZONE 40   // sobre -1000..1000 de controls_debug_axis_normalized()
+
+static bool  menu_armed_x    = false;   // mismo "empujón" que el selector 1P/2P, pero en el eje X
+static float menu_center_x_t = 0.0f;
+static float menu_gap_x_t    = 0.0f;
 
 static int clamp(int v, int lo, int hi) { return v<lo?lo:v>hi?hi:v; }
 static float clampf(float v, float lo, float hi) { return v<lo?lo:v>hi?hi:v; }
@@ -276,9 +300,32 @@ static float enc_momentum(int enc_raw, float *vel, float dt) {
     return *vel;
 }
 
+// Modo DIRECTO: posición del stick (eje Y de J1 = axis 1, de J2 = axis 3) -> posición de la pala.
+static void pad_update_direct(Pad *p, int axis_id, int ph) {
+    int norm = controls_debug_axis_normalized(axis_id);
+    if (norm > -PAD_DIRECT_DEADZONE && norm < PAD_DIRECT_DEADZONE) norm = 0;
+    else if (norm > 0) norm -= PAD_DIRECT_DEADZONE;
+    else               norm += PAD_DIRECT_DEADZONE;
+    float t = clampf((float)norm * (1000.0f / (float)(1000 - PAD_DIRECT_DEADZONE)) / 1000.0f, -1.0f, 1.0f);
+    float half = (float)(PLAY_H - ph) / 2.0f;
+    p->y   = clampf((float)PLAY_Y + half + t * half, (float)PLAY_Y, (float)(PLAY_Y + PLAY_H - ph));
+    p->vel = 0.0f;   // sin velocidad heredada si luego se cambia de modo
+}
+
+// Mueve la pala de un jugador humano (idx 0 = J1/p1, 1 = J2/p2) según el modo activo.
+static void human_pad_update(Pad *p, int idx, float dt) {
+    if (ctrl_mode == PONG_CTRL_DIRECT) {
+        pad_update_direct(p, idx == 0 ? 1 : 3, (p == &p1) ? paddle_h : PADDLE_H);
+    } else {
+        pad_move(p, enc_momentum(controls_get_raw_delta(idx), &p->vel, dt) * dt);
+    }
+}
+
 static int ai_lv(void) {
-    int total = p1.score + p2.score;
-    return total >= 20 ? 3 : total >= 12 ? 2 : total >= 5 ? 1 : 0;
+    // Nivel según los puntos del JUGADOR (no el total): la IA sube de nivel
+    // cuando el jugador va ganando, no solo porque pase el tiempo.
+    int pts = p1.score;
+    return pts >= 20 ? 3 : pts >= 12 ? 2 : pts >= 5 ? 1 : 0;
 }
 
 static int player_paddle_h(void) {
@@ -320,6 +367,20 @@ static int ai_predict_ball_y(void) {
     return (int)(y + BALL_SZ / 2);
 }
 
+// Sortea el error de puntería de la IA: valor al azar entre 0 y el máximo, con
+// signo al azar (ligeramente sesgado según dónde juegue el jugador). Se llama
+// al empezar cada punto Y en cada devolución de la IA, para que la
+// probabilidad de fallo sea POR GOLPE (~17-34% según el nivel) y los
+// peloteos largos acaben favoreciendo al jugador, en vez de que la IA acierte
+// o falle un punto entero según el error que le tocó al principio.
+static void ai_roll_error(void) {
+    ai_prof.ai_error = ai_prof.ai_error_max * (int)(rand() % 101) / 100;
+    int r = (int)(rand() % 100);
+    if (ai_prof.zone_bias > 2)       ai_prof.ai_error_dir = (r < 65) ? -1 : 1;
+    else if (ai_prof.zone_bias < -2) ai_prof.ai_error_dir = (r < 65) ?  1 : -1;
+    else                             ai_prof.ai_error_dir = (r < 50) ? 1 : -1;
+}
+
 static void ai_profile_update(bool player_scored) {
     int lv = ai_lv();
 
@@ -340,28 +401,24 @@ static void ai_profile_update(bool player_scored) {
     if (ai_prof.zone_bias < -8) ai_prof.zone_bias = -8;
 
     int base_err = AI_BASE_ERROR[lv];
-    if (ai_prof.streak >= 5)       base_err = base_err * 58 / 100;
-    else if (ai_prof.streak >= 4)  base_err = base_err * 70 / 100;
-    else if (ai_prof.streak >= 3)  base_err = base_err * 82 / 100;
-    else if (ai_prof.streak >= 2)  base_err = base_err * 92 / 100;
+    if (ai_prof.streak >= 5)       base_err = base_err * 78 / 100;
+    else if (ai_prof.streak >= 4)  base_err = base_err * 84 / 100;
+    else if (ai_prof.streak >= 3)  base_err = base_err * 90 / 100;
+    else if (ai_prof.streak >= 2)  base_err = base_err * 95 / 100;
 
     if (lv < 3) {
         if (ai_prof.streak <= -4)       base_err = base_err * 140 / 100;
         else if (ai_prof.streak <= -2)  base_err = base_err * 120 / 100;
     }
 
-    if (base_err < 4)  base_err = 4;
-    if (base_err > 80) base_err = 80;
-    ai_prof.ai_error = base_err;
-
-    int r = (int)(rand() % 100);
-    if (ai_prof.zone_bias > 2)       ai_prof.ai_error_dir = (r < 65) ? -1 : 1;
-    else if (ai_prof.zone_bias < -2) ai_prof.ai_error_dir = (r < 65) ?  1 : -1;
-    else                             ai_prof.ai_error_dir = (r < 50) ? 1 : -1;
+    if (base_err < 30) base_err = 30;
+    if (base_err > 60) base_err = 60;
+    ai_prof.ai_error_max = base_err;
+    ai_roll_error();
 
     float spd = AI_BASE_SPEED[lv];
-    if (ai_prof.streak >= 3) spd = spd * 1.15f;
-    if (ai_prof.streak >= 5) spd = spd * 1.20f;
+    if (ai_prof.streak >= 3) spd = spd * 1.08f;
+    if (ai_prof.streak >= 5) spd = spd * 1.10f;
     if (spd > AI_SPEED_CAP) spd = AI_SPEED_CAP;
     ai_prof.ai_speed = spd;
 
@@ -374,7 +431,8 @@ static void ai_profile_init(void) {
     ai_prof.streak        = 0;
     ai_prof.player_total_pts = 0;
     ai_prof.ai_total_pts     = 0;
-    ai_prof.ai_error      = AI_BASE_ERROR[0];
+    ai_prof.ai_error_max  = AI_BASE_ERROR[0];
+    ai_prof.ai_error      = AI_BASE_ERROR[0] * 6 / 10;   // 1er punto: error moderado
     ai_prof.ai_error_dir  = 1;
     ai_prof.ai_speed      = AI_BASE_SPEED[0];
     ai_prof.target_y      = CY;
@@ -531,6 +589,34 @@ static void draw_field_static(void) {
     field_needs_redraw = false;
 }
 
+// Pinta un rectángulo de negro y REPARA lo estático que hubiera debajo
+// (muros, línea central, marcadores y rótulos): antes, al borrar la bola o
+// una pala, o al limpiar el cuadro de un mensaje, se llevaban por delante
+// trozos de las líneas del campo y de los números.
+static bool rect_hit(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+static void fill_rect_clip(int x, int y, int w, int h, int cx0, int cy0, int cw, int ch, uint16_t col) {
+    int x0 = x > cx0 ? x : cx0, y0 = y > cy0 ? y : cy0;
+    int x1 = (x + w < cx0 + cw) ? x + w : cx0 + cw, y1 = (y + h < cy0 + ch) ? y + h : cy0 + ch;
+    if (x1 > x0 && y1 > y0) renderer_fill_rect(x0, y0, x1 - x0, y1 - y0, col);
+}
+
+static void clear_rect_repair(int x, int y, int w, int h) {
+    renderer_fill_rect(x, y, w, h, COLOR_BLACK);
+    fill_rect_clip(x, y, w, h, PLAY_X, PLAY_Y,          PLAY_W, 2, COLOR_WHITE);      // muro superior
+    fill_rect_clip(x, y, w, h, PLAY_X, PLAY_Y+PLAY_H-2, PLAY_W, 2, COLOR_WHITE);      // muro inferior
+    if (rect_hit(x, y, w, h, CX-1, PLAY_Y, 2, PLAY_H))                                // línea central
+        for (int yy = PLAY_Y+4; yy < PLAY_Y+PLAY_H-10; yy += 16)
+            fill_rect_clip(x, y, w, h, CX-1, yy, 2, 8, COLOR_WHITE);
+    // lo que sea texto se vuelve a pintar en el mismo frame (ver draw_playing_frame)
+    if (rect_hit(x, y, w, h, CX-90, PLAY_Y+6, 40, 24)) prev_p1_score = -1;
+    if (rect_hit(x, y, w, h, CX+50, PLAY_Y+6, 40, 24)) prev_p2_score = -1;
+    if (rect_hit(x, y, w, h, CX-70, CY-30, 140, 44))   prev_levelup_shown = false;
+    if (rect_hit(x, y, w, h, 0, PLAY_Y+PLAY_H-24, TFT_WIDTH, 18)) prev_bottom_msg[0] = '\x01';
+}
+
 static bool draw_score_if_changed(void) {
     char buf[4];
     bool changed = false;
@@ -554,47 +640,35 @@ static bool draw_score_if_changed(void) {
 static void draw_playing_frame(void) {
     if (field_needs_redraw) draw_field_static();
 
-    // p1/p2/ball ahora guardan posición sub-píxel en float (para que la
-    // física con dt variable no pierda precisión); se redondea a entero
-    // solo aquí, justo para dibujar, y se compara en enteros para no
-    // redibujar cada frame por ruido de sub-píxel sin cambio visible.
+    // p1/p2/ball guardan posición sub-píxel en float; se redondea a entero
+    // solo aquí y se compara en enteros para no redibujar sin cambio visible.
     int p1_draw_y   = (int)(p1.y + 0.5f);
     int p2_draw_y   = (int)(p2.y + 0.5f);
     int ball_draw_x = (int)(ball.x + 0.5f);
     int ball_draw_y = (int)(ball.y + 0.5f);
 
-    if (prev_p1_y != p1_draw_y || prev_paddle_h != paddle_h) {
-        if (prev_p1_y >= 0)
-            renderer_fill_rect(p1.x, prev_p1_y, PADDLE_W,
-                                (prev_paddle_h > 0) ? prev_paddle_h : paddle_h, COLOR_BLACK);
-        renderer_fill_rect(p1.x, p1_draw_y, PADDLE_W, paddle_h, COLOR_P1);
-        prev_p1_y = p1_draw_y;
-        prev_paddle_h = paddle_h;
-        renderer_flush();
-    }
-    if (prev_p2_y != p2_draw_y) {
-        if (prev_p2_y >= 0)
-            renderer_fill_rect(p2.x, prev_p2_y, PADDLE_W, PADDLE_H, COLOR_BLACK);
-        renderer_fill_rect(p2.x, p2_draw_y, PADDLE_W, PADDLE_H, COLOR_P2);
-        prev_p2_y = p2_draw_y;
-        renderer_flush();
-    }
-    if (prev_ball_x != ball_draw_x || prev_ball_y != ball_draw_y) {
-        if (prev_ball_x >= 0)
-            renderer_fill_rect(prev_ball_x, prev_ball_y, BALL_SZ, BALL_SZ, COLOR_BLACK);
-        renderer_fill_rect(ball_draw_x, ball_draw_y, BALL_SZ, BALL_SZ, COLOR_WHITE);
-        prev_ball_x = ball_draw_x;
-        prev_ball_y = ball_draw_y;
-        renderer_flush();
-    }
+    bool p1_moved   = (prev_p1_y != p1_draw_y || prev_paddle_h != paddle_h);
+    bool p2_moved   = (prev_p2_y != p2_draw_y);
+    bool ball_moved = (prev_ball_x != ball_draw_x || prev_ball_y != ball_draw_y);
+    bool dirty = false;
 
+    // 1) Borrar posiciones anteriores (reparando el campo que hubiera debajo).
+    if (p1_moved && prev_p1_y >= 0) {
+        clear_rect_repair(p1.x, prev_p1_y, PADDLE_W, (prev_paddle_h > 0) ? prev_paddle_h : paddle_h);
+        dirty = true;
+    }
+    if (p2_moved && prev_p2_y >= 0) { clear_rect_repair(p2.x, prev_p2_y, PADDLE_W, PADDLE_H); dirty = true; }
+    if (ball_moved && prev_ball_x >= 0) { clear_rect_repair(prev_ball_x, prev_ball_y, BALL_SZ, BALL_SZ); dirty = true; }
+
+    // 2) Textos (marcadores, LEVEL UP, mensaje inferior) -- también los que
+    //    el borrado anterior haya dejado marcados para repintar.
     bool ui_changed = draw_score_if_changed();
 
     bool bon = (blink / BLINK_HALF) % 2 == 0;
     bool levelup_active = (levelup_timer > 0);
 
     if (levelup_active != prev_levelup_shown) {
-        renderer_fill_rect(CX-70, CY-30, 140, 44, COLOR_BLACK);
+        clear_rect_repair(CX-70, CY-30, 140, 44);
         if (levelup_active) {
             renderer_draw_text(centered_x("LEVEL UP!", 2), CY-24, "LEVEL UP!", COLOR_YELLOW, COLOR_BLACK, 2);
             char lv_msg[16];
@@ -610,7 +684,7 @@ static void draw_playing_frame(void) {
     else if (demo && bon)                       target_msg = "DEMO - PULSA PARA JUGAR";
 
     if (strcmp(target_msg, prev_bottom_msg) != 0) {
-        renderer_fill_rect(0, PLAY_Y+PLAY_H-24, TFT_WIDTH, 18, COLOR_BLACK);
+        clear_rect_repair(0, PLAY_Y+PLAY_H-24, TFT_WIDTH, 18);
         if (target_msg[0]) {
             renderer_draw_text(centered_x(target_msg, 2), PLAY_Y+PLAY_H-22,
                                 target_msg, COLOR_WHITE, COLOR_BLACK, 2);
@@ -620,7 +694,32 @@ static void draw_playing_frame(void) {
         ui_changed = true;
     }
 
-    if (ui_changed) renderer_flush();
+    // 3) Pintar palas y bola encima de todo (la bola también si un cuadro de
+    //    texto acaba de limpiar la zona donde está).
+    if (p1_moved || ui_changed) {
+        renderer_fill_rect(p1.x, p1_draw_y, PADDLE_W, paddle_h, COLOR_P1);
+        prev_p1_y = p1_draw_y; prev_paddle_h = paddle_h; dirty = true;
+    }
+    if (p2_moved || ui_changed) {
+        renderer_fill_rect(p2.x, p2_draw_y, PADDLE_W, PADDLE_H, COLOR_P2);
+        prev_p2_y = p2_draw_y; dirty = true;
+    }
+    if (ball_moved || ui_changed) {
+        renderer_fill_rect(ball_draw_x, ball_draw_y, BALL_SZ, BALL_SZ, COLOR_WHITE);
+        prev_ball_x = ball_draw_x; prev_ball_y = ball_draw_y; dirty = true;
+    }
+
+    // Un único flush por frame (antes eran hasta 4): menos pasadas por el SPI.
+    if (dirty || ui_changed) renderer_flush();
+}
+
+// Línea del modo de control; se redibuja sola al cambiar de modo (sin repintar el resto).
+#define SELECT_CTRL_Y (CY + 38)
+static void draw_ctrl_mode_line(void) {
+    char line[32];
+    snprintf(line, sizeof(line), ">  CONTROL: %s  <", ctrl_mode_names[ctrl_mode]);
+    renderer_fill_rect(0, SELECT_CTRL_Y - 2, TFT_WIDTH, 18, COLOR_BLACK);
+    renderer_draw_text(centered_x(line, 2), SELECT_CTRL_Y, line, COLOR_YELLOW, COLOR_BLACK, 2);
 }
 
 static void draw_select_screen(void) {
@@ -630,8 +729,10 @@ static void draw_select_screen(void) {
                         CY-10, two_p ? "- 2 JUGADORES -" : "  2 JUGADORES  ", COLOR_WHITE, COLOR_BLACK, 2);
     renderer_draw_text(centered_x(!two_p ? "- 1 JUGADOR   -" : "  1 JUGADOR    ", 2),
                         CY+16, !two_p ? "- 1 JUGADOR   -" : "  1 JUGADOR    ", COLOR_WHITE, COLOR_BLACK, 2);
-    renderer_draw_text(centered_x("MUEVE PARA CAMBIAR - PULSA PARA JUGAR", 1),
-                        CY+60, "MUEVE PARA CAMBIAR - PULSA PARA JUGAR", COLOR_WHITE, COLOR_BLACK, 1);
+    draw_ctrl_mode_line();
+    renderer_draw_text(centered_x("ARRIBA/ABAJO: JUGADORES - IZQ/DER: CONTROL", 1),
+                        CY+62, "ARRIBA/ABAJO: JUGADORES - IZQ/DER: CONTROL", COLOR_WHITE, COLOR_BLACK, 1);
+    renderer_draw_text(centered_x("PULSA PARA JUGAR", 1), CY+76, "PULSA PARA JUGAR", COLOR_WHITE, COLOR_BLACK, 1);
     renderer_flush();
     init_menu_anim();
 }
@@ -700,6 +801,25 @@ static void pong_tick(float dt) {
             }
         }
 
+        {   // izquierda/derecha: modo de control (mismo "armado" que el selector 1P/2P)
+            int dx = controls_get_raw_delta_x(0);
+            if (menu_gap_x_t > 0.0f) menu_gap_x_t -= dt;
+            if (dx == 0) {
+                menu_center_x_t += dt;
+                if (menu_center_x_t >= MENU_REARM_S) menu_armed_x = true;
+            } else {
+                menu_center_x_t = 0.0f;
+                if (menu_armed_x && menu_gap_x_t <= 0.0f) {
+                    ctrl_mode = (ctrl_mode == PONG_CTRL_INERTIA) ? PONG_CTRL_DIRECT : PONG_CTRL_INERTIA;
+                    menu_armed_x = false;
+                    menu_gap_x_t = MENU_MIN_GAP_S;
+                    p1.vel = p2.vel = 0.0f;
+                    draw_ctrl_mode_line();
+                    renderer_flush();
+                }
+            }
+        }
+
         if (controls_menu_select()) {
             p1.score = p2.score = 0;
             player_level = 0;
@@ -715,9 +835,8 @@ static void pong_tick(float dt) {
         break;
 
     case S_SERVE:
-        pad_move(&p1, enc_momentum(controls_get_raw_delta(0), &p1.vel, dt) * dt);
-        if (two_p)
-            pad_move(&p2, enc_momentum(controls_get_raw_delta(1), &p2.vel, dt) * dt);
+        human_pad_update(&p1, 0, dt);
+        if (two_p) human_pad_update(&p2, 1, dt);
         if (demo || controls_menu_select() || (!two_p && serve_side==1)) {
             ball_launch(); state = S_PLAYING;
         }
@@ -729,11 +848,9 @@ static void pong_tick(float dt) {
             ai_move(&p1, 0, DEMO_AI_SPEED, dt);
             ai_move(&p2, 0, DEMO_AI_SPEED, dt);
         } else {
-            pad_move(&p1, enc_momentum(controls_get_raw_delta(0), &p1.vel, dt) * dt);
-            if (two_p)
-                pad_move(&p2, enc_momentum(controls_get_raw_delta(1), &p2.vel, dt) * dt);
-            else
-                ai_move_adaptive(&p2, dt);
+            human_pad_update(&p1, 0, dt);
+            if (two_p) human_pad_update(&p2, 1, dt);
+            else       ai_move_adaptive(&p2, dt);
         }
 
         ball.x += ball.bx * dt;
@@ -743,7 +860,7 @@ static void pong_tick(float dt) {
         if (ball.y+BALL_SZ >= PLAY_Y+PLAY_H) { ball.y = PLAY_Y+PLAY_H-BALL_SZ; ball.by = -ball.by; ai_prof.target_valid = false; sound_effect_move(); }
 
         if (ball.bx < 0 && hits(&p1)) { bounce(&p1, true);  ai_prof.target_valid = false; }
-        if (ball.bx > 0 && hits(&p2)) { bounce(&p2, false); ai_prof.target_valid = false; }
+        if (ball.bx > 0 && hits(&p2)) { bounce(&p2, false); ai_prof.target_valid = false; if (!two_p) ai_roll_error(); }
 
         if (ball.x + BALL_SZ < PLAY_X) {
             p2.score++;
@@ -848,6 +965,7 @@ void game_pong_run(game_mode_t mode) {
     } else {
         state = S_SELECT;
         menu_armed = false; menu_center_t = 0.0f; menu_gap_t = 0.0f;   // no heredar un stick ya inclinado
+        menu_armed_x = false; menu_center_x_t = 0.0f; menu_gap_x_t = 0.0f;
         draw_select_screen();
         sound_start_menu_music();
     }

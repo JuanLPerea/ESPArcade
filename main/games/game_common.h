@@ -17,6 +17,6 @@ typedef struct {
     game_run_fn run;
 } game_entry_t;
 
-#define NUM_GAMES 13
+#define NUM_GAMES 14
 
 #endif

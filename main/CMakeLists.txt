@@ -23,6 +23,7 @@ idf_component_register(
         "games/frogger.c"
         "games/tetris.c"
         "games/commando.c"
+        "games/manhattan.c"
         "ArcadeColor.c"
     INCLUDE_DIRS
         "."

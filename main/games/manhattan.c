@@ -609,8 +609,9 @@ static void try_move(int dir)
     steps++;
 
     for (int i = 0; i < MAX_REW; i++) {
-        Reward *r = &rewards[i];
+       Reward *r = &rewards[i];
         if (r->collected || r->x != pl.x || r->y != pl.y) continue;
+        if (pl.jumping) continue;          /* no recoger si está saltando */
         const RewardInfo *ri = &REW_INFO[r->type];
         r->collected = true;
         items++;
@@ -622,7 +623,35 @@ static void try_move(int dir)
         stats_changed();
     }
 
-    if (state == ST_PLAY && pl.x == exit_x && pl.y == exit_y) end_game(0);
+    if (state == ST_PLAY && pl.x == exit_x && pl.y == exit_y) {
+    /* Bonus por llegar al taxi */
+    int bonus = 3000 - steps * 10;
+    if (bonus < 0) bonus = 0;
+    score += 1000u + (uint32_t)bonus;
+
+    /* Mensaje de transición */
+    say("Taxi conseguido. Ahora otra zona de Manhattan...");
+
+    /* Regenerar laberinto y objetos */
+    generate_maze();
+    populate();
+
+    /* Recolocar a Woody en el nuevo inicio */
+    memset(&pl, 0, sizeof(pl));
+    pl.x = pl.px = start_x;
+    pl.y = pl.py = start_y;
+    pl.dir = 1;
+
+    /* Limpiar proyectiles y contadores de este laberinto */
+    memset(projs, 0, sizeof(projs));
+    steps = 0;          /* puedes quitar esta línea si quieres que los pasos sean acumulativos */
+    // items y defeated_n se mantienen (son acumulativos)
+
+    /* Opcional: recuperar un poco de munición */
+    if (ammo < 8) ammo += 2;
+
+    sound_effect_success();   /* o sound_start_scramble_victory() si quieres el tema de victoria corto */
+}
 }
 
 static void shoot_quote(void)
@@ -1653,7 +1682,7 @@ void game_manhattan_run(game_mode_t mode)
         } else if (state == ST_PLAY) {
             update_game(dt);
             if (state == ST_PLAY) {
-                if (++ego_decay_cnt >= 100) {   // ≈ 2,5 s a 60 FPS
+                if (++ego_decay_cnt >= 90) {   // ≈ 2,5 s a 60 FPS
                     ego_decay_cnt = 0;
                     if (ego > 0) {
                     ego -= 1;

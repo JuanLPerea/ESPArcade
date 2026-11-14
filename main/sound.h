@@ -54,6 +54,17 @@ bool sound_tetris_music_is_playing(void);
 
 
 /*
+ * Música de jazz de Manhattan Arcade, canales 1+2 en bucle -- igual que
+ * la de Tetris (comparten motor: solo suena una de las dos a la vez), con
+ * el canal 3 (efectos) libre. Llamar sound_start_manhattan_music() al
+ * empezar la partida y sound_stop_manhattan_music() al terminarla o salir.
+ */
+void sound_start_manhattan_music(void);
+void sound_stop_manhattan_music(void);
+bool sound_manhattan_music_is_playing(void);
+
+
+/*
  * Fanfarria de victoria de Scramble (~3200ms, una sola vez, no
  * bloqueante). Melodía original de este proyecto: arpegio ascendente
  * de Do mayor y resolución en el Do agudo, canal 1 (melodía,
@@ -221,4 +232,4 @@ void sound_effect_pacman_levelup(void);
 void sound_start_pacman_intro(void);
 void sound_stop_pacman_intro(void);
 
-#endif
+#endif

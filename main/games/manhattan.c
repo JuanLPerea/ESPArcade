@@ -214,7 +214,7 @@ static const EndInfo END_INFO[7] = {
  * Estado del juego
  * --------------------------------------------------------- */
 enum { T_ROAD = 0, T_WALL = 1, T_EXIT = 2, T_CROSS = 3 };
-typedef enum { ST_TITLE, ST_PLAY, ST_END, ST_SCORES } GameState;
+typedef enum { ST_TITLE, ST_PLAY, ST_END, ST_SCORES, ST_TAXI } GameState;
 
 #define MAX_EN   28
 #define MAX_RAT  16
@@ -541,8 +541,10 @@ static void end_game(int reason)
         int bonus = 3000 - steps * 10;
         if (bonus < 0) bonus = 0;
         score += 1000u + (uint32_t)bonus;
+        sound_stop_manhattan_music();
         sound_start_scramble_victory();
     } else {
+        sound_stop_manhattan_music();
         sound_effect_game_over();
     }
 }
@@ -590,6 +592,25 @@ static const RewardInfo REW_INFO[4] = {
 static float pl_ix(void) { return pl.moving ? (float)pl.px + (float)(pl.x - pl.px) * pl.prog : (float)pl.x; }
 static float pl_iy(void) { return pl.moving ? (float)pl.py + (float)(pl.y - pl.py) * pl.prog : (float)pl.y; }
 
+static int taxi_bonus, zone = 1;
+static float taxi_t;
+static bool taxi_drawn;
+
+static void next_zone(void)
+{
+    say("Taxi conseguido. Ahora otra zona de Manhattan...");
+    generate_maze();
+    populate();
+    memset(&pl, 0, sizeof(pl));
+    pl.x = pl.px = start_x;
+    pl.y = pl.py = start_y;
+    pl.dir = 1;
+    memset(projs, 0, sizeof(projs));
+    steps = 0;
+    if (ammo < 8) ammo += 2;
+    state = ST_PLAY;
+}
+
 static void try_move(int dir)
 {
     if (state != ST_PLAY || pl.moving) return;
@@ -611,7 +632,7 @@ static void try_move(int dir)
     for (int i = 0; i < MAX_REW; i++) {
        Reward *r = &rewards[i];
         if (r->collected || r->x != pl.x || r->y != pl.y) continue;
-        if (pl.jumping) continue;          /* no recoger si está saltando */
+        if (pl.jumping) continue;          /* no recoger si esta saltando */
         const RewardInfo *ri = &REW_INFO[r->type];
         r->collected = true;
         items++;
@@ -624,34 +645,18 @@ static void try_move(int dir)
     }
 
     if (state == ST_PLAY && pl.x == exit_x && pl.y == exit_y) {
-    /* Bonus por llegar al taxi */
-    int bonus = 3000 - steps * 10;
-    if (bonus < 0) bonus = 0;
-    score += 1000u + (uint32_t)bonus;
-
-    /* Mensaje de transición */
-    say("Taxi conseguido. Ahora otra zona de Manhattan...");
-
-    /* Regenerar laberinto y objetos */
-    generate_maze();
-    populate();
-
-    /* Recolocar a Woody en el nuevo inicio */
-    memset(&pl, 0, sizeof(pl));
-    pl.x = pl.px = start_x;
-    pl.y = pl.py = start_y;
-    pl.dir = 1;
-
-    /* Limpiar proyectiles y contadores de este laberinto */
-    memset(projs, 0, sizeof(projs));
-    steps = 0;          /* puedes quitar esta línea si quieres que los pasos sean acumulativos */
-    // items y defeated_n se mantienen (son acumulativos)
-
-    /* Opcional: recuperar un poco de munición */
-    if (ammo < 8) ammo += 2;
-
-    sound_effect_success();   /* o sound_start_scramble_victory() si quieres el tema de victoria corto */
-}
+        /* Llegada al taxi: caja de mensaje + fanfarria; la nueva zona
+         * se genera al pulsar A (ver next_zone) */
+        taxi_bonus = 3000 - steps * 10;
+        if (taxi_bonus < 0) taxi_bonus = 0;
+        score += 1000u + (uint32_t)taxi_bonus;
+        zone++;
+        state = ST_TAXI;
+        taxi_t = 0.0f;
+        taxi_drawn = false;
+        sound_stop_manhattan_music();
+        sound_start_scramble_victory();
+    }
 }
 
 static void shoot_quote(void)
@@ -888,7 +893,7 @@ static void new_game(void)
     pl.x = pl.px = start_x; pl.y = pl.py = start_y;
     pl.dir = 1;
     ego = 60; love = 60; hypo = 20; ammo = 5;
-    steps = 0; items = 0; defeated_n = 0; score = 0;
+    steps = 0; items = 0; defeated_n = 0; score = 0; zone = 1;
     memset(alarm_flag, 0, sizeof(alarm_flag));
     msg_active = false; msg_dirty = true;
     state = ST_PLAY;
@@ -1330,13 +1335,12 @@ static void render_game(int t_ms)
 
 static int c_arrow, c_dist, c_meter[3], c_score, c_steps, c_items, c_ammo;
 
-static uint16_t meter_color(int i, int val, int st)
+static uint16_t meter_color(int i, int st)
 {
+    /* Color fijo por medidor; en alarma solo parpadea (st==2 -> tono oscuro). */
     static const uint16_t base[3] = { HEX(0x0ea5e9), HEX(0x10b981), HEX(0xf43f5e) };
-    if (st == 0) return base[i];
-    if (st == 2) return COLOR_WHITE;
-    if (i < 2) return val <= 25 ? HEX(0xf87171) : HEX(0xfbbf24);
-    return val >= 75 ? HEX(0xfb7185) : HEX(0x38bdf8);
+    static const uint16_t dim[3]  = { HEX(0x0a4a69), HEX(0x0a5a40), HEX(0x6e2132) };
+    return st == 2 ? dim[i] : base[i];
 }
 
 static void draw_meter(int i, int val, int st)
@@ -1347,7 +1351,7 @@ static void draw_meter(int i, int val, int st)
     renderer_fill_rect((uint16_t)(bx - 1), BAR_Y - 1, 13, BAR_H + 2, C_PANEL_LN);
     renderer_fill_rect((uint16_t)bx, BAR_Y, 11, BAR_H, HEX(0x111116));
     int h = val * BAR_H / 100;
-    if (h > 0) renderer_fill_rect((uint16_t)bx, (uint16_t)(BAR_Y + BAR_H - h), 11, (uint16_t)h, meter_color(i, val, st));
+    if (h > 0) renderer_fill_rect((uint16_t)bx, (uint16_t)(BAR_Y + BAR_H - h), 11, (uint16_t)h, meter_color(i, st));
     for (int x = 0; x < 11; x += 4) renderer_fill_rect((uint16_t)(bx + x), BAR_Y + BAR_H / 2, 2, 1, HEX(0xfde047));
     snprintf(buf, sizeof(buf), "%-3d", val);
     static const uint16_t vcol[3] = { HEX(0x7dd3fc), HEX(0x6ee7b7), HEX(0xfda4af) };   /* igual que las etiquetas */
@@ -1605,6 +1609,25 @@ static void draw_end_overlay(void)
     draw_text_c(bx, bw, by + 116, buf, 2, COLOR_YELLOW, COLOR_BLACK);
 }
 
+static void draw_taxi_overlay(void)
+{
+    char buf[48];
+    const int bx = 10, by = 30, bw = VIEW_W - 20, bh = 160;
+    renderer_fill_rect(bx - 2, by - 2, bw + 4, bh + 4, HEX(0x16a34a));
+    renderer_fill_rect(bx, by, bw, bh, COLOR_BLACK);
+    draw_text_c(bx, bw, by + 8, "TAXI CONSEGUIDO!", 1, C_AMBER, COLOR_BLACK);
+    snprintf(buf, sizeof(buf), "ZONA %d SUPERADA", zone - 1);
+    draw_text_c(bx, bw, by + 24, buf, 2, COLOR_WHITE, COLOR_BLACK);
+    draw_text_c(bx, bw, by + 54, "Otra zona de Manhattan te espera.", 1, HEX(0xd4d4d8), COLOR_BLACK);
+    draw_text_c(bx, bw, by + 65, "Que no te alcance la neurosis.", 1, HEX(0xd4d4d8), COLOR_BLACK);
+    snprintf(buf, sizeof(buf), "PASOS %d  OBJETOS %d", steps, items);
+    draw_text_c(bx, bw, by + 90, buf, 1, HEX(0xa1a1aa), COLOR_BLACK);
+    snprintf(buf, sizeof(buf), "BONUS +%d", 1000 + taxi_bonus);
+    draw_text_c(bx, bw, by + 102, buf, 1, HEX(0x4ade80), COLOR_BLACK);
+    snprintf(buf, sizeof(buf), "PUNTOS %u", (unsigned)score);
+    draw_text_c(bx, bw, by + 116, buf, 2, COLOR_YELLOW, COLOR_BLACK);
+}
+
 static void draw_end_blink(bool on)
 {
     renderer_fill_rect(20, 30 + 138, VIEW_W - 40, 10, COLOR_BLACK);
@@ -1678,6 +1701,7 @@ void game_manhattan_run(game_mode_t mode)
            renderer_clear(COLOR_BLACK);
            panel_init();
            new_game();
+           if (!g_demo) sound_start_manhattan_music();
            }
         } else if (state == ST_PLAY) {
             update_game(dt);
@@ -1692,6 +1716,22 @@ void game_manhattan_run(game_mode_t mode)
                 render_game((int)t_ms);
                 update_panel(t_ms);
                 if (msg_dirty) { draw_strip(); msg_dirty = false; }
+            }
+        } else if (state == ST_TAXI) {
+            taxi_t += dt;
+            if (!taxi_drawn) {
+                render_game((int)t_ms);
+                update_panel(t_ms);
+                draw_taxi_overlay();
+                taxi_drawn = true;
+                blink_prev = -1;
+            }
+            int tb = (int)((t_ms / 400u) & 1u);
+            if (taxi_t > 1500.0f && tb != blink_prev) { blink_prev = tb; draw_end_blink(tb == 0); }
+            if (taxi_t > 1500.0f && in_start) {
+                sound_stop_scramble_victory();
+                next_zone();
+                if (!g_demo) sound_start_manhattan_music();
             }
         } else if (state == ST_END) {
             end_t += dt;
@@ -1725,6 +1765,7 @@ void game_manhattan_run(game_mode_t mode)
         vTaskDelayUntil(&last_wake, period_ticks ? period_ticks : 1);
     }
 
+    sound_stop_manhattan_music();
     sound_stop_scramble_victory();
     highscores_flush();
 

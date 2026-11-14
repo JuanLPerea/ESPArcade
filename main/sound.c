@@ -1614,6 +1614,75 @@ static uint32_t tetris_music_ch2_next;
 
 
 /* ============================================================
+ * MÚSICA DE JAZZ DE MANHATTAN (IN-GAME)
+ * Pieza original de este proyecto, para Manhattan Arcade: un
+ * turnaround de jazz en Fa mayor (Dm7 - C7 - Fmaj7/Am7 - D7, y una
+ * segunda mitad Gm7 - C7 - Fmaj7 - Gm7/C7), con corcheas "swing"
+ * (240 + 120 ms por pulso de 360 ms) en la melodía y bajo andante
+ * en negras. Canal 1 = melodía (triangular, hace de clarinete) y
+ * canal 2 = bajo (triangular).
+ *
+ * Funciona exactamente igual que la música de Tetris -- de hecho
+ * comparte su maquinaria en sound_update(): una sola bandera
+ * (tetris_music_playing) y dos índices/temporizadores independientes
+ * que vuelven a 0 al terminar. Los dos canales suman 11520 ms (8
+ * compases de 1440 ms), así que encajan y reinician juntos. Canal 3
+ * libre para los efectos de la partida.
+ * ============================================================ */
+#define JAZZ_MUSIC_CH1_LEN 48
+#define JAZZ_MUSIC_CH2_LEN 32
+
+static const uint16_t jazz_music_ch1_freq[JAZZ_MUSIC_CH1_LEN] = {
+    /* Dm7   */ 440, 523, 587, 523, 440, 349,
+    /* C7    */ 392, 466, 523, 466, 392, 0,
+    /* F/Am7 */ 440, 523, 698, 659, 523, 440,
+    /* D7    */ 370, 440, 587, 523, 440, 0,
+    /* Gm7   */ 587, 466, 392, 440, 466, 587,
+    /* C7    */ 523, 659, 784, 659, 523, 466,
+    /* Fmaj7 */ 440, 523, 440, 392, 440, 349,
+    /* Gm/C7 */ 392, 466, 440, 392, 330, 349,
+};
+static const uint16_t jazz_music_ch1_dur[JAZZ_MUSIC_CH1_LEN] = {
+    240, 120, 360, 240, 120, 360,
+    240, 120, 240, 120, 360, 360,
+    240, 120, 360, 240, 120, 360,
+    240, 120, 240, 120, 360, 360,
+    240, 120, 360, 240, 120, 360,
+    240, 120, 360, 240, 120, 360,
+    240, 120, 360, 240, 120, 360,
+    240, 120, 360, 240, 120, 360,
+};
+static const uint16_t jazz_music_ch2_freq[JAZZ_MUSIC_CH2_LEN] = {
+    147, 175, 220, 175,     /* Dm7   */
+    131, 165, 196, 233,     /* C7    */
+    175, 220, 220, 165,     /* F/Am7 */
+    147, 185, 220, 262,     /* D7    */
+    196, 233, 294, 233,     /* Gm7   */
+    131, 165, 196, 165,     /* C7    */
+    175, 220, 262, 220,     /* Fmaj7 */
+    196, 233, 131, 165,     /* Gm/C7 */
+};
+static const uint16_t jazz_music_ch2_dur[JAZZ_MUSIC_CH2_LEN] = {
+    360, 360, 360, 360, 360, 360, 360, 360,
+    360, 360, 360, 360, 360, 360, 360, 360,
+    360, 360, 360, 360, 360, 360, 360, 360,
+    360, 360, 360, 360, 360, 360, 360, 360,
+};
+
+/* Pista que está usando ahora mismo la maquinaria de fondo
+ * (Tetris o Manhattan). Se rellena en cada sound_start_*_music(). */
+static const uint16_t *bg_ch1_freq = tetris_music_ch1_freq;
+static const uint16_t *bg_ch1_dur  = tetris_music_ch1_dur;
+static const uint16_t *bg_ch2_freq = tetris_music_ch2_freq;
+static const uint16_t *bg_ch2_dur  = tetris_music_ch2_dur;
+static uint8_t  bg_ch1_len = TETRIS_MUSIC_CH1_LEN;
+static uint8_t  bg_ch2_len = TETRIS_MUSIC_CH2_LEN;
+static uint16_t bg_ch1_vol = TETRIS_MUSIC_CH1_VOLUME;
+static uint16_t bg_ch2_vol = TETRIS_MUSIC_CH2_VOLUME;
+static volatile bool manhattan_music_active = false;   /* true = la pista en curso es la de jazz */
+
+
+/* ============================================================
  * INICIALIZACIÓN
  * ============================================================ */
 
@@ -1960,32 +2029,32 @@ void sound_update(void)
 
         if (time_reached_ms(tetris_music_ch1_next)) {
             tetris_music_ch1_index++;
-            if (tetris_music_ch1_index >= TETRIS_MUSIC_CH1_LEN) {
+            if (tetris_music_ch1_index >= bg_ch1_len) {
                 tetris_music_ch1_index = 0;
             }
             configure_channel(
                 &channel1,
-                tetris_music_ch1_freq[tetris_music_ch1_index],
-                TETRIS_MUSIC_CH1_VOLUME,
+                bg_ch1_freq[tetris_music_ch1_index],
+                bg_ch1_vol,
                 WAVE_TRIANGLE
             );
             tetris_music_ch1_next =
-                timeout_ms(tetris_music_ch1_dur[tetris_music_ch1_index]);
+                timeout_ms(bg_ch1_dur[tetris_music_ch1_index]);
         }
 
         if (time_reached_ms(tetris_music_ch2_next)) {
             tetris_music_ch2_index++;
-            if (tetris_music_ch2_index >= TETRIS_MUSIC_CH2_LEN) {
+            if (tetris_music_ch2_index >= bg_ch2_len) {
                 tetris_music_ch2_index = 0;
             }
             configure_channel(
                 &channel2,
-                tetris_music_ch2_freq[tetris_music_ch2_index],
-                TETRIS_MUSIC_CH2_VOLUME,
+                bg_ch2_freq[tetris_music_ch2_index],
+                bg_ch2_vol,
                 WAVE_TRIANGLE
             );
             tetris_music_ch2_next =
-                timeout_ms(tetris_music_ch2_dur[tetris_music_ch2_index]);
+                timeout_ms(bg_ch2_dur[tetris_music_ch2_index]);
         }
 
         SOUND_EXIT_CRITICAL();
@@ -3031,6 +3100,12 @@ void sound_start_tetris_music(void)
     scramble_win_active    = false;
     toccata_playing        = false;
 
+    manhattan_music_active = false;
+    bg_ch1_freq = tetris_music_ch1_freq;  bg_ch1_dur = tetris_music_ch1_dur;
+    bg_ch2_freq = tetris_music_ch2_freq;  bg_ch2_dur = tetris_music_ch2_dur;
+    bg_ch1_len  = TETRIS_MUSIC_CH1_LEN;   bg_ch2_len = TETRIS_MUSIC_CH2_LEN;
+    bg_ch1_vol  = TETRIS_MUSIC_CH1_VOLUME; bg_ch2_vol = TETRIS_MUSIC_CH2_VOLUME;
+
     tetris_music_playing  = true;
     tetris_music_ch1_index = 0;
     tetris_music_ch2_index = 0;
@@ -3063,5 +3138,70 @@ void sound_stop_tetris_music(void)
 
 bool sound_tetris_music_is_playing(void)
 {
-    return tetris_music_playing;
+    return tetris_music_playing && !manhattan_music_active;
+}
+
+
+/*
+ * Arranca la música de jazz de Manhattan Arcade (canal 1 + canal 2),
+ * en bucle hasta llamar a sound_stop_manhattan_music(). Reutiliza la
+ * maquinaria de la música de Tetris (ver arrays jazz_music_* más
+ * arriba); canal 3 libre para los efectos.
+ */
+void sound_start_manhattan_music(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    SOUND_ENTER_CRITICAL();
+
+    menu_music_playing     = false;
+    channel2_siren_active  = false;
+    channel2_engine_active = false;
+    channel1_skid_active   = false;
+    pacman_intro_active    = false;
+    scramble_win_active    = false;
+    toccata_playing        = false;
+
+    manhattan_music_active = true;
+    bg_ch1_freq = jazz_music_ch1_freq;  bg_ch1_dur = jazz_music_ch1_dur;
+    bg_ch2_freq = jazz_music_ch2_freq;  bg_ch2_dur = jazz_music_ch2_dur;
+    bg_ch1_len  = JAZZ_MUSIC_CH1_LEN;   bg_ch2_len = JAZZ_MUSIC_CH2_LEN;
+    bg_ch1_vol  = TETRIS_MUSIC_CH1_VOLUME;
+    bg_ch2_vol  = TETRIS_MUSIC_CH2_VOLUME;
+
+    tetris_music_playing   = true;
+    tetris_music_ch1_index = 0;
+    tetris_music_ch2_index = 0;
+
+    configure_channel(&channel1, jazz_music_ch1_freq[0], bg_ch1_vol, WAVE_TRIANGLE);
+    configure_channel(&channel2, jazz_music_ch2_freq[0], bg_ch2_vol, WAVE_TRIANGLE);
+
+    tetris_music_ch1_next = timeout_ms(jazz_music_ch1_dur[0]);
+    tetris_music_ch2_next = timeout_ms(jazz_music_ch2_dur[0]);
+
+    SOUND_EXIT_CRITICAL();
+}
+
+
+void sound_stop_manhattan_music(void)
+{
+    SOUND_ENTER_CRITICAL();
+
+    if (manhattan_music_active) {
+        tetris_music_playing   = false;
+        manhattan_music_active = false;
+
+        disable_channel(&channel1);
+        disable_channel(&channel2);
+    }
+
+    SOUND_EXIT_CRITICAL();
+}
+
+
+bool sound_manhattan_music_is_playing(void)
+{
+    return tetris_music_playing && manhattan_music_active;
 }

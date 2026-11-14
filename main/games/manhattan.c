@@ -84,6 +84,7 @@
 /* ---------------------------------------------------------
  * Aleatorios y utilidades
  * --------------------------------------------------------- */
+static int ego_decay_cnt;
 static uint32_t rng_state = 0x2468ace1;
 static uint32_t rng(void)
 {
@@ -851,6 +852,7 @@ static void update_game(float dt)
 
 static void new_game(void)
 {
+    ego_decay_cnt = 0;
     generate_maze();
     populate();
     memset(&pl, 0, sizeof(pl));
@@ -1395,29 +1397,165 @@ static void update_panel(uint32_t t_ms)
 /* ---------------------------------------------------------
  * Pantallas: titulo y fin de partida
  * --------------------------------------------------------- */
-static void draw_title_screen(void)
+
+static void draw_title_screen(uint32_t t_ms)
 {
-    static const char *const help[6] = {
-        "MOVER: STICK", "SALTAR RATAS Y GOTERAS: A", "FRASE DEMOLEDORA: B",
-        "OBJETIVO: LLEGAR AL TAXI", "EGO, PAREJA E HIPOC.:", "NI A 0 NI A 100" };
     renderer_clear(COLOR_BLACK);
-    draw_text_c(0, SCR_W, 8, "MANHATTAN ARCADE", 2, COLOR_WHITE, COLOR_BLACK);
+    draw_text_c(0, SCR_W, 8,  "MANHATTAN ARCADE", 2, COLOR_WHITE, COLOR_BLACK);
     draw_text_c(0, SCR_W, 30, "LABERINTO NEUROTICO", 2, C_AMBER, COLOR_BLACK);
-    draw_text_c(0, SCR_W, 54, "una comedia neurotica interactiva", 1, HEX(0xa1a1aa), COLOR_BLACK);
-    renderer_fill_rect(20, 68, SCR_W - 40, 1, C_PANEL_LN);
-    renderer_fill_rect(20, 84, 56, 56, HEX(0x181622));
-    g_ox = 26; g_oy = 88;
-    draw_woody_sprite(false, 0, 0);
-    for (int i = 0; i < 6; i++)
-        renderer_draw_text(92, (uint16_t)(88 + i * 13), help[i], i < 4 ? COLOR_WHITE : HEX(0xfde68a), COLOR_BLACK, 1);
-    renderer_fill_rect(20, 168, SCR_W - 40, 1, C_PANEL_LN);
+    draw_text_c(0, SCR_W, 54, "una comedia interactiva", 1, HEX(0xa1a1aa), COLOR_BLACK);
+    renderer_fill_rect(20, 70, SCR_W - 40, 1, C_PANEL_LN);
+
+    /* --- Skyline a todo el ancho --- */
+    const int sky_y0 = 78;
+    const int sky_h  = 108;
+    renderer_fill_rect(0, sky_y0, SCR_W, sky_h, HEX(0x0b1220));
+
+    struct { int x, y, w, h; } bld[] = {
+        {  4, 135, 20, 51 },
+        { 26, 115, 18, 71 },
+        { 46, 100, 26, 86 },
+        { 74, 122, 16, 64 },
+        { 92,  90, 22, 96 },
+        {116, 108, 24, 78 },
+        {142,  95, 18, 91 },
+        {162, 118, 22, 68 },
+        {186, 105, 20, 81 },
+        {208, 125, 18, 61 },
+        {228, 112, 24, 74 },
+        {254, 130, 16, 56 },
+        {272, 120, 20, 66 },
+        {294, 138, 22, 48 },
+    };
+    for (int i = 0; i < (int)(sizeof(bld)/sizeof(bld[0])); i++) {
+        int bx = bld[i].x, by = bld[i].y, bw = bld[i].w, bh = bld[i].h;
+        renderer_fill_rect(bx, by, bw, bh, HEX(0x1e293b));
+        for (int wy = by + 4; wy < by + bh - 6; wy += 7) {
+            for (int wx = bx + 3; wx < bx + bw - 3; wx += 5) {
+                if (((wx * 13 + wy * 7) & 3) != 0)
+                    renderer_fill_rect(wx, wy, 2, 3, HEX(0xfbbf24));
+            }
+        }
+        if (bh > 88) {
+            renderer_fill_rect(bx + bw/2 - 1, by - 7, 2, 7, HEX(0x64748b));
+            renderer_fill_rect(bx + bw/2 - 2, by - 8, 4, 2, HEX(0x94a3b8));
+        }
+    }
+
+    /* Agua / reflejo */
+    renderer_fill_rect(0, sky_y0 + sky_h - 10, SCR_W, 10, HEX(0x0f172a));
+    for (int i = 0; i < 16; i++) {
+        int rx = 8 + i * 20 + ((t_ms / 80) % 3);
+        renderer_fill_rect(rx, sky_y0 + sky_h - 7, 9, 2, HEX(0x1e3a5f));
+    }
+
+    /* Estatua de la Libertad esquemática (derecha) */
+    {
+        const int sx = 278;
+        const int sy = 92;
+        renderer_fill_rect(sx + 6,  sy + 70, 28, 14, HEX(0x4b5563));
+        renderer_fill_rect(sx + 2,  sy + 82, 36,  8, HEX(0x374151));
+        renderer_fill_rect(sx + 10, sy + 66, 20,  6, HEX(0x6b7280));
+        renderer_fill_rect(sx + 10, sy + 28, 20, 40, HEX(0x4ade80));
+        renderer_fill_rect(sx + 8,  sy + 36,  6, 30, HEX(0x22c55e));
+        renderer_fill_rect(sx + 26, sy + 36,  6, 30, HEX(0x22c55e));
+        renderer_fill_rect(sx + 12, sy + 16, 16, 14, HEX(0x4ade80));
+        renderer_fill_rect(sx + 14, sy + 20,  4,  4, HEX(0x14532d));
+        renderer_fill_rect(sx + 22, sy + 20,  4,  4, HEX(0x14532d));
+        renderer_fill_rect(sx + 10, sy + 12, 4, 6, HEX(0x86efac));
+        renderer_fill_rect(sx + 16, sy +  8, 4, 8, HEX(0x86efac));
+        renderer_fill_rect(sx + 22, sy + 12, 4, 6, HEX(0x86efac));
+        renderer_fill_rect(sx + 28, sy + 14, 3, 5, HEX(0x86efac));
+        renderer_fill_rect(sx + 28, sy + 22, 6, 20, HEX(0x4ade80));
+        renderer_fill_rect(sx + 30, sy + 14, 4, 10, HEX(0x22c55e));
+        renderer_fill_rect(sx + 29, sy +  6, 6, 10, HEX(0xfbbf24));
+        renderer_fill_rect(sx + 31, sy +  2, 2,  6, HEX(0xfde047));
+    }
+
+    /* --- Personajes a pie de edificios --- */
+    float t = (float)t_ms * 0.0022f;
+    Enemy tmp = {0};
+
+    #define DRAW_NAME(ox, oy, name) do { \
+        int nw = (int)st7789_text_width(name, 1); \
+        int nx = (ox) + (TILE - nw) / 2; \
+        if (nx < 0) nx = 0; \
+        renderer_draw_text((uint16_t)nx, (uint16_t)((oy) + TILE - 2), name, HEX(0xfde68a), HEX(0x0b1220), 1); \
+    } while (0)
+
+    /* Woody */
+    {
+        int ox = 100 + (int)(cosf(t * 0.9f) * 5.0f);
+        int oy = 128 + (int)(sinf(t * 1.1f) * 4.0f);
+        int swing = (int)(sinf(t * 2.4f) * 4.0f);
+        g_ox = ox; g_oy = oy;
+        draw_woody_sprite(false, swing, 0);
+        DRAW_NAME(ox, oy, "WOODY");
+    }
+
+    /* Mama */
+    {
+        int ox =  22 + (int)(cosf(t * 0.7f + 1.0f) * 5.0f);
+        int oy = 136 + (int)(sinf(t * 1.3f + 0.5f) * 4.0f);
+        g_ox = ox; g_oy = oy;
+        tmp.type = EN_MOTHER;
+        draw_enemy(&tmp);
+        DRAW_NAME(ox, oy, "MAMA");
+    }
+
+    /* Analista */
+    {
+        int ox =  58 + (int)(cosf(t * 0.85f + 2.2f) * 5.0f);
+        int oy = 142 + (int)(sinf(t * 1.0f + 1.8f) * 4.0f);
+        g_ox = ox; g_oy = oy;
+        tmp.type = EN_ANALYST;
+        draw_enemy(&tmp);
+        DRAW_NAME(ox, oy, "ANALISTA");
+    }
+
+    /* Critico */
+    {
+        int ox = 140 + (int)(cosf(t * 0.75f + 3.5f) * 5.0f);
+        int oy = 134 + (int)(sinf(t * 1.2f + 2.7f) * 4.0f);
+        g_ox = ox; g_oy = oy;
+        tmp.type = EN_CRITIC;
+        draw_enemy(&tmp);
+        DRAW_NAME(ox, oy, "CRITICO");
+    }
+
+    /* Guapa */
+    {
+        int ox = 178 + (int)(cosf(t * 0.95f + 4.8f) * 5.0f);
+        int oy = 140 + (int)(sinf(t * 1.15f + 3.9f) * 4.0f);
+        g_ox = ox; g_oy = oy;
+        tmp.type = EN_PRETTY;
+        draw_enemy(&tmp);
+        DRAW_NAME(ox, oy, "GUAPA");
+    }
+
+    /* Nuevo personaje a la derecha de Guapa */
+    {
+        int ox = 218 + (int)(cosf(t * 0.8f + 5.5f) * 5.0f);
+        int oy = 136 + (int)(sinf(t * 1.25f + 4.4f) * 4.0f);
+        g_ox = ox; g_oy = oy;
+        tmp.type = EN_DIRECTOR;
+        draw_enemy(&tmp);
+        DRAW_NAME(ox, oy, "DIRECTOR");
+    }
+
+    #undef DRAW_NAME
+
+    renderer_fill_rect(20, 190, SCR_W - 40, 1, C_PANEL_LN);
 }
 
+/* Blink mejorado: el texto permanece visible y solo cambia de brillo */
 static void draw_title_blink(bool on)
 {
-    renderer_fill_rect(0, 196, SCR_W, 20, COLOR_BLACK);
-    if (on) draw_text_c(0, SCR_W, 200, "PULSA A PARA EMPEZAR", 2, COLOR_YELLOW, COLOR_BLACK);
+   // renderer_fill_rect(0, 196, SCR_W, 20, COLOR_BLACK);
+    uint16_t col = on ? COLOR_YELLOW : HEX(0xa16207);   /* amarillo brillante / ámbar apagado */
+    draw_text_c(0, SCR_W, 200, "PULSA A PARA EMPEZAR", 2, col, COLOR_BLACK);
 }
+
 
 static void draw_end_overlay(void)
 {
@@ -1496,21 +1634,32 @@ void game_manhattan_run(game_mode_t mode)
         read_input();
         if (in_quit) break;
 
-        if (state == ST_TITLE) {
-            if (!title_drawn) { draw_title_screen(); title_drawn = true; blink_prev = -1; }
-            int b = (int)((t_ms / 400u) & 1u);
-            if (b != blink_prev) { blink_prev = b; draw_title_blink(b == 0); }
-            if (g_demo) {
-                if (t_ms > 5000 || in_start) break;
+         if (state == ST_TITLE) {
+         draw_title_screen(t_ms);
+
+    /* Ciclo de 800 ms: brillante ~65 % del tiempo */
+    int phase = (int)(t_ms % 800u);
+    bool on = (phase < 520);          // visible más tiempo
+    draw_title_blink(on);
+
+    if (g_demo) {
+        if (t_ms > 5000 || in_start) break;
             } else if (in_start) {
-                sound_effect_select();
-                renderer_clear(COLOR_BLACK);
-                panel_init();
-                new_game();
-            }
+           sound_effect_select();
+           renderer_clear(COLOR_BLACK);
+           panel_init();
+           new_game();
+           }
         } else if (state == ST_PLAY) {
             update_game(dt);
             if (state == ST_PLAY) {
+                if (++ego_decay_cnt >= 100) {   // ≈ 2,5 s a 60 FPS
+                    ego_decay_cnt = 0;
+                    if (ego > 0) {
+                    ego -= 1;
+                    stats_changed();
+                    }
+                }
                 render_game((int)t_ms);
                 update_panel(t_ms);
                 if (msg_dirty) { draw_strip(); msg_dirty = false; }

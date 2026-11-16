@@ -585,7 +585,7 @@ typedef struct { int8_t ego, love, hypo, quotes; const char *popup; uint16_t col
 static const RewardInfo REW_INFO[4] = {
     { 25, 0, 0, 0, "+25% EGO",    POP_SKY,   L_BOOK },
     { 0, 25, 0, 0, "+25% PAREJA", POP_GREEN, L_FLOWERS },
-    { 0, 0, -30, 0, "-30% HIPOC", POP_ROSE,  L_COFFEE },
+    { 0, 0, -20, 0, "-20% HIPOC", POP_ROSE,  L_COFFEE },
     { 5, 0, 0, 2, "+2 CITAS",     POP_YEL,   L_TYPEW },
 };
 
@@ -892,7 +892,7 @@ static void new_game(void)
     memset(&pl, 0, sizeof(pl));
     pl.x = pl.px = start_x; pl.y = pl.py = start_y;
     pl.dir = 1;
-    ego = 60; love = 60; hypo = 20; ammo = 5;
+    ego = 60; love = 60; hypo = 40; ammo = 5;
     steps = 0; items = 0; defeated_n = 0; score = 0; zone = 1;
     memset(alarm_flag, 0, sizeof(alarm_flag));
     msg_active = false; msg_dirty = true;

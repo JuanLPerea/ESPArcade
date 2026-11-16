@@ -106,7 +106,7 @@ static inline void menu_sleep_ms(uint32_t ms)
 // más abajo.
 #define MENU_MUSIC_SILENCE_MS (2 * 1000)
 
-static const char *PROJECT_TITLE = "MISSING IN ARCADE";
+static const char *PROJECT_TITLE = "MANHATTAN ARCADE";
 
 
 static int wrap_index(int idx)

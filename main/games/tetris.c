@@ -46,8 +46,12 @@
  *    claro arriba/izquierda, oscuro abajo/derecha y brillo; también en la
  *    siguiente pieza y la decoración del menú.
  *  - HUD: los borrados de puntuación/nivel ya no pisan los bordes de los
- *    tableros (HUD_CLEAR_X/W) y GAME OVER es un cuadro dentro de cada
- *    tablero en vez de una barra negra de lado a lado.
+ *    tableros (HUD_CLEAR_X/W).
+ *  - GAME OVER por jugador: cuando un jugador pierde, su tablero muestra un
+ *    cuadro "GAME OVER" (draw_game_over_box) que se queda en pantalla
+ *    mientras el otro jugador sigue jugando, tanto en 1 como en 2 jugadores.
+ *    over_drawn[] recuerda en qué tablero ya está dibujado. Si se pasa por la
+ *    pantalla de récords (que machaca el campo), se redibuja todo.
  *  - Controles de partida (ambos jugadores): stick hacia abajo = caída
  *    rápida (antes el botón B); B gira al revés que A; el movimiento lateral
  *    necesita MOVE_STEP de recorrido por columna y repite suave al mantener
@@ -396,7 +400,7 @@ static int      prev_score_hud[2] = { -1, -1 };
 static int      prev_level_hud[2] = { -1, -1 };
 static int      prev_next_hud[2]  = { -1, -1 };
 static bool     prev_active_hud[2] = { true, true };
-static char     prev_center_msg[24] = "";
+static bool     over_drawn[2] = { false, false };   // cartel GAME OVER ya dibujado en el tablero de cada jugador
 static char     prev_bottom_msg[40] = "";
 
 //static int rnd(int n) { return n > 0 ? rand() % n : 0; }
@@ -769,7 +773,7 @@ static void draw_field_static(void) {
     prev_level_hud[0] = prev_level_hud[1] = -1;
     prev_next_hud[0]  = prev_next_hud[1]  = -1;
     prev_active_hud[0] = prev_active_hud[1] = true;
-    prev_center_msg[0] = '\0';
+    over_drawn[0] = over_drawn[1] = false;
     prev_bottom_msg[0] = '\0';
     board_static_drawn = true;
     renderer_flush();
@@ -885,33 +889,17 @@ static void draw_hud_if_changed(int idx) {
     if (changed) renderer_flush();
 }
 
-// Mensaje central. Antes era una barra negra de 32 px de alto de lado a lado
-// de la pantalla con el texto en escala 3: borraba la franja central de los
-// DOS tableros (con sus bordes) y la columna del HUD (recuadro de siguiente
-// pieza, marcadores...). Ahora, con target no vacío, se dibuja un cuadro
-// pequeño con borde DENTRO de cada tablero en juego ("GAME" / "OVER") y no se
-// toca nada más. Con target vacío no hace nada (el mensaje solo se muestra al
-// terminar la partida y la pantalla se limpia entera al salir).
-static void update_center_message(const char *target, uint16_t color, int scale) {
-    (void)scale;
-    if (strcmp(target, prev_center_msg) == 0) return;
-    if (target[0]) {
-        static const char *line1 = "GAME";
-        static const char *line2 = "OVER";
-        const int box_w = BOARD_W - 20, box_h = 50;
-        for (int p = 0; p < num_players; p++) {
-            int bx = board_x[p];
-            int x = bx + (BOARD_W - box_w) / 2;
-            int y = BOARD_Y + BOARD_H / 2 - box_h / 2;
-            renderer_fill_rect(x,     y,     box_w,     box_h,     color);
-            renderer_fill_rect(x + 1, y + 1, box_w - 2, box_h - 2, COLOR_BLACK);
-            draw_text_centered_in(bx, BOARD_W, y + 8,  line1, color, 2);
-            draw_text_centered_in(bx, BOARD_W, y + 27, line2, color, 2);
-        }
-    }
-    strncpy(prev_center_msg, target, sizeof(prev_center_msg) - 1);
-    prev_center_msg[sizeof(prev_center_msg) - 1] = '\0';
-    renderer_flush();
+// Cartel "GAME OVER" dentro del tablero de UN jugador. Se dibuja una sola vez
+// cuando ese jugador pierde y se queda mientras el otro sigue jugando.
+static void draw_game_over_box(int idx) {
+    const int box_w = BOARD_W - 20, box_h = 50;
+    int bx = board_x[idx];
+    int x = bx + (BOARD_W - box_w) / 2;
+    int y = BOARD_Y + BOARD_H / 2 - box_h / 2;
+    renderer_fill_rect(x,     y,     box_w,     box_h,     COLOR_YELLOW);
+    renderer_fill_rect(x + 1, y + 1, box_w - 2, box_h - 2, COLOR_BLACK);
+    draw_text_centered_in(bx, BOARD_W, y + 8,  "GAME", COLOR_YELLOW, 2);
+    draw_text_centered_in(bx, BOARD_W, y + 27, "OVER", COLOR_YELLOW, 2);
 }
 
 static void update_bottom_message(const char *target, int scale) {
@@ -931,13 +919,15 @@ static void draw_playing_frame(void) {
     for (int p = 0; p < num_players; p++) {
         draw_board_if_changed(&pl[p], p);
         draw_hud_if_changed(p);
+        // El cartel va DESPUÉS de pintar el tablero, así no lo pisa el borrado de la pieza.
+        if (!pl[p].active && !over_drawn[p]) {
+            draw_game_over_box(p);
+            over_drawn[p] = true;
+            renderer_flush();
+        }
     }
 
     bool bon = (blink / 15) % 2 == 0;
-    const char *center = "";
-    if (state == TT_GAME_OVER) center = "GAME OVER";
-    update_center_message(center, COLOR_YELLOW, 3);
-
     const char *bottom = "";
     if (state == TT_GAME_OVER && bon) bottom = "PULSA PARA CONTINUAR";
     else if (demo && bon)             bottom = "DEMO - PULSA PARA JUGAR";
@@ -990,7 +980,6 @@ static void draw_select_screen(void) {
     for (int i = 0; i < 3; i++)
         renderer_draw_text(centered_x(help[i], 1), PLAY_Y + 164 + i * 12, help[i], COLOR_WHITE, COLOR_BLACK, 1);
 
-    prev_center_msg[0] = '\0';
     prev_bottom_msg[0] = '\0';
     renderer_flush();
 }
@@ -1024,6 +1013,7 @@ static void player_reset(PlayerState *p) {
     p->clear_mask  = 0;
     p->next_piece = random_piece();
     spawn_piece(p);
+    over_drawn[p - pl] = false;   // por si J2 se une a mitad de partida: sin cartel heredado
 }
 
 static void start_game(void) {
@@ -1169,12 +1159,17 @@ static void tt_tick(void) {
         if (!any_active) {
             sound_stop_tetris_music();
             sound_effect_game_over();
-            draw_playing_frame();
+            draw_playing_frame();          // deja los carteles visibles
+            bool entered = false;
             for (int p = 0; p < num_players; p++) {
                 if (!demo && highscores_is_top(TT_GAME_ID, pl[p].score)) {
                     highscores_enter(TT_GAME_ID, pl[p].score); // bloqueante
+                    entered = true;
                 }
             }
+            // La pantalla de récords machaca el campo: se redibuja todo
+            // (tableros, HUD y carteles) antes de pasar a GAME_OVER.
+            if (entered) board_static_drawn = false;
             pause_ticks = 0;
             state = TT_GAME_OVER;
         }

@@ -16,6 +16,8 @@
 #include "manhattan.h"
 
 const game_entry_t games_list[NUM_GAMES] = {
+    { "MANHATTAN",        game_manhattan_run },
+    { "COMMANDO",         game_commando_run },
     { "PONG",           game_pong_run },
     { "SPACE INVADERS", game_space_invaders_run },
     { "ASTEROIDS",      game_asteroids_run },
@@ -28,6 +30,6 @@ const game_entry_t games_list[NUM_GAMES] = {
     { "PARATROOPER",    game_paratrooper_run },
     { "FROGGER",        game_frogger_run },
     { "TETRIS",         game_tetris_run },
-    { "COMMANDO",         game_commando_run },
-    { "MANHATTAN",        game_manhattan_run },
+    
+    
 };

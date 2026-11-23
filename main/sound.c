@@ -821,6 +821,47 @@ typedef struct {
 
 static volatile Channel3Sweep channel3_sweep = { .active = false };
 
+/* ============================================================
+ * PATRÓN DE CANAL 3 (envolvente por pasos)
+ *
+ * Cada paso fija frecuencia, duración, forma de onda Y volumen. Es lo
+ * que hace falta para sonidos con "cuerpo": una explosión es ruido que
+ * se apaga poco a poco (volumen decreciente) y luego un retumbo grave;
+ * un disparo es un chasquido de ruido seguido de un golpe seco. Con
+ * channel3_seq (una sola forma de onda y volumen por secuencia) eso no
+ * se puede hacer.
+ *
+ * Cada patrón lleva una PRIORIDAD: un patrón nuevo con prioridad menor
+ * que el que está sonando se ignora -- así el disparo del jugador (que
+ * se repite sin parar) no corta una explosión a medias. A igual o mayor
+ * prioridad, manda el último en arrancar. Los demás dueños del canal 3
+ * (secuencia, barrido, tono suelto) cancelan siempre el patrón.
+ *
+ * Se avanza desde audio_task() (cada bloque de ~11.6 ms), NO desde
+ * sound_update(): así la duración de cada paso no depende de los fps
+ * del juego (Commando va a ~16 fps y un paso de 30 ms se alargaría
+ * hasta 60 ms). Por eso las dos funciones van dentro de sección crítica.
+ * ============================================================ */
+#define CHANNEL3_PAT_MAX_STEPS 8
+
+typedef struct {
+    uint16_t freq;
+    uint16_t dur_ms;
+    uint8_t  wave;
+    uint8_t  vol;
+} Ch3Step;
+
+typedef struct {
+    const Ch3Step *steps;
+    uint8_t  count;
+    uint8_t  index;
+    uint8_t  prio;
+    bool     active;
+    uint32_t next_change;
+} Channel3Pattern;
+
+static volatile Channel3Pattern channel3_pat = { .active = false };
+
 /*
  * Secuenciador simple de canal 3, para melodías cortas no
  * bloqueantes (2-4 notas): "pierdes la bola" descendente, "victoria"
@@ -875,6 +916,7 @@ static void channel3_seq_start(
     // tres manda en cada momento.
     channel3_tone_has_expiry = false;
     channel3_sweep.active    = false;
+    channel3_pat.active      = false;
 
     configure_channel(&channel3, channel3_seq.freqs[0], volume, waveform);
     channel3_seq.next_change = timeout_ms(channel3_seq.durations_ms[0]);
@@ -942,6 +984,7 @@ static void channel3_sweep_start(
     // Los otros dos dueños posibles del canal 3 se apartan.
     channel3_seq.active      = false;
     channel3_tone_has_expiry = false;
+    channel3_pat.active      = false;
 
     configure_channel(&channel3, freq_start, volume, waveform);
     channel3_sweep.next_change = timeout_ms(step_ms);
@@ -973,6 +1016,82 @@ static void channel3_sweep_update(void)
 
     channel_set_frequency(&channel3, (uint16_t)f);
     channel3_sweep.next_change = timeout_ms(channel3_sweep.step_ms);
+}
+
+static void channel3_pat_start(const Ch3Step *steps, uint8_t count, uint8_t prio)
+{
+    if (count == 0 || count > CHANNEL3_PAT_MAX_STEPS) {
+        return;
+    }
+
+    SOUND_ENTER_CRITICAL();
+
+    /* Lo que suena es más importante: este patrón se descarta. */
+    if (channel3_pat.active && channel3_pat.prio > prio) {
+        SOUND_EXIT_CRITICAL();
+        return;
+    }
+
+    channel3_seq.active      = false;
+    channel3_sweep.active    = false;
+    channel3_tone_has_expiry = false;
+
+    channel3_pat.steps       = steps;
+    channel3_pat.count       = count;
+    channel3_pat.index       = 0;
+    channel3_pat.prio        = prio;
+    channel3_pat.next_change = timeout_ms(steps[0].dur_ms);
+    channel3_pat.active      = true;
+
+    configure_channel(&channel3, steps[0].freq, steps[0].vol, steps[0].wave);
+
+    SOUND_EXIT_CRITICAL();
+}
+
+/* Llamada desde audio_task() una vez por bloque de audio. Si por lo que
+ * sea llega tarde, salta los pasos ya vencidos conservando la duración
+ * total del sonido (acumula sobre next_change, no sobre "ahora"). */
+static void channel3_pat_update(void)
+{
+    if (!channel3_pat.active) {
+        return;
+    }
+
+    SOUND_ENTER_CRITICAL();
+
+    if (channel3_pat.active && time_reached_ms(channel3_pat.next_change)) {
+        uint8_t  old      = channel3_pat.index;
+        uint8_t  idx      = old;
+        uint32_t next     = channel3_pat.next_change;
+        bool     finished = false;
+
+        while (time_reached_ms(next)) {
+            idx++;
+            if (idx >= channel3_pat.count) {
+                finished = true;
+                break;
+            }
+            next += channel3_pat.steps[idx].dur_ms;
+        }
+
+        if (finished) {
+            channel3_pat.active = false;
+            disable_channel(&channel3);
+        } else {
+            channel3_pat.index       = idx;
+            channel3_pat.next_change = next;
+            if (idx != old) {
+                configure_channel(
+                    &channel3,
+                    channel3_pat.steps[idx].freq,
+                    channel3_pat.steps[idx].vol,
+                    channel3_pat.steps[idx].wave
+                );
+            }
+        }
+    }
+
+    SOUND_EXIT_CRITICAL();
 }
 
 /* Efecto corto de una sola nota, con apagado automático -- usada por
@@ -1359,6 +1478,10 @@ static void audio_task(void *arg)
     uint8_t block[AUDIO_BLOCK_SAMPLES];
 
     while (true) {
+        /* Avanza los patrones de efectos del canal 3 con la resolución
+         * del bloque de audio, independiente de los fps del juego. */
+        channel3_pat_update();
+
         for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
             block[i] = generate_sample_u8();
         }
@@ -1669,6 +1792,141 @@ static const uint16_t jazz_music_ch2_dur[JAZZ_MUSIC_CH2_LEN] = {
     360, 360, 360, 360, 360, 360, 360, 360,
 };
 
+/* ============================================================
+ * COMMANDO -- MÚSICA MILITAR, JINGLES DE INICIO Y DE GAME OVER
+ *
+ * Todo original de este proyecto (no es un port del arcade).
+ *
+ * MÚSICA IN-GAME: marcha heroica en La menor, 4/4 a 150 BPM (corchea
+ * = 200 ms, compás = 1600 ms), 8 compases = 12800 ms en bucle.
+ * Armonía: Am - F - G - E7 | Am - F - G/E - Am.
+ *   Canal 1 = "trompeta" (cuadrada): llamada de clarín con arpegios
+ *             Am / F / G que suben a la tónica y cadencia por Sol#.
+ *   Canal 2 = bajo de marcha (triangular): fundamental-quinta en
+ *             negras con staccato (280 ms de nota + 120 ms de
+ *             silencio), el "tum-pa" de un desfile.
+ * Comparte la maquinaria de fondo de Tetris/Manhattan (una sola
+ * bandera, dos índices que vuelven a 0 al final); los dos canales
+ * suman 12800 ms, así que reinician juntos. Canal 3 libre para los
+ * efectos de la partida.
+ *
+ * JINGLES (una sola pasada, canales 1+2, ambos canales comparten el
+ * mismo array de duraciones):
+ *   INICIO  (3100 ms): toque de clarín ascendente en Do mayor.
+ *   GAME OVER (2840 ms): marcha fúnebre descendente en La menor.
+ * ============================================================ */
+#define CMD_MUSIC_CH1_LEN 50
+#define CMD_MUSIC_CH2_LEN 64
+
+/* Más bajos que el menú: la cuadrada tiene RMS pleno (ver nota de
+ * TETRIS_MUSIC_CH*_VOLUME) y el canal 3 lleva el disparo continuo. */
+#define COMMANDO_MUSIC_CH1_VOLUME  42
+#define COMMANDO_MUSIC_CH2_VOLUME  85
+
+static const uint16_t cmd_music_ch1_freq[CMD_MUSIC_CH1_LEN] = {
+    /* 1 Am  */ 440,   0, 440, 523, 659, 659,   0,
+    /* 2 F   */ 523,   0, 440, 523, 698, 698,   0,
+    /* 3 G   */ 587,   0, 494, 587, 784, 784,   0,
+    /* 4 E7  */ 659, 587, 523, 494, 415,
+    /* 5 Am  */ 440, 523, 659, 880, 784, 659,
+    /* 6 F   */ 698, 659, 587, 523, 440,
+    /* 7 G/E */ 587, 494, 392, 494, 659,   0, 415, 494,
+    /* 8 Am  */ 440,   0, 440, 659, 880,
+};
+static const uint16_t cmd_music_ch1_dur[CMD_MUSIC_CH1_LEN] = {
+    300, 100, 200, 200, 400, 300, 100,
+    300, 100, 200, 200, 400, 300, 100,
+    300, 100, 200, 200, 400, 300, 100,
+    400, 200, 200, 400, 400,
+    200, 200, 200, 400, 200, 400,
+    400, 200, 200, 400, 400,
+    200, 200, 200, 200, 300, 100, 200, 200,
+    300, 100, 200, 200, 800,
+};
+/* Bajo: 4 negras por compás, cada una = nota 280 ms + silencio 120 ms */
+static const uint16_t cmd_music_ch2_freq[CMD_MUSIC_CH2_LEN] = {
+    110, 0, 165, 0, 110, 0, 165, 0,     /* Am: La-Mi-La-Mi        */
+     87, 0, 131, 0,  87, 0, 131, 0,     /* F:  Fa-Do-Fa-Do        */
+     98, 0, 147, 0,  98, 0, 147, 0,     /* G:  Sol-Re-Sol-Re      */
+     82, 0, 123, 0,  82, 0, 208, 0,     /* E7: Mi-Si-Mi-Sol# (guía) */
+    110, 0, 165, 0, 110, 0, 165, 0,
+     87, 0, 131, 0,  87, 0, 131, 0,
+     98, 0, 147, 0,  82, 0, 123, 0,     /* G -> E                 */
+    110, 0, 165, 0, 110, 0, 110, 0,     /* Am: cierre             */
+};
+static const uint16_t cmd_music_ch2_dur[CMD_MUSIC_CH2_LEN] = {
+    280, 120, 280, 120, 280, 120, 280, 120,
+    280, 120, 280, 120, 280, 120, 280, 120,
+    280, 120, 280, 120, 280, 120, 280, 120,
+    280, 120, 280, 120, 280, 120, 280, 120,
+    280, 120, 280, 120, 280, 120, 280, 120,
+    280, 120, 280, 120, 280, 120, 280, 120,
+    280, 120, 280, 120, 280, 120, 280, 120,
+    280, 120, 280, 120, 280, 120, 280, 120,
+};
+
+/* ---- Jingles de dos canales (una sola pasada) ---- */
+typedef struct {
+    const uint16_t *f1;
+    const uint16_t *d1;
+    const uint16_t *f2;
+    const uint16_t *d2;
+    uint8_t  n1, n2;
+    uint16_t v1, v2;
+    uint8_t  w1, w2;
+} Jingle2;
+
+/* INICIO: tres frases en Do mayor -- G4 G4 C5 / C5 C5 E5 / E5 G5 C6 --
+ * sobre un bajo Do / Sol / Do-Sol-Do. 3100 ms. */
+#define CMD_INTRO_LEN 17
+static const uint16_t cmd_intro_f1[CMD_INTRO_LEN] = {
+    392, 0, 392, 0, 523, 0,
+    523, 0, 523, 0, 659, 0,
+    659, 0, 784, 0, 1047,
+};
+static const uint16_t cmd_intro_f2[CMD_INTRO_LEN] = {
+    131, 0, 131, 0, 131, 0,
+    196, 0, 196, 0, 196, 0,
+    262, 0, 196, 0, 131,
+};
+static const uint16_t cmd_intro_d[CMD_INTRO_LEN] = {
+    150, 50, 150, 50, 400, 100,
+    150, 50, 150, 50, 400, 100,
+    150, 50, 250, 50, 800,
+};
+static const Jingle2 cmd_intro_jingle = {
+    cmd_intro_f1, cmd_intro_d, cmd_intro_f2, cmd_intro_d,
+    CMD_INTRO_LEN, CMD_INTRO_LEN,
+    85, 100,
+    WAVE_SQUARE, WAVE_TRIANGLE
+};
+
+/* GAME OVER: Do-Si-La-Sol# descendiendo a paso lento y Mi largo sobre
+ * un bajo de La (con un Mi grave en el tercer tiempo). 2840 ms. */
+#define CMD_OVER_LEN 9
+static const uint16_t cmd_over_f1[CMD_OVER_LEN] = {
+    523, 0, 494, 0, 440, 0, 415, 0, 330,
+};
+static const uint16_t cmd_over_f2[CMD_OVER_LEN] = {
+    110, 0, 110, 0, 110, 0,  82, 0, 110,
+};
+static const uint16_t cmd_over_d[CMD_OVER_LEN] = {
+    300, 60, 300, 60, 300, 60, 300, 60, 1400,
+};
+static const Jingle2 cmd_over_jingle = {
+    cmd_over_f1, cmd_over_d, cmd_over_f2, cmd_over_d,
+    CMD_OVER_LEN, CMD_OVER_LEN,
+    70, 100,
+    WAVE_SQUARE, WAVE_TRIANGLE
+};
+
+static const Jingle2 *jingle_cur = NULL;
+static volatile bool  jingle_active = false;
+static volatile bool  jingle_done1 = false;
+static volatile bool  jingle_done2 = false;
+static uint8_t  jingle_i1, jingle_i2;
+static uint32_t jingle_next1, jingle_next2;
+
 /* Pista que está usando ahora mismo la maquinaria de fondo
  * (Tetris o Manhattan). Se rellena en cada sound_start_*_music(). */
 static const uint16_t *bg_ch1_freq = tetris_music_ch1_freq;
@@ -1680,6 +1938,11 @@ static uint8_t  bg_ch2_len = TETRIS_MUSIC_CH2_LEN;
 static uint16_t bg_ch1_vol = TETRIS_MUSIC_CH1_VOLUME;
 static uint16_t bg_ch2_vol = TETRIS_MUSIC_CH2_VOLUME;
 static volatile bool manhattan_music_active = false;   /* true = la pista en curso es la de jazz */
+static volatile bool commando_music_active  = false;   /* true = la pista en curso es la marcha de Commando */
+/* Forma de onda de cada canal de la música de fondo (Tetris/jazz usan
+ * triangular; la marcha de Commando usa cuadrada en la melodía). */
+static uint8_t bg_ch1_wave = WAVE_TRIANGLE;
+static uint8_t bg_ch2_wave = WAVE_TRIANGLE;
 
 
 /* ============================================================
@@ -1762,6 +2025,7 @@ void sound_play_tone(
      * con la nota que tocara de la secuencia.
      */
     channel3_seq.active = false;
+    channel3_pat.active = false;
 
     configure_channel(
         &channel3,
@@ -1802,6 +2066,7 @@ void sound_start_menu_music(void)
     // por lo que sea estuvieran sonando, la música de menú manda.
     // Lo mismo con la fanfarria de victoria de Scramble (canales 1+2):
     // al volver al menú tras un nivel, la música de menú se impone.
+    jingle_active          = false;
     channel2_siren_active  = false;
     channel2_engine_active = false;
     scramble_win_active    = false;
@@ -1970,6 +2235,42 @@ void sound_update(void)
         SOUND_EXIT_CRITICAL();
     }
 
+    // Avanza los jingles de Commando (inicio / game over): una sola
+    // pasada, canal 1 + canal 2, dos índices independientes.
+    if (jingle_active && jingle_cur) {
+        SOUND_ENTER_CRITICAL();
+
+        const Jingle2 *j = jingle_cur;
+
+        if (!jingle_done1 && time_reached_ms(jingle_next1)) {
+            jingle_i1++;
+            if (jingle_i1 >= j->n1) {
+                jingle_done1 = true;
+                disable_channel(&channel1);
+            } else {
+                configure_channel(&channel1, j->f1[jingle_i1], j->v1, j->w1);
+                jingle_next1 = timeout_ms(j->d1[jingle_i1]);
+            }
+        }
+
+        if (!jingle_done2 && time_reached_ms(jingle_next2)) {
+            jingle_i2++;
+            if (jingle_i2 >= j->n2) {
+                jingle_done2 = true;
+                disable_channel(&channel2);
+            } else {
+                configure_channel(&channel2, j->f2[jingle_i2], j->v2, j->w2);
+                jingle_next2 = timeout_ms(j->d2[jingle_i2]);
+            }
+        }
+
+        if (jingle_done1 && jingle_done2) {
+            jingle_active = false;
+        }
+
+        SOUND_EXIT_CRITICAL();
+    }
+
     // Avanza la Toccata BWV 565 de Paratrooper (canal 1 + canal 2).
     // Una sola pasada (~8.6s) al empezar la partida, NO en bucle --
     // igual que el jingle de inicio de Pac-Man: al llegar al final se
@@ -2036,7 +2337,7 @@ void sound_update(void)
                 &channel1,
                 bg_ch1_freq[tetris_music_ch1_index],
                 bg_ch1_vol,
-                WAVE_TRIANGLE
+                bg_ch1_wave
             );
             tetris_music_ch1_next =
                 timeout_ms(bg_ch1_dur[tetris_music_ch1_index]);
@@ -2051,7 +2352,7 @@ void sound_update(void)
                 &channel2,
                 bg_ch2_freq[tetris_music_ch2_index],
                 bg_ch2_vol,
-                WAVE_TRIANGLE
+                bg_ch2_wave
             );
             tetris_music_ch2_next =
                 timeout_ms(bg_ch2_dur[tetris_music_ch2_index]);
@@ -2524,6 +2825,7 @@ void sound_effect_stop(void)
     channel3_seq.active = false;
     channel3_tone_has_expiry = false;
     channel3_sweep.active = false;
+    channel3_pat.active = false;
 
     disable_channel(
         &channel3
@@ -2828,6 +3130,7 @@ void sound_start_pacman_intro(void)
     scramble_win_active   = false;
     toccata_playing       = false;
 
+    jingle_active         = false;
     pacman_intro_active   = true;
     pacman_intro_ch1_done = false;
     pacman_intro_ch2_done = false;
@@ -2889,6 +3192,7 @@ void sound_start_scramble_victory(void)
     channel1_skid_active   = false;
     toccata_playing        = false;
 
+    jingle_active         = false;
     scramble_win_active   = true;
     scramble_win_ch1_done = false;
     scramble_win_ch2_done = false;
@@ -2958,6 +3262,7 @@ void sound_start_paratrooper_music(void)
     channel2_engine_active = false;
     channel1_skid_active   = false;
 
+    jingle_active   = false;
     toccata_playing = true;
     toccata_index   = 0;
 
@@ -3100,7 +3405,10 @@ void sound_start_tetris_music(void)
     scramble_win_active    = false;
     toccata_playing        = false;
 
+    jingle_active          = false;
     manhattan_music_active = false;
+    commando_music_active  = false;
+    bg_ch1_wave = WAVE_TRIANGLE;  bg_ch2_wave = WAVE_TRIANGLE;
     bg_ch1_freq = tetris_music_ch1_freq;  bg_ch1_dur = tetris_music_ch1_dur;
     bg_ch2_freq = tetris_music_ch2_freq;  bg_ch2_dur = tetris_music_ch2_dur;
     bg_ch1_len  = TETRIS_MUSIC_CH1_LEN;   bg_ch2_len = TETRIS_MUSIC_CH2_LEN;
@@ -3138,7 +3446,7 @@ void sound_stop_tetris_music(void)
 
 bool sound_tetris_music_is_playing(void)
 {
-    return tetris_music_playing && !manhattan_music_active;
+    return tetris_music_playing && !manhattan_music_active && !commando_music_active;
 }
 
 
@@ -3164,6 +3472,9 @@ void sound_start_manhattan_music(void)
     scramble_win_active    = false;
     toccata_playing        = false;
 
+    jingle_active          = false;
+    commando_music_active  = false;
+    bg_ch1_wave = WAVE_TRIANGLE;  bg_ch2_wave = WAVE_TRIANGLE;
     manhattan_music_active = true;
     bg_ch1_freq = jazz_music_ch1_freq;  bg_ch1_dur = jazz_music_ch1_dur;
     bg_ch2_freq = jazz_music_ch2_freq;  bg_ch2_dur = jazz_music_ch2_dur;
@@ -3204,4 +3515,285 @@ void sound_stop_manhattan_music(void)
 bool sound_manhattan_music_is_playing(void)
 {
     return tetris_music_playing && manhattan_music_active;
+}
+
+
+/* ============================================================
+ * COMMANDO -- música, jingles y efectos
+ * (datos y descripción de la música arriba, junto a cmd_music_*)
+ * ============================================================ */
+
+/*
+ * Marcha militar in-game (canal 1 + canal 2), en bucle hasta llamar a
+ * sound_stop_commando_music(). Canal 3 libre para los efectos.
+ */
+void sound_start_commando_music(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    SOUND_ENTER_CRITICAL();
+
+    menu_music_playing     = false;
+    channel2_siren_active  = false;
+    channel2_engine_active = false;
+    channel1_skid_active   = false;
+    pacman_intro_active    = false;
+    scramble_win_active    = false;
+    toccata_playing        = false;
+    jingle_active          = false;
+
+    manhattan_music_active = false;
+    commando_music_active  = true;
+    bg_ch1_freq = cmd_music_ch1_freq;  bg_ch1_dur = cmd_music_ch1_dur;
+    bg_ch2_freq = cmd_music_ch2_freq;  bg_ch2_dur = cmd_music_ch2_dur;
+    bg_ch1_len  = CMD_MUSIC_CH1_LEN;   bg_ch2_len = CMD_MUSIC_CH2_LEN;
+    bg_ch1_vol  = COMMANDO_MUSIC_CH1_VOLUME;
+    bg_ch2_vol  = COMMANDO_MUSIC_CH2_VOLUME;
+    bg_ch1_wave = WAVE_SQUARE;
+    bg_ch2_wave = WAVE_TRIANGLE;
+
+    tetris_music_playing   = true;
+    tetris_music_ch1_index = 0;
+    tetris_music_ch2_index = 0;
+
+    configure_channel(&channel1, cmd_music_ch1_freq[0], bg_ch1_vol, bg_ch1_wave);
+    configure_channel(&channel2, cmd_music_ch2_freq[0], bg_ch2_vol, bg_ch2_wave);
+
+    tetris_music_ch1_next = timeout_ms(cmd_music_ch1_dur[0]);
+    tetris_music_ch2_next = timeout_ms(cmd_music_ch2_dur[0]);
+
+    SOUND_EXIT_CRITICAL();
+}
+
+/* Solo corta los canales si la marcha era lo que estaba sonando (así no
+ * pisa la fanfarria de victoria ni un jingle si se llama a destiempo). */
+void sound_stop_commando_music(void)
+{
+    SOUND_ENTER_CRITICAL();
+
+    if (commando_music_active && tetris_music_playing) {
+        tetris_music_playing = false;
+        disable_channel(&channel1);
+        disable_channel(&channel2);
+    }
+    commando_music_active = false;
+
+    SOUND_EXIT_CRITICAL();
+}
+
+bool sound_commando_music_is_playing(void)
+{
+    return tetris_music_playing && commando_music_active;
+}
+
+
+/* Arranque común de los jingles de dos canales (ver Jingle2). */
+static void jingle_start(const Jingle2 *j)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    SOUND_ENTER_CRITICAL();
+
+    // Canales 1/2: el jingle manda sobre cualquier otra cosa.
+    menu_music_playing     = false;
+    tetris_music_playing   = false;
+    commando_music_active  = false;
+    pacman_intro_active    = false;
+    scramble_win_active    = false;
+    toccata_playing        = false;
+    channel2_siren_active  = false;
+    channel2_engine_active = false;
+    channel1_skid_active   = false;
+
+    jingle_cur    = j;
+    jingle_active = true;
+    jingle_done1  = false;
+    jingle_done2  = false;
+    jingle_i1     = 0;
+    jingle_i2     = 0;
+
+    configure_channel(&channel1, j->f1[0], j->v1, j->w1);
+    configure_channel(&channel2, j->f2[0], j->v2, j->w2);
+
+    jingle_next1 = timeout_ms(j->d1[0]);
+    jingle_next2 = timeout_ms(j->d2[0]);
+
+    SOUND_EXIT_CRITICAL();
+}
+
+void sound_start_commando_intro(void)    { jingle_start(&cmd_intro_jingle); }
+void sound_start_commando_gameover(void) { jingle_start(&cmd_over_jingle);  }
+
+void sound_stop_commando_jingle(void)
+{
+    SOUND_ENTER_CRITICAL();
+
+    if (jingle_active) {
+        jingle_active = false;
+        disable_channel(&channel1);
+        disable_channel(&channel2);
+    }
+
+    SOUND_EXIT_CRITICAL();
+}
+
+bool sound_commando_jingle_is_playing(void)
+{
+    return jingle_active;
+}
+
+
+/*
+ * Efectos de Commando. Todos en canal 3 como patrones por pasos con
+ * envolvente (ver channel3_pat). La prioridad (último argumento) decide
+ * quién corta a quién: 1 = disparo/lanzamiento, 2 = muertes pequeñas y
+ * recogidas, 3 = explosión grande, 4 = muerte del jugador.
+ */
+
+/* Disparo de fusil: chasquido seco de ruido + golpe grave corto, como
+ * el "tchk" del arcade. Muy breve (70 ms) porque se repite sin parar. */
+void sound_effect_commando_shot(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[3] = {
+        { 100, 24, WAVE_NOISE, 100 },
+        { 520, 16, WAVE_SAW,    70 },
+        { 200, 30, WAVE_SAW,    55 },
+    };
+    channel3_pat_start(steps, 3, 1);
+}
+
+/* Explosión grande: ráfaga de ruido que se apaga en 4 escalones y
+ * retumbo grave de diente de sierra que baja de 110 a 65 Hz (~530 ms). */
+void sound_effect_commando_boom(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[7] = {
+        { 100,  40, WAVE_NOISE, 100 },
+        { 100,  50, WAVE_NOISE,  92 },
+        { 100,  60, WAVE_NOISE,  78 },
+        { 100,  70, WAVE_NOISE,  60 },
+        { 110,  80, WAVE_SAW,    70 },
+        {  85, 100, WAVE_SAW,    52 },
+        {  65, 130, WAVE_SAW,    36 },
+    };
+    channel3_pat_start(steps, 7, 3);
+}
+
+/* Explosión pequeña (soldado abatido, obús, soldado de trinchera):
+ * mismo gesto que la grande pero en ~250 ms. */
+void sound_effect_commando_boom_small(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[5] = {
+        { 100, 30, WAVE_NOISE, 100 },
+        { 100, 40, WAVE_NOISE,  75 },
+        { 100, 50, WAVE_NOISE,  50 },
+        { 130, 60, WAVE_SAW,    45 },
+        {  95, 70, WAVE_SAW,    30 },
+    };
+    channel3_pat_start(steps, 5, 2);
+}
+
+/* Muerte del jugador: dos golpes de ruido y caída lenta en diente de
+ * sierra (La4 -> Do3 aprox.), ~660 ms. Prioridad máxima. */
+void sound_effect_commando_player_die(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[7] = {
+        { 100,  60, WAVE_NOISE, 100 },
+        { 100,  60, WAVE_NOISE,  85 },
+        { 440,  80, WAVE_SAW,    80 },
+        { 330,  90, WAVE_SAW,    75 },
+        { 247, 100, WAVE_SAW,    70 },
+        { 185, 110, WAVE_SAW,    60 },
+        { 130, 160, WAVE_SAW,    45 },
+    };
+    channel3_pat_start(steps, 7, 4);
+}
+
+/* Lanzar granada: "fuuum" descendente suave en 4 escalones. */
+void sound_effect_commando_grenade_throw(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[4] = {
+        { 700, 25, WAVE_SAW, 45 },
+        { 520, 30, WAVE_SAW, 45 },
+        { 380, 35, WAVE_SAW, 42 },
+        { 280, 45, WAVE_SAW, 38 },
+    };
+    channel3_pat_start(steps, 4, 1);
+}
+
+/* Objeto recogido (granadas / disparo triple): arpegio de clarín
+ * ascendente en cuadrada. */
+void sound_effect_commando_pickup(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[4] = {
+        {  784,  50, WAVE_SQUARE, CHANNEL3_VOLUME },
+        {  988,  50, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 1175,  50, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 1568, 160, WAVE_SQUARE, CHANNEL3_VOLUME },
+    };
+    channel3_pat_start(steps, 4, 2);
+}
+
+/* Rehén liberado: mini fanfarria de 6 notas (Do-Mi-Sol-Do, Sol, Do). */
+void sound_effect_commando_rescue(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[6] = {
+        {  523,  70, WAVE_SQUARE, CHANNEL3_VOLUME },
+        {  659,  70, WAVE_SQUARE, CHANNEL3_VOLUME },
+        {  784,  70, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 1047, 110, WAVE_SQUARE, CHANNEL3_VOLUME },
+        {  784,  60, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 1047, 260, WAVE_SQUARE, CHANNEL3_VOLUME },
+    };
+    channel3_pat_start(steps, 6, 2);
+}
+
+/* Aviso (llega un camión, se abre la fortaleza): toque de alarma de
+ * cuartel, Sol-Do alternando y remate en Mi. */
+void sound_effect_commando_alert(void)
+{
+    if (!sound_initialized) {
+        sound_init();
+    }
+
+    static const Ch3Step steps[6] = {
+        { 392,  90, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 523,  90, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 392,  90, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 523,  90, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 392,  90, WAVE_SQUARE, CHANNEL3_VOLUME },
+        { 659, 200, WAVE_SQUARE, CHANNEL3_VOLUME },
+    };
+    channel3_pat_start(steps, 6, 2);
 }

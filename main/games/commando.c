@@ -566,7 +566,7 @@ static void struct_damage(int i, int q)
     static const uint16_t pts[5] = { 100, 300, 600, 500, 500 };
     score += pts[o->type - OB_TENT];
     expl_add(o->x + o->w / 2.0f, o->y + o->h / 2.0f, 16 + o->w / 6);
-    sound_effect_explosion();
+    sound_effect_commando_boom();
     if (o->type == OB_BUNKER || rnd_range(0, 99) < 40)
         item_spawn(o->x + o->w / 2 - 5, o->y + o->h / 2 - 5, rnd_range(0, 1) ? IT_GRENADES : IT_SPREAD);
     o->type = OB_RUBBLE; o->hp = 0;
@@ -590,7 +590,7 @@ static void player_hit(void)
     pl.death_t = DEATH_STEPS;
     pl.death_dir = (rng() & 1) ? 1 : -1;
     expl_add(pl_cx(), pl_cy(), 14);
-    sound_effect_explosion();
+    sound_effect_commando_player_die();
 }
 
 static void item_spawn(int x, int y, int type)
@@ -622,7 +622,7 @@ static void enemy_kill(Enemy *e)
     static const uint16_t pts[4] = { 100, 300, 250, 250 };
     score += pts[e->type & 3];
     expl_add(e->x + EW / 2.0f, e->y + EH / 2.0f, 12);
-    sound_effect_hit();
+    sound_effect_commando_boom_small();
     item_drop(e->x, e->y, e->type >= 2 ? 35 : 20);
 }
 
@@ -686,7 +686,7 @@ static void rocket_fire(Enemy *e)
 static void rocket_detonate(const EBullet *b)
 {
     expl_add(b->x, b->y, 16);
-    sound_effect_explosion();
+    sound_effect_commando_boom();
     if (!pl.dying && !player_in_tunnel() && hypotf(pl_cx() - b->x, pl_cy() - b->y) < 15) player_hit();
 }
 
@@ -1096,7 +1096,7 @@ static void trench_soldier_kill(TrSoldier *s)
     s->active = false;
     score += 150;
     expl_add(s->x, trenches[s->t].y + 4, 12);
-    sound_effect_hit();
+    sound_effect_commando_boom_small();
     item_drop((float)s->x - 5, (float)trenches[s->t].y, 22);
 }
 
@@ -1120,7 +1120,7 @@ static void veh_destroy(Vehicle *v)
     int n = v->kind == VK_TANK ? 4 : 3;
     for (int k = 0; k < n; k++)
         expl_add(v->x + frnd(4, (float)v->w - 4), v->y + frnd(4, (float)v->h - 4), frnd(14, 26));
-    sound_effect_explosion();
+    sound_effect_commando_boom();
     if (v->kind == VK_TANK) {
         score += 800;
         item_spawn((int)v->x + v->w / 2 - 5, (int)v->y + v->h / 2 - 5, IT_GRENADES);
@@ -1143,7 +1143,7 @@ static void veh_damage(Vehicle *v, int d)
 static void grenade_explode(Grenade *g)
 {
     expl_add(g->tx, g->ty, g->r);
-    sound_effect_explosion();
+    sound_effect_commando_boom();
     if (g->mine) {
         for (int i = 0; i < obs_n; i++) {
             const Obstacle *o = &obs[i];
@@ -1289,7 +1289,7 @@ static void trucks_spawn(void)
         v->cargo = 3 + (level >= 3 ? 1 : 0);
         trucks_sent++;
         truck_timer = 1100 + rnd_range(0, 600) - level * 80; if (truck_timer < 700) truck_timer = 700;
-        sound_effect_alarm();
+        sound_effect_commando_alert();
         return;
     }
     truck_timer = 60;
@@ -1427,7 +1427,7 @@ static void fort_update(void)
     if (!fort_active && UNFX(pl.y) < FORT_TRIGGER_Y) {            /* se abre la puerta */
         fort_active = true;
         obs[gate_idx].type = OB_RUBBLE; obs[gate_idx].hp = 0;
-        sound_effect_alarm();
+        sound_effect_commando_alert();
     }
     if (!fort_active) return;
     fort_timer++;
@@ -1512,7 +1512,7 @@ static void hostages_update(void)
             if (nx > 3 && nx < FIELD_W - 15 && !obs_collide((int)nx, (int)ny, 12, 15)) { h->x = nx; h->y = ny; }
         } else if (h->killed >= 2) {
             h->freed = true; h->t = 0; score += 1000;
-            sound_effect_extra_life();
+            sound_effect_commando_rescue();
         } else h->active = false;                    /* los guardias huyeron: rehén perdido */
     }
 }
@@ -1539,7 +1539,7 @@ static void update_world(void)
         if (b->dist >= range || point_solid((int)b->x, (int)b->y, b->ignore)) {
             b->active = false;
             if (b->rocket) rocket_detonate(b);
-            else if (b->shell) { expl_add(b->x, b->y, 12); sound_effect_explosion(); }
+            else if (b->shell) { expl_add(b->x, b->y, 12); sound_effect_commando_boom_small(); }
             continue;
         }
         if (b->x < 0 || b->x >= FIELD_W || b->y < camy - 12 || b->y > camy + SCR_H + 12) { b->active = false; continue; }
@@ -1547,7 +1547,7 @@ static void update_world(void)
             rects_hit((int)b->x - 1, (int)b->y - 1, 3, 3, UNFX(pl.x) + 1, UNFX(pl.y) + 1, PLAYER_W - 2, PLAYER_H - 2)) {
             b->active = false;
             if (b->rocket) rocket_detonate(b);
-            else { if (b->shell) { expl_add(b->x, b->y, 12); sound_effect_explosion(); } player_hit(); }
+            else { if (b->shell) { expl_add(b->x, b->y, 12); sound_effect_commando_boom_small(); } player_hit(); }
         }
     }
 
@@ -1570,8 +1570,8 @@ static void update_world(void)
         if (!it->active || pl.dying) continue;
         if (!rects_hit(UNFX(pl.x), UNFX(pl.y), PLAYER_W, PLAYER_H, it->x, it->y, 10, 10)) continue;
         it->active = false;
-        if (it->type == IT_SPREAD) { pl.spread = 450; sound_effect_powerup(); }
-        else if (it->type == IT_GRENADES) { pl.grenades += 5; sound_effect_powerup(); }
+        if (it->type == IT_SPREAD) { pl.spread = 450; sound_effect_commando_pickup(); }
+        else if (it->type == IT_GRENADES) { pl.grenades += 5; sound_effect_commando_pickup(); }
         else { if (pl.lives < 10) pl.lives++; sound_effect_extra_life(); }
     }
 }
@@ -1663,8 +1663,6 @@ static void pbullet_add(int32_t vx, int32_t vy)
     }
 }
 
-static bool chomp_alt;
-
 static void player_shoot(void)
 {
     int dx = pl.dir_x, dy = pl.dir_y;
@@ -1678,8 +1676,7 @@ static void player_shoot(void)
         pbullet_add(dx * sp, dy * sp);
     }
     pl.noise = 40;
-    sound_effect_pacman_chomp(chomp_alt);       /* el chomp de Pac-Man, alternando tic/tac */
-    chomp_alt = !chomp_alt;
+    sound_effect_commando_shot();
 }
 
 static void player_throw(void)
@@ -1691,6 +1688,7 @@ static void player_throw(void)
     grenade_throw(cx, cy, cx + dx * 69, cy + dy * 69, true);
     pl.grenades--;
     pl.noise = 70;
+    sound_effect_commando_grenade_throw();
 }
 
 static void player_respawn(void)
@@ -1722,7 +1720,7 @@ static void update_player(void)
     if (pl.dying) {
         pl.vx = pl.vy = 0;
         if (--pl.death_t <= 0) {
-            if (pl.lives <= 0) { state = ST_GAMEOVER; gameover_t = GAME_SPEED * 4; sound_effect_game_over(); }
+            if (pl.lives <= 0) { state = ST_GAMEOVER; gameover_t = GAME_SPEED * 4; sound_stop_commando_music(); sound_start_commando_gameover(); }
             else player_respawn();
         }
         return;
@@ -1840,10 +1838,14 @@ static void logic_step(void)
             level = 1;
             game_init(false);
             state = ST_PLAYING;
+            sound_start_commando_intro();
         }
         return;
     }
     if (state == ST_PLAYING) {
+        /* Marcha de fondo: arranca al acabar el jingle de inicio. */
+        if (!sound_commando_jingle_is_playing() && !sound_commando_music_is_playing())
+            sound_start_commando_music();
         update_camera();
         update_player();
         update_bullets();
@@ -1852,7 +1854,7 @@ static void logic_step(void)
     }
     if (state == ST_WIN) {
         update_world();
-        if (++win_t > GAME_SPEED * 3 && in_start_edge) { sound_stop_scramble_victory(); level++; game_init(true); state = ST_PLAYING; }
+        if (++win_t > GAME_SPEED * 3 && in_start_edge) { sound_stop_scramble_victory(); level++; game_init(true); state = ST_PLAYING; sound_start_commando_intro(); }
         return;
     }
     if (state == ST_GAMEOVER) {
@@ -2824,6 +2826,9 @@ void game_commando_run(game_mode_t mode)
     }
 
     sound_stop_scramble_victory();
+    sound_stop_commando_music();
+    sound_stop_commando_jingle();
+    sound_effect_stop();
     highscores_flush();
 
     /* Vuelta al menú: rotación horizontal y entrada limpia. */

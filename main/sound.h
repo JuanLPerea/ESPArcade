@@ -232,4 +232,46 @@ void sound_effect_pacman_levelup(void);
 void sound_start_pacman_intro(void);
 void sound_stop_pacman_intro(void);
 
+/*
+ * COMMANDO (Missing in Arcade).
+ *
+ * Música militar in-game: marcha heroica en La menor, canales 1+2 en
+ * bucle (12.8 s) -- comparte motor con la de Tetris/Manhattan, solo
+ * suena una a la vez; canal 3 libre para los efectos.
+ *
+ * Jingles de una sola pasada, canales 1+2 (paran la música de fondo):
+ *   intro     -> toque de clarín en Do mayor (~3.1 s)
+ *   gameover  -> marcha fúnebre descendente (~2.8 s)
+ * sound_commando_jingle_is_playing() permite esperar a que acabe el de
+ * inicio antes de arrancar la marcha.
+ */
+void sound_start_commando_music(void);
+void sound_stop_commando_music(void);
+bool sound_commando_music_is_playing(void);
+
+void sound_start_commando_intro(void);
+void sound_start_commando_gameover(void);
+void sound_stop_commando_jingle(void);
+bool sound_commando_jingle_is_playing(void);
+
+/*
+ * Efectos de Commando -- canal 3, no bloqueantes. Son patrones por
+ * pasos con envolvente de volumen y PRIORIDAD: uno de menor prioridad
+ * no corta a otro de mayor prioridad que esté sonando (el disparo, que
+ * se repite sin parar, no corta una explosión).
+ *   shot, grenade_throw      prioridad 1
+ *   boom_small, pickup,
+ *   rescue, alert            prioridad 2
+ *   boom                     prioridad 3
+ *   player_die               prioridad 4
+ */
+void sound_effect_commando_shot(void);          /* fusil: chasquido + golpe  */
+void sound_effect_commando_boom(void);          /* explosión grande          */
+void sound_effect_commando_boom_small(void);    /* explosión pequeña / baja  */
+void sound_effect_commando_player_die(void);    /* muerte del jugador        */
+void sound_effect_commando_grenade_throw(void); /* lanzar granada            */
+void sound_effect_commando_pickup(void);        /* objeto recogido           */
+void sound_effect_commando_rescue(void);        /* rehén liberado            */
+void sound_effect_commando_alert(void);         /* aviso de camión/fortaleza */
+
 #endif
